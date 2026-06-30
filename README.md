@@ -124,12 +124,17 @@ Simulation CSV outputs go to `data/`. The sweep scripts invoke the optimizer, bi
 See `INSTRUCTIONS.md` for the complete hardware and simulation specification.
 
 ## Contact
+Of the original (LLMSimulator)[https://github.com/scale-snu/LLMSimulator]:
 
 Sungmin Yun — sungmin.yun@snu.ac.kr
 
 Kwanhee Kyung — kwanhee.kyung@scale.snu.ac.kr
 
 Juhwan Cho — juhwan.cho@scale.snu.ac.kr
+
+Of this modified version, based on Son et. al. "Exploring High-Bandwidth Flash for Modern LLM Inference:  Opportunities and Challenges" published on CAL'26:
+
+Jeongmin Lee — jeongminl@kaist.ac.kr
 
 ## Based On
 
