@@ -57,6 +57,7 @@ void TimeStamp::set_status(const StatusBoard& output_status) {
   status.act_energy = output_status.act_energy - status.act_energy; // get layer's energy
   status.read_energy = output_status.read_energy - status.read_energy;
   status.write_energy = output_status.write_energy - status.write_energy;
+  status.kv_write_time = output_status.kv_write_time - status.kv_write_time;
 
   status.all_act_energy = output_status.all_act_energy - status.all_act_energy;
   status.all_read_energy = output_status.all_read_energy - status.all_read_energy;

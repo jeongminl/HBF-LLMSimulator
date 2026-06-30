@@ -33,7 +33,6 @@ bool ModuleGraph::run(BatchedSequence::Ptr sequences_metadata) {
     } else {
       module->forward(input, sequences_metadata);
     }
-    // input->unset();
     return true;
   } else {
     return false;
@@ -156,24 +155,6 @@ void TopModuleGraph::run(BatchedSequence::Ptr sequences_metadata) {
   }
 }
 
-// deprecated
-void TopModuleGraph::push_stamp() {
-  fail("Cannot use push_stamp function");
-  ModuleGraph::Ptr module_graph = *current_module;
-  if (!module_graph->is_pop()) {
-    timeboard.push_timestamp(status, module_graph->get_name());
-  }
-}
-
-// deprecated
-void TopModuleGraph::pop_stamp() {
-  fail("Cannot use pop_stamp function");
-  ModuleGraph::Ptr module_graph = *current_module;
-  if (module_graph->is_pop()) {
-    timeboard.pop_timestamp(status);
-  }
-}
-
 void TopModuleGraph::set_stamp() {
   ModuleGraph::Ptr module_graph = *current_module;
   if (!module_graph->is_stamped()) {
@@ -235,6 +216,7 @@ void TopModuleGraph::set_pop_status() {
   }
 
   ExecStatus exec_status = device->getExecStatus();
+  status.kv_write_time += exec_status.kv_write_duration;
 
   if (status.parallel_execution) {
     if (exec_status.processor_type == ProcessorType::LOGIC ||
@@ -247,10 +229,8 @@ void TopModuleGraph::set_pop_status() {
     }
   } else {
     status.device_time += exec_status.total_duration;
-    // status.high_time = status.device_time;
-    // status.low_time = status.device_time;
   }
-  
+
   if (exec_status.processor_type == ProcessorType::PIM ||
       exec_status.processor_type == ProcessorType::LOGIC ||
       exec_status.processor_type == ProcessorType::GPU) {
@@ -271,31 +251,7 @@ void TopModuleGraph::set_pop_status() {
 
     status.mac_energy +=
         exec_status.flops * dram_powers[processor_type].kMAC_energy_j_;
-    ;  // 2flops per operation, energy per operation, pJ to nJ
   }
-
-  // if (!exec_status.parallel_execution) {
-  //   // status.device_time = std::max(status.device_time,
-  //   //                               std::max(status.low_time,
-  //   //                               status.high_time));
-  //   // status.low_time = status.device_time;
-  //   // status.high_time = status.device_time;
-  //   status.parallel_execution = false;
-  // } else {
-  //   status.parallel_execution = true;
-  // }
-
-  // if (exec_status.processor_type == ProcessorType::LOGIC ||
-  //     exec_status.processor_type == ProcessorType::PIM) {
-  //   status.low_time += exec_status.total_duration;
-  //   status.device_time = status.low_time;
-  // } else if (exec_status.processor_type == ProcessorType::GPU) {
-  //   status.high_time += exec_status.total_duration;
-  //   status.device_time = status.high_time;
-  // } else {
-  //   status.low_time = status.device_time;
-  //   status.high_time = status.device_time;
-  // }
 
   status.compute_util = exec_status.compute_util;
   status.memory_util = exec_status.memory_util;

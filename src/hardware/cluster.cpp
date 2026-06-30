@@ -1,9 +1,11 @@
 #include "hardware/cluster.h"
 
 #include <filesystem>
+#include <cmath>
 
 #include "common/assert.h"
 #include "hardware/stat.h"
+#include "model/footprint.h"
 #include "module/module_graph.h"
 #include "module/tensor.h"
 #include "module/timeboard.h"
@@ -72,7 +74,10 @@ void Cluster::set_dependency_tensor(std::vector<Tensor::Ptr> &list,
   }
 }
 
-bool Cluster::checkMemorySize() {
+bool Cluster::checkMemorySize(double pred_weight_bytes,
+                               double pred_kv_bytes,
+                               double pred_act_bytes,
+                               double pred_total_bytes) {
   Device::Ptr device = get_device(0);
   auto module = module_map.at(0).at("::LLM");
   auto size_vector = module->get_size();
@@ -81,11 +86,13 @@ bool Cluster::checkMemorySize() {
   int e_tp_dg = device->model_config.e_tp_dg;
 
   int num_total_device = device->config.num_device * device->config.num_node;
-  int num_routed_expert_per_device = device->model_config.num_routed_expert * e_tp_dg / num_total_device;
+  // Use double: Maverick top_k=1/num_routed=128 gives expert_batch_size=0 as int
+  // below batch 128, zeroing all MoE-FFN activation terms in the live-sim gate.
+  double num_routed_expert_per_device = (double)device->model_config.num_routed_expert * e_tp_dg / num_total_device;
 
   int batch_size_per_dp = scheduler->batch_size_per_dp;
   int total_batch_size = scheduler->total_batch_size;
-  int expert_batch_size = device->model_config.expert_freq ? total_batch_size * device->model_config.top_k / device->model_config.num_routed_expert : 0;
+  double expert_batch_size = device->model_config.expert_freq ? (double)total_batch_size * device->model_config.top_k / device->model_config.num_routed_expert : 0.0;
 
   int input_len = device->model_config.input_len;
   int total_len = device->model_config.input_len + device->model_config.output_len;
@@ -217,27 +224,93 @@ bool Cluster::checkMemorySize() {
     }
   }
 
+  // Use analytic activation_size for both branches so the printed ACT:, the size total,
+  // and the Part C scarce-tier gate all reference the same per-decode-step metric.
   double size = 0;
-  if(device->model_config.q_lora_rank == 0){
-    std::cout << "ACT: "
-            << size_vector.at(0) / 1024.0 / 1024 / 1024 /
-                   device->model_config.num_layers
-            << "GB, Weight: " << size_vector.at(1) / 1024.0 / 1024 / 1024
-            << "GB, Cache: " << size_vector.at(2) / 1024.0 / 1024 / 1024 << "GB"
-            << std::endl;
-    size = size_vector.at(0) / device->model_config.num_layers +
-            size_vector.at(1) + size_vector.at(2);
-  }
-  else{ // for MLA
-    std::cout << "ACT: "
+  std::cout << "ACT: "
             << activation_size / 1024.0 / 1024 / 1024
             << "GB, Weight: " << size_vector.at(1) / 1024.0 / 1024 / 1024
             << "GB, Cache: " << size_vector.at(2) / 1024.0 / 1024 / 1024 << "GB"
             << std::endl;
-    size =activation_size + size_vector.at(1) + size_vector.at(2);               
-  }            
+  size = activation_size + size_vector.at(1) + size_vector.at(2);
                  
   std::cout << "Total: " << size / 1024.0 / 1024 / 1024 << "GB" << std::endl;
+
+  // ---- Part C: generalised activation-scarce-tier check ---------------------
+  // Previously only fired for num_hbm_stacks==0 (logic SRAM).  Now also checks
+  // activation against the HBM-stack capacity when num_hbm_stacks>0, using the
+  // same scarceTierActivationLimit() helper shared with the optimizer.
+  // This is side-effect-free: only sets out_of_memory / fail(), never mutates
+  // batch size (the mem_cap_limit batch-shrink path at :289 is unchanged).
+  if (hasScarceTier(config)) {
+    double act_limit = scarceTierActivationLimit(config);
+    // Use the analytic per-decode-step activation peak for both MLA and non-MLA models.
+    // The recorded size_vector.at(0)/num_layers is the cumulative activation across the
+    // full scheduler working set, not the per-step peak — using it here would falsely OOM
+    // HBF+/CONV+ runs even at batch=1 (see Part E comment below for why it is skipped
+    // in the drift harness for the same reason).  The analytic activation_size is computed
+    // above for all decode/prefill branches (lines 107-222) and is the same metric used
+    // by the optimizer's checkCapacity gate, so the two gates are now consistent.
+    double act_val = activation_size;
+    if (act_val > act_limit) {
+      out_of_memory = true;
+      std::string tier = (config.hbf_config.num_hbm_stacks > 0) ? "HBM" : "Logic SRAM";
+      if (config.exit_out_of_memory) {
+        fail("Activations exceed " + tier + " capacity: " +
+             std::to_string(act_val / 1e6) + " MB > " +
+             std::to_string(act_limit / 1e6) + " MB");
+      }
+    }
+  }
+
+  // ---- Part E: optimizer drift harness (footprint) --------------------------
+  // Compare the optimizer's predictions against the simulator's ground truth.
+  // Non-circular: weight (at(1)) and KV (at(2)) use recorded tensors; act uses
+  // recorded at(0)/num_layers for non-MLA (non-circular) or the analytic formula
+  // for MLA (partially circular — still catches formula-vs-formula drift).
+  if (pred_weight_bytes >= 0 && config.validate_optimizer != "off") {
+    double eps = 1.0;  // 1 byte guard against division by zero
+    double thresh = config.validate_optimizer_threshold;
+
+    auto check_field = [&](const std::string& name, double pred, double actual) {
+      double div = std::abs(pred - actual) / std::max(actual, eps);
+      if (div > thresh) {
+        std::string msg = "[OptValidation] " + name +
+                          ": pred=" + std::to_string(pred / 1e9) + "GB" +
+                          " actual=" + std::to_string(actual / 1e9) + "GB" +
+                          " div=" + std::to_string(div * 100.0) + "% WARN";
+        if (config.validate_optimizer == "strict") {
+          fail(msg);
+        } else {
+          std::cout << msg << std::endl;
+        }
+      }
+    };
+
+    double actual_weight = size_vector.at(1);
+    double actual_kv     = size_vector.at(2);
+    double actual_total  = size;
+
+    check_field("weight", pred_weight_bytes, actual_weight);
+    check_field("kv",     pred_kv_bytes,     actual_kv);
+
+    if (device->model_config.q_lora_rank != 0) {
+      // MLA: compare analytic activation_size on both sides (partially circular —
+      // catches formula-vs-formula drift between optimizer and cluster).
+      check_field("act", pred_act_bytes, (double)activation_size);
+      // Total: include analytic act on both sides (consistent with size = activation_size + wgt + kv).
+      check_field("total", pred_total_bytes, actual_total);
+    } else {
+      // Non-MLA: at(0)/num_layers is the max-batch cumulative activation sum (graph built with
+      // num_max_batched_token/batch_size_per_dp tokens/sequence).  The optimizer predicts the
+      // per-decode-step peak activation (1 token/sequence) — fundamentally different metrics.
+      // Comparing them produces a spurious WARN (~100%), so we skip the act comparison.
+      // For total: exclude the act term from both sides so the weight+KV signal isn't masked.
+      double pred_wgt_kv  = pred_weight_bytes + pred_kv_bytes;
+      double actual_wgt_kv = actual_weight + actual_kv;
+      check_field("total(wgt+kv)", pred_wgt_kv, actual_wgt_kv);
+    }
+  }
   if (size > config.memory_capacity) {
     out_of_memory = true;
     if (config.exit_out_of_memory) {
@@ -399,9 +472,11 @@ void Cluster::exportToCSV(std::ofstream &csv, std::vector<Stat> &stat_list) {
         << std::to_string(temp.o_proj) << "," << std::to_string(temp.ffn) << ","
         << std::to_string(temp.expert_ffn) << ","
         << std::to_string(temp.communication) << ","
+        << std::to_string(temp.kv_write) << ","
         << std::to_string(temp.rope) << ","
         << std::to_string(temp.layernorm) << ","
         << std::to_string(temp.residual) << ","
+        << std::to_string(temp.lm_head) << ","
         << std::to_string(temp.act_energy) << ","
         << std::to_string(temp.read_energy) << ","
         << std::to_string(temp.write_energy) << ","
@@ -430,7 +505,7 @@ std::vector<Stat> Cluster::runIteration(int iter, std::string file_name) {
          "input_len,output_len,num_sum_iter,mixed,batchsize,numtoken,num_sum_"
          "seq,num_gen_seq,seqlen,sum_attention_opb,qkvgen,q_down_proj,kv_down_proj,kr_proj,"
          "q_up_proj,qr_proj,kv_up_proj,tr_k_up_proj,v_up_proj,atten_sum,atten_gen,"
-         "o_proj,ffn,expert_ffn,communication,rope,layernorm,residual,act_energy,read_energy,write_"
+         "o_proj,ffn,expert_ffn,communication,kv_write,rope,layernorm,residual,lm_head,act_energy,read_energy,write_"
          "energy,all_act_energy,all_read_energy,all_write_energy,mac_energy,"
          "total_energy,fc_dram,fc_comp,attn_dram,attn_comp,moe_dram,moe_comp,OOM"
       << std::endl;
@@ -586,6 +661,36 @@ std::vector<Stat> Cluster::runIterationSumGenSplit(int iter,
 
       scheduler->fillSequenceQueue(time, total_time);
       scheduler->fillRunningQueue(sum_machine_time);
+
+      time_ns kv_overhead_in_this_iter = 0;
+      if (get_device(0)->config.use_hbf && get_device(0)->config.hbf_config.num_flash_stacks > 0) {
+        auto& cfg = get_device(0)->config;
+        auto& model_config = get_device(0)->model_config;
+        for (auto batch : scheduler->running_queue) {
+          for (auto seq : batch->get_gen()) {
+            if (!seq->kv_transferred) {
+              long long kv_size = 0;
+              if (model_config.compressed_kv) {
+                kv_size = (long long)model_config.num_layers *
+                          (model_config.kv_lora_rank + model_config.qk_rope_head_dim) *
+                          seq->input_len * model_config.precision_byte;
+              } else {
+                kv_size = 2LL * model_config.num_layers * model_config.num_kv_heads *
+                          model_config.head_dim * seq->input_len * model_config.precision_byte;
+              }
+
+              time_ns write_latency = ((double)kv_size / cfg.hbf_config.flash_write_bandwidth * 1e9) +
+                                      cfg.hbf_config.flash_page_program_latency_ns;
+              time_ns transfer_latency = (double)kv_size / cfg.device_ict_bandwidth * 1e9;
+
+              seq->kv_transfer_overhead = transfer_latency;
+              seq->kv_transferred = true;
+              kv_overhead_in_this_iter += seq->kv_transfer_overhead;
+            }
+          }
+        }
+      }
+      total_time += kv_overhead_in_this_iter;
     }
     // sum machine
     else {
@@ -697,6 +802,7 @@ void Cluster::setTimeBreakDown(Stat &stat) {
     std::vector<TimeStamp *> RoPE;
     std::vector<TimeStamp *> LayerNorm;
     std::vector<TimeStamp *> Residual;
+    std::vector<TimeStamp *> LmHead;
 
     timeboard.find_stamp("attn_qkv_proj", QKV_gen);
     timeboard.find_stamp("AttentionSum", AttnSum);
@@ -720,6 +826,7 @@ void Cluster::setTimeBreakDown(Stat &stat) {
     
     timeboard.find_stamp("residual_1", Residual);
     timeboard.find_stamp("residual_2", Residual);
+    timeboard.find_stamp("lm_head", LmHead);
 
     time_ns qkv_gen = 0;
     time_ns atten_sum = 0;
@@ -733,6 +840,7 @@ void Cluster::setTimeBreakDown(Stat &stat) {
     time_ns rope = 0;
     time_ns layernorm = 0;
     time_ns residual = 0;
+    time_ns lm_head_time = 0;
 
     energy_nJ FC_DRAM = 0;
     energy_nJ FC_COMP = 0;
@@ -748,19 +856,27 @@ void Cluster::setTimeBreakDown(Stat &stat) {
     }
     stat.qkv_gen = qkv_gen;
 
+    time_ns kv_write = 0;
     for (auto stamp : AttnSum) {
-      atten_sum += stamp->get_duration();
+      time_ns stamp_dur = stamp->get_duration();
+      time_ns stamp_kv = stamp->get_kv_write();
+      atten_sum += (stamp_dur - stamp_kv);
+      kv_write += stamp_kv;
       Attn_DRAM += stamp->getDramEnergy() * num_total_device;
       Attn_COMP += stamp->getCompEnergy() * num_total_device;
     }
     stat.atten_sum = atten_sum;
 
     for (auto stamp : AttnGen) {
-      atten_gen += stamp->get_duration();
+      time_ns stamp_dur = stamp->get_duration();
+      time_ns stamp_kv = stamp->get_kv_write();
+      atten_gen += (stamp_dur - stamp_kv);
+      kv_write += stamp_kv;
       Attn_DRAM += stamp->getDramEnergy() * num_total_device;
       Attn_COMP += stamp->getCompEnergy() * num_total_device;
     }
     stat.atten_gen = atten_gen;
+    stat.kv_write = kv_write;
 
     for (auto stamp : O_proj) {
       o_proj += stamp->get_duration();
@@ -817,14 +933,19 @@ void Cluster::setTimeBreakDown(Stat &stat) {
     }
     stat.residual = residual;
 
+    for (auto stamp : LmHead) {
+      lm_head_time += stamp->get_duration();
+    }
+    stat.lm_head = lm_head_time;
+
     stat.FC_DRAM_energy = FC_DRAM;
     stat.FC_COMP_energy = FC_COMP;
     stat.Attn_DRAM_energy = Attn_DRAM;
     stat.Attn_COMP_energy = Attn_COMP;
     stat.MoE_DRAM_energy = MoE_DRAM;
     stat.MoE_COMP_energy = MoE_COMP;
-    stat.isOOM = out_of_memory;    
-    
+    stat.isOOM = out_of_memory;
+
     double opb = 0;
     for (auto stamp : AttnSum) {
       opb += stamp->getOpb();
@@ -860,9 +981,10 @@ void Cluster::setTimeBreakDown(Stat &stat) {
 
     std::vector<TimeStamp *> FFN;        
     std::vector<TimeStamp *> ExpertFFN;  
-    std::vector<TimeStamp *> Comm;       
+    std::vector<TimeStamp *> Comm;
     std::vector<TimeStamp *> CommInExpertFFN;
     std::vector<TimeStamp *> Test;
+    std::vector<TimeStamp *> LmHead;
 
     timeboard.find_stamp("attn_q_down_proj", Q_down);
     timeboard.find_stamp("attn_kv_down_proj", KV_down);
@@ -901,6 +1023,7 @@ void Cluster::setTimeBreakDown(Stat &stat) {
     
     timeboard.find_stamp("residual_1", Residual);
     timeboard.find_stamp("residual_2", Residual);
+    timeboard.find_stamp("lm_head", LmHead);
 
     timeboard.find_stamp("decoder_", Decoders);
 
@@ -928,6 +1051,7 @@ void Cluster::setTimeBreakDown(Stat &stat) {
     time_ns rope = 0;
     time_ns layernorm = 0;
     time_ns residual = 0;
+    time_ns lm_head_time = 0;
 
     energy_nJ FC_DRAM = 0;
     energy_nJ FC_COMP = 0;
@@ -992,19 +1116,27 @@ void Cluster::setTimeBreakDown(Stat &stat) {
     }
     stat.v_up_proj = v_up_proj;
 
+    time_ns kv_write = 0;
     for (auto stamp : AttnSum) {
-      atten_sum += stamp->get_duration();
+      time_ns stamp_dur = stamp->get_duration();
+      time_ns stamp_kv = stamp->get_kv_write();
+      atten_sum += (stamp_dur - stamp_kv);
+      kv_write += stamp_kv;
       Attn_DRAM += stamp->getDramEnergy() * num_total_device;
       Attn_COMP += stamp->getCompEnergy() * num_total_device;
     }
     stat.atten_sum = atten_sum;
 
     for (auto stamp : AttnGen) {
-      atten_gen += stamp->get_duration();
+      time_ns stamp_dur = stamp->get_duration();
+      time_ns stamp_kv = stamp->get_kv_write();
+      atten_gen += (stamp_dur - stamp_kv);
+      kv_write += stamp_kv;
       Attn_DRAM += stamp->getDramEnergy() * num_total_device;
       Attn_COMP += stamp->getCompEnergy() * num_total_device;
     }
     stat.atten_gen = atten_gen;
+    stat.kv_write = kv_write;
 
     for (auto stamp : O_proj) {
       o_proj += stamp->get_duration();
@@ -1061,6 +1193,11 @@ void Cluster::setTimeBreakDown(Stat &stat) {
     }
     stat.residual = residual;
 
+    for (auto stamp : LmHead) {
+      lm_head_time += stamp->get_duration();
+    }
+    stat.lm_head = lm_head_time;
+
     stat.FC_DRAM_energy = FC_DRAM;
     stat.FC_COMP_energy = FC_COMP;
     stat.Attn_DRAM_energy = Attn_DRAM;
@@ -1068,7 +1205,7 @@ void Cluster::setTimeBreakDown(Stat &stat) {
     stat.MoE_DRAM_energy = MoE_DRAM;
     stat.MoE_COMP_energy = MoE_COMP;
     stat.isOOM = out_of_memory;
-    
+
     double opb = 0;
     for (auto stamp : AttnSum) {
       opb += stamp->getOpb();

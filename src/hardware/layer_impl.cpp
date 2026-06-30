@@ -28,7 +28,6 @@ ExecStatus getIdealMemoryStatus(Device_Ptr device, ProcessorType processor_type,
                           DRAMRequestType dram_request_type, Tensor_Ptr tensor) {
   
   ExecStatus exec_status;
-  long total_size = tensor->getSize();
   device->run_ideal(dram_request_type, tensor);
   exec_status = device->dram_interface->getExecStatus(); 
   return exec_status;

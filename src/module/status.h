@@ -16,6 +16,7 @@ struct ExecStatus {
   time_ns total_duration = 0.0;
   time_ns compute_duration = 0.0;
   time_ns memory_duration = 0.0;
+  time_ns kv_write_duration = 0.0;  // track unhidden KV write duration separately
 
   hw_metric flops = 0.0;
   hw_metric memory_size = 0.0;
@@ -42,6 +43,7 @@ struct ExecStatus {
 
   ExecStatus& operator+=(const ExecStatus& rhs) {
     memory_duration += rhs.memory_duration;
+    kv_write_duration += rhs.kv_write_duration;
     generic_read_cmd += rhs.generic_read_cmd;
     compute_pim_cmd += rhs.compute_pim_cmd;
     move_pim_cmd += rhs.compute_pim_cmd;
@@ -68,6 +70,7 @@ class StatusBoard {
 
   time_ns high_time = 0;  // time of GPU
   time_ns low_time = 0;   // time of PIM
+  time_ns kv_write_time = 0; // accumulated KV write time
 
   Tensor_Ptr tensor;
 

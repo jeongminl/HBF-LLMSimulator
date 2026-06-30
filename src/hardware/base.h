@@ -22,6 +22,10 @@ struct LayerInfo {
   bool duplicated_input = false;
   bool use_flash_mla = true;
   bool use_flash_attention = true;
+  bool use_chunked_attention = false;
+  // 0 = use the global system.chunk_size setting (from config.yaml).
+  // Set to a positive value to override chunk granularity for this layer only.
+  int chunk_size = 0;
 };
 
 enum class LayerType {

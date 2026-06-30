@@ -26,6 +26,12 @@ Device::Device(SystemConfig config, int device_total_rank, Cluster_ptr cluster)
   compute_peak_flops = config.compute_peak_flops;
   memory_bandwidth = config.memory_bandwidth;
   memory_capacity = config.memory_capacity;
+  if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+    this->config.memory_capacity = config.hbf_config.total_capacity_bytes;
+    memory_capacity = config.hbf_config.total_capacity_bytes;
+    this->config.memory_bandwidth = config.hbf_config.flash_read_bandwidth;
+    memory_bandwidth = config.hbf_config.flash_read_bandwidth;
+  }
   device_local_rank = device_total_rank % config.num_device;
 
   top_module_graph = TopModuleGraph::Create(status);
@@ -69,7 +75,7 @@ bool Device::check_module_graph_remain() {
 };
 
 void Device::run(std::vector<BatchedSequence::Ptr> sequences_metadata_list) {
-  int dp_rank = device_total_rank / model_config.ne_tp_dg;
+  int dp_rank = device_total_rank / (model_config.ne_tp_dg * model_config.pp_dg);
   top_module_graph->run(sequences_metadata_list.at(dp_rank));
 }
 

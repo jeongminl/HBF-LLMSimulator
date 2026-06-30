@@ -30,8 +30,6 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
   int num_kv_heads = layer_info.num_kv_heads;
   int attention_group_size = layer_info.attention_group_size;
 
-  time_ns time = 0;
-
   int m, n, k;
   double flops, memory_size;
   double total_flops = 0;
@@ -39,7 +37,6 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
 
   time_ns compute_duration;
   time_ns memory_duration;
-  time_ns total_duration = 0;
 
   ExecStatus exec_status;
   if (sequences_metadata->get_gen_process_token() == 0) {
@@ -57,6 +54,8 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
   int accumul_len = 0;
   time_ns accumul_compute_duration = 0;
   time_ns accumul_memory_duration = 0;
+  hw_metric total_kv_read_size = 0;
+  hw_metric total_act_size = 0;
   for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
     seq = seq_list.at(seq_idx);
 
@@ -75,10 +74,19 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
       exec_status.compute_duration += compute_duration;
       accumul_compute_duration += compute_duration;
 
-      memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
-      accumul_memory_duration += memory_duration;
+      if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+        total_kv_read_size += k * n * input->precision_byte;
+        total_act_size += (m * k * num_heads / num_kv_heads + m * n * num_heads / num_kv_heads) * input->precision_byte;
+      } else {
+        memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+        accumul_memory_duration += memory_duration;
+      }
     }
     accumul_len += n;
+  }
+
+  if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+    accumul_memory_duration = getAttentionMemoryDuration(config, total_kv_read_size, total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size);
   }
 
   if (use_ramulator) {
@@ -119,9 +127,14 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
   }
 
   // Context //
+  // Context: accumulate total KV read and activation sizes across all (seq × kv_head) pairs
+  // and call getAttentionMemoryDuration once after the loop.  Per-iteration calls would charge
+  // one full flash_page_read_latency per (seq, kv_head) pair instead of once per chunk.
   accumul_len = 0;
   accumul_compute_duration = 0;
   accumul_memory_duration = 0;
+  hw_metric total_context_kv_read_size = 0;
+  hw_metric total_context_act_size = 0;
   for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
     seq = seq_list.at(seq_idx);
 
@@ -140,10 +153,18 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
       exec_status.compute_duration += compute_duration;
       accumul_compute_duration += compute_duration;
 
-      memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
-      accumul_memory_duration += memory_duration;
+      if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+        total_context_kv_read_size += k * n * input->precision_byte;
+        total_context_act_size += (m * k * num_heads / num_kv_heads + m * n * num_heads / num_kv_heads) * input->precision_byte;
+      } else {
+        memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+        accumul_memory_duration += memory_duration;
+      }
     }
     accumul_len += k;
+  }
+  if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+    accumul_memory_duration = getAttentionMemoryDuration(config, total_context_kv_read_size, total_context_act_size, layer_info.use_chunked_attention, layer_info.chunk_size);
   }
 
   if (use_ramulator) {
@@ -154,7 +175,7 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
                        DRAMRequestType::kRead, PIMOperandType::kDRAM, v_cache);
     exec_status += temp;
     accumul_memory_duration = temp.memory_duration;
-  }  
+  }
   else {
     v_cache->setShape({accumul_len, head_dim * num_kv_heads});
     ExecStatus temp;
@@ -168,10 +189,20 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
   exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /
                              compute_peak_flops / exec_status.total_duration;
   exec_status.memory_util = 1000.0 * 1000.0 * 1000.0 * total_memory_size /
-                            memory_bandwidth / exec_status.total_duration;
+                            ((config.use_hbf && config.hbf_config.num_flash_stacks > 0) ? config.hbf_config.flash_read_bandwidth : memory_bandwidth) / exec_status.total_duration;
 
   exec_status.flops = total_flops;
   exec_status.memory_size = total_memory_size;
+
+  if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+    // Only the unhidden portion of KV write extends the critical path.
+    // The write can overlap with the attention compute phase (both Scoring and
+    // Context).  exec_status.compute_duration accumulates across both phases.
+    time_ns kv_write = getKVWriteDuration(config, num_seq, num_kv_heads, head_dim, input->precision_byte, false, 0, 0, device->model_config.input_len, device->model_config.output_len);
+    time_ns unhidden_write = std::max((time_ns)0, kv_write - exec_status.compute_duration);
+    exec_status.total_duration += unhidden_write;
+    exec_status.kv_write_duration = unhidden_write;
+  }
 
   return exec_status;
 };
@@ -198,8 +229,6 @@ ExecStatus AttentionGenExecutionLogic(Device_Ptr device,
   int num_kv_heads = layer_info.num_kv_heads;
   int attention_group_size = layer_info.attention_group_size;
 
-  time_ns time = 0;
-
   int m, n, k;
   double flops = 0;
   double memory_size = 0;
@@ -208,7 +237,6 @@ ExecStatus AttentionGenExecutionLogic(Device_Ptr device,
 
   time_ns compute_duration;
   time_ns memory_duration;
-  time_ns total_duration = 0;
 
   ExecStatus exec_status;
   if (sequences_metadata->get_gen_process_token() == 0) {
@@ -350,8 +378,6 @@ ExecStatus AttentionGenExecutionPIM(Device_Ptr device,
   int num_kv_heads = layer_info.num_kv_heads;
   int attention_group_size = layer_info.attention_group_size;
 
-  time_ns time = 0;
-
   int m, n, k;
   double flops = 0;
   double memory_size = 0;
@@ -360,7 +386,6 @@ ExecStatus AttentionGenExecutionPIM(Device_Ptr device,
 
   time_ns compute_duration;
   time_ns memory_duration;
-  time_ns total_duration = 0;
 
   ExecStatus exec_status;
   if (sequences_metadata->get_gen_process_token() == 0) {
@@ -473,7 +498,6 @@ ExecStatus AttentionGenExecutionPIM(Device_Ptr device,
   opb = total_flops / total_memory_size;
   exec_status.total_duration += accumul_memory_duration * opb;
 
-  // exec_status.total_duration = total_duration;
 
   exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /
                              compute_peak_flops / exec_status.total_duration;
@@ -511,8 +535,6 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
   int qk_rope_head_dim = layer_info.qk_rope_head_dim;
   bool use_flash_mla = layer_info.use_flash_mla;
 
-  time_ns time = 0;
-
   int m, n, k;
   double flops, memory_size;
   double total_flops = 0;
@@ -520,7 +542,6 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
 
   time_ns compute_duration;
   time_ns memory_duration;
-  time_ns total_duration = 0;
 
   ExecStatus exec_status;
   if (sequences_metadata->get_gen_process_token() == 0) {
@@ -540,6 +561,8 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
   time_ns accumul_memory_duration = 0;
 
   if(use_flash_mla){
+    hw_metric total_kv_read_size = 0;
+    hw_metric total_act_size = 0;
     for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
       seq = seq_list.at(seq_idx);
 
@@ -553,7 +576,6 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
               2.0 * m * (head_dim) * n * num_heads; // context
       total_flops += flops;
 
-
       memory_size = 1.0 * (m * (head_dim + qk_rope_head_dim) + // query
                     1.0 * n * (head_dim + qk_rope_head_dim) + // key
                     1.0 * n * head_dim + // value
@@ -562,12 +584,19 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
       total_memory_size += memory_size;
 
       accumul_compute_duration += flops / compute_peak_flops * 1000 * 1000 * 1000;
-      exec_status.compute_duration += accumul_compute_duration;
+      exec_status.compute_duration += flops / compute_peak_flops * 1000 * 1000 * 1000;
 
-      accumul_memory_duration +=
-          memory_size / memory_bandwidth * 1000 * 1000 * 1000;
-      exec_status.memory_duration += accumul_memory_duration;
+      if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+        total_kv_read_size += n * (2.0 * head_dim + qk_rope_head_dim) * num_heads * input->precision_byte;
+        total_act_size += m * (2.0 * head_dim + qk_rope_head_dim) * num_heads * input->precision_byte;
+      } else {
+        accumul_memory_duration += memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+      }
     }
+    if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+      accumul_memory_duration = getAttentionMemoryDuration(config, total_kv_read_size, total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size);
+    }
+    exec_status.memory_duration += accumul_memory_duration;
 
     if(use_ramulator) {
       ExecStatus temp;
@@ -619,7 +648,9 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
   }
   else{
 
-    // Score //
+     // Score //
+    hw_metric total_kv_read_size = 0;
+    hw_metric total_act_size = 0;
     for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
       seq = seq_list.at(seq_idx);
 
@@ -638,10 +669,18 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
         exec_status.compute_duration += compute_duration;
         accumul_compute_duration += compute_duration;
 
-        memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
-        accumul_memory_duration += memory_duration;
+        if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+          total_kv_read_size += k * n * input->precision_byte;
+          total_act_size += (m * k + m * n) * input->precision_byte;
+        } else {
+          memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+          accumul_memory_duration += memory_duration;
+        }
       }
       accumul_len += n;
+    }
+    if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+      accumul_memory_duration = getAttentionMemoryDuration(config, total_kv_read_size, total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size);
     }
 
     if(use_ramulator) {
@@ -735,6 +774,8 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
     accumul_len = 0;
     accumul_compute_duration = 0;
     accumul_memory_duration = 0;
+    total_kv_read_size = 0;
+    total_act_size = 0;
     for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
       seq = seq_list.at(seq_idx);
 
@@ -753,10 +794,18 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
         exec_status.compute_duration += compute_duration;
         accumul_compute_duration += compute_duration;
 
-        memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
-        accumul_memory_duration += memory_duration;
+        if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+          total_kv_read_size += k * n * input->precision_byte;
+          total_act_size += (m * k + m * n) * input->precision_byte;
+        } else {
+          memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+          accumul_memory_duration += memory_duration;
+        }
       }
       accumul_len += k;
+    }
+    if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+      accumul_memory_duration = getAttentionMemoryDuration(config, total_kv_read_size, total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size);
     }
 
     if (use_ramulator) {
@@ -802,11 +851,21 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
   exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /
   compute_peak_flops / exec_status.total_duration;
   exec_status.memory_util = 1000.0 * 1000.0 * 1000.0 * total_memory_size /
-  memory_bandwidth / exec_status.total_duration;
+  ((config.use_hbf && config.hbf_config.num_flash_stacks > 0) ? config.hbf_config.flash_read_bandwidth : memory_bandwidth) / exec_status.total_duration;
 
   exec_status.flops = total_flops;
   exec_status.memory_size = total_memory_size;
   input->setShape(orig_shape); // restore orig shape of input
+
+  if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+    time_ns kv_write = getKVWriteDuration(config, num_seq, num_kv_heads, head_dim, input->precision_byte, compressed_kv, layer_info.kv_lora_rank, qk_rope_head_dim, device->model_config.input_len, device->model_config.output_len);
+    // Use total compute (Scoring + Context) for overlap; exec_status.compute_duration
+    // accumulates across both phases and is correct here.
+    time_ns unhidden_write = std::max((time_ns)0, kv_write - exec_status.compute_duration);
+    exec_status.total_duration += unhidden_write;
+    exec_status.kv_write_duration = unhidden_write;
+  }
+
   return exec_status;
 };
 
@@ -839,8 +898,6 @@ ExecStatus MultiLatentAttentionGenExecutionLogic(Device_Ptr device,
   int qk_rope_head_dim = layer_info.qk_rope_head_dim;
   int use_flash_mla = layer_info.use_flash_mla;
 
-  time_ns time = 0;
-
   int m, n, k;
   double flops, memory_size;
   double total_flops = 0;
@@ -848,7 +905,6 @@ ExecStatus MultiLatentAttentionGenExecutionLogic(Device_Ptr device,
 
   time_ns compute_duration;
   time_ns memory_duration;
-  time_ns total_duration = 0;
 
   ExecStatus exec_status;
   if (sequences_metadata->get_gen_process_token() == 0) {
@@ -890,12 +946,14 @@ ExecStatus MultiLatentAttentionGenExecutionLogic(Device_Ptr device,
                     num_heads * input->precision_byte;
       total_memory_size += memory_size;
 
-      accumul_compute_duration += flops / compute_peak_flops * 1000 * 1000 * 1000;
-      exec_status.compute_duration += accumul_compute_duration;
+      // Add per-iteration value, not the running sum (running sum causes N²/2 over-count).
+      time_ns iter_compute = flops / compute_peak_flops * 1000 * 1000 * 1000;
+      accumul_compute_duration += iter_compute;
+      exec_status.compute_duration += iter_compute;
 
-      accumul_memory_duration +=
-          memory_size / memory_bandwidth * 1000 * 1000 * 1000;
-      exec_status.memory_duration += accumul_memory_duration;
+      time_ns iter_memory = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+      accumul_memory_duration += iter_memory;
+      exec_status.memory_duration += iter_memory;
     }
 
     if(use_ramulator) {
@@ -1167,8 +1225,6 @@ ExecStatus MultiLatentAttentionGenExecutionPIM(Device_Ptr device,
   int qk_rope_head_dim = layer_info.qk_rope_head_dim;
   int use_flash_mla = layer_info.use_flash_mla;
 
-  time_ns time = 0;
-
   int m, n, k;
   double flops, memory_size;
   double total_flops = 0;
@@ -1176,7 +1232,6 @@ ExecStatus MultiLatentAttentionGenExecutionPIM(Device_Ptr device,
 
   time_ns compute_duration;
   time_ns memory_duration;
-  time_ns total_duration = 0;
 
   ExecStatus exec_status;
   if (sequences_metadata->get_gen_process_token() == 0) {
@@ -1218,12 +1273,14 @@ ExecStatus MultiLatentAttentionGenExecutionPIM(Device_Ptr device,
                     num_heads * input->precision_byte;
       total_memory_size += memory_size;
 
-      accumul_compute_duration += flops / compute_peak_flops * 1000 * 1000 * 1000;
-      exec_status.compute_duration += accumul_compute_duration;
+      // Add per-iteration value, not the running sum (running sum causes N²/2 over-count).
+      time_ns iter_compute = flops / compute_peak_flops * 1000 * 1000 * 1000;
+      accumul_compute_duration += iter_compute;
+      exec_status.compute_duration += iter_compute;
 
-      accumul_memory_duration +=
-          memory_size / memory_bandwidth * 1000 * 1000 * 1000;
-      exec_status.memory_duration += accumul_memory_duration;
+      time_ns iter_memory = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+      accumul_memory_duration += iter_memory;
+      exec_status.memory_duration += iter_memory;
     }
 
     if(use_ramulator) {
@@ -1484,8 +1541,6 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
   int kv_lora_rank = layer_info.kv_lora_rank;
   bool use_flash_mla = layer_info.use_flash_mla;
 
-  time_ns time = 0;
-
   int m, n, k;
   double flops, memory_size;
   double total_flops = 0;
@@ -1493,7 +1548,6 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
 
   time_ns compute_duration;
   time_ns memory_duration;
-  time_ns total_duration = 0;
 
   ExecStatus exec_status;
   if (sequences_metadata->get_gen_process_token() == 0) {
@@ -1512,6 +1566,8 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
   time_ns accumul_memory_duration = 0;
 
   if(use_flash_mla){
+    hw_metric total_kv_read_size = 0;
+    hw_metric total_act_size = 0;
     for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
       seq = seq_list.at(seq_idx);
 
@@ -1525,7 +1581,6 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
               2.0 * num_heads * (kv_lora_rank) * n; // context
       total_flops += flops;
 
-
       memory_size = 1.0 * (num_heads * (kv_lora_rank + qk_rope_head_dim) + // query
                     1.0 * n * (kv_lora_rank + qk_rope_head_dim) + // latent kv and pe cache
                     1.0 * num_heads * kv_lora_rank) * // output 
@@ -1533,12 +1588,19 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
       total_memory_size += memory_size;
 
       accumul_compute_duration += flops / compute_peak_flops * 1000 * 1000 * 1000;
-      exec_status.compute_duration += accumul_compute_duration;
+      exec_status.compute_duration += flops / compute_peak_flops * 1000 * 1000 * 1000;
 
-      accumul_memory_duration +=
-          memory_size / memory_bandwidth * 1000 * 1000 * 1000;
-      exec_status.memory_duration += accumul_memory_duration;
+      if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+        total_kv_read_size += n * (kv_lora_rank + qk_rope_head_dim) * input->precision_byte;
+        total_act_size += num_heads * (kv_lora_rank + qk_rope_head_dim + kv_lora_rank) * input->precision_byte;
+      } else {
+        accumul_memory_duration += memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+      }
     }
+    if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+      accumul_memory_duration = getAttentionMemoryDuration(config, total_kv_read_size, total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size);
+    }
+    exec_status.memory_duration += accumul_memory_duration;
 
     if(use_ramulator) {
       ExecStatus temp;
@@ -1781,6 +1843,8 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
     accumul_len = 0;
     accumul_compute_duration = 0;
     accumul_memory_duration = 0;
+    hw_metric total_kv_read_size = 0;
+    hw_metric total_act_size = 0;
     for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
       seq = seq_list.at(seq_idx);
 
@@ -1798,9 +1862,17 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
       exec_status.compute_duration += compute_duration;
       accumul_compute_duration += compute_duration;
 
-      memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
-      accumul_memory_duration += memory_duration;
+      if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+        total_kv_read_size += k * n * input->precision_byte;
+        total_act_size += (m * k * num_heads + m * n * num_heads) * input->precision_byte;
+      } else {
+        memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+        accumul_memory_duration += memory_duration;
+      }
       accumul_len += k;
+    }
+    if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+      accumul_memory_duration = getAttentionMemoryDuration(config, total_kv_read_size, total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size);
     }
 
     if (use_ramulator) {
@@ -1852,17 +1924,26 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
   }
 
-  // exec_status.total_duration = total_duration;
 
   exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /
   compute_peak_flops / exec_status.total_duration;
   exec_status.memory_util = 1000.0 * 1000.0 * 1000.0 * total_memory_size /
-  memory_bandwidth / exec_status.total_duration;
+  ((config.use_hbf && config.hbf_config.num_flash_stacks > 0) ? config.hbf_config.flash_read_bandwidth : memory_bandwidth) / exec_status.total_duration;
 
   exec_status.flops = total_flops;
   exec_status.memory_size = total_memory_size;
 
   input->setShape(orig_shape); // restore orig shape of input
+
+  if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+    time_ns kv_write = getKVWriteDuration(config, num_seq, num_kv_heads, head_dim, input->precision_byte, true, kv_lora_rank, qk_rope_head_dim, device->model_config.input_len, device->model_config.output_len);
+    // Use total compute (Scoring + Context) for overlap; exec_status.compute_duration
+    // accumulates across both phases and is correct here.
+    time_ns unhidden_write = std::max((time_ns)0, kv_write - exec_status.compute_duration);
+    exec_status.total_duration += unhidden_write;
+    exec_status.kv_write_duration = unhidden_write;
+  }
+
   return exec_status;
 };
 
@@ -1888,8 +1969,6 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
   int kv_lora_rank = layer_info.kv_lora_rank;
   bool use_flash_mla = layer_info.use_flash_mla;
 
-  time_ns time = 0;
-
   int m, n, k;
   double flops, memory_size;
   double total_flops = 0;
@@ -1897,7 +1976,6 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
 
   time_ns compute_duration;
   time_ns memory_duration;
-  time_ns total_duration = 0;
 
   ExecStatus exec_status;
   if (sequences_metadata->get_gen_process_token() == 0) {
@@ -1936,12 +2014,14 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
                     input->precision_byte;
       total_memory_size += memory_size;
 
-      accumul_compute_duration += flops / compute_peak_flops * 1000 * 1000 * 1000;
-      exec_status.compute_duration += accumul_compute_duration;
+      // Add per-iteration value, not the running sum (running sum causes N²/2 over-count).
+      time_ns iter_compute = flops / compute_peak_flops * 1000 * 1000 * 1000;
+      accumul_compute_duration += iter_compute;
+      exec_status.compute_duration += iter_compute;
 
-      accumul_memory_duration +=
-          memory_size / memory_bandwidth * 1000 * 1000 * 1000;
-      exec_status.memory_duration += accumul_memory_duration;
+      time_ns iter_memory = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+      accumul_memory_duration += iter_memory;
+      exec_status.memory_duration += iter_memory;
     }
 
     if(use_ramulator) {
@@ -2291,8 +2371,6 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
   int kv_lora_rank = layer_info.kv_lora_rank;
   bool use_flash_mla = layer_info.use_flash_mla;
 
-  time_ns time = 0;
-
   int m, n, k;
   double flops, memory_size;
   double total_flops = 0;
@@ -2300,7 +2378,6 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
 
   time_ns compute_duration;
   time_ns memory_duration;
-  time_ns total_duration = 0;
 
   ExecStatus exec_status;
   if (sequences_metadata->get_gen_process_token() == 0) {
@@ -2338,12 +2415,14 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
                     input->precision_byte;
       total_memory_size += memory_size;
 
-      accumul_compute_duration += flops / compute_peak_flops * 1000 * 1000 * 1000;
-      exec_status.compute_duration += accumul_compute_duration;
+      // Add per-iteration value, not the running sum (running sum causes N²/2 over-count).
+      time_ns iter_compute = flops / compute_peak_flops * 1000 * 1000 * 1000;
+      accumul_compute_duration += iter_compute;
+      exec_status.compute_duration += iter_compute;
 
-      accumul_memory_duration +=
-          memory_size / memory_bandwidth * 1000 * 1000 * 1000;
-      exec_status.memory_duration += accumul_memory_duration;
+      time_ns iter_memory = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+      accumul_memory_duration += iter_memory;
+      exec_status.memory_duration += iter_memory;
     }
 
     if(use_ramulator) {

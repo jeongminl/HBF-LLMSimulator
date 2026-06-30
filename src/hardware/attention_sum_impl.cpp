@@ -29,9 +29,6 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
   int head_dim = layer_info.head_dim;
   int num_heads = layer_info.num_heads;
   int num_kv_heads = layer_info.num_kv_heads;
-  int attention_group_size = layer_info.attention_group_size;
-
-  time_ns time = 0;
 
   int m, n, k;
   double flops, memory_size;
@@ -42,8 +39,6 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
   if (input->getSize() == 0) {
     return exec_status;
   }
-
-  time_ns total_duration = 0;
 
   std::vector<Sequence::Ptr> seq_list = sequences_metadata->get_sum();
   Sequence::Ptr seq;
@@ -69,7 +64,25 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
     total_memory_size += memory_size;
 
     compute_duration = flops / compute_peak_flops * 1000 * 1000 * 1000;
-    memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+    // For HBF configs: KV (key cache) is on flash, activations (query + score
+    // output) are on the scarce tier (HBM for HBF, logic SRAM for HBF+).
+    // Route through getAttentionMemoryDuration so the page-read latency and
+    // tier split are modelled consistently with AttentionGen / AttentionMixed.
+    // kv_read_size = k*n*kv_heads (the key cache rows read for scoring);
+    // act_size = (query + output score) = (m*k*heads + m*n*heads).
+    // TODO: This calls getAttentionMemoryDuration once per sequence (per-seq page
+    // latency), whereas the gen path (attention_gen_impl.cpp) accumulates sizes
+    // across all sequences and calls once.  Per-seq access is a defensible model
+    // for independent prefill sequences (distinct flash addresses), but the
+    // inconsistency should be re-evaluated against the prefill spec if
+    // prefill / disaggregated experiments are added.
+    if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+      hw_metric kv_read_size = (hw_metric)k * n * num_kv_heads * input->precision_byte;
+      hw_metric act_size = (hw_metric)(m * k * num_heads + m * n * num_heads) * input->precision_byte;
+      memory_duration = getAttentionMemoryDuration(config, kv_read_size, act_size, layer_info.use_chunked_attention, layer_info.chunk_size);
+    } else {
+      memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+    }
 
     if (use_ramulator) {
       time_ns accumul_memory_duration = 0;
@@ -155,7 +168,8 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
     flops = 7.0 * m * n * num_heads;
     total_flops += flops;
 
-    memory_size = 1.0 * (m * n * num_heads * 2) * input->precision_byte;
+    // Softmax scoring is purely compute (no weight reads, activations overlapped
+    // with compute); memory_size is 0 here by design.
     memory_size = 0;
     total_memory_size += memory_size;
 
@@ -222,12 +236,24 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
     total_memory_size += memory_size;
 
     compute_duration = flops / compute_peak_flops * 1000 * 1000 * 1000;
-    memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+
+    // Context phase uses the flash model on HBF presets (same as Scoring above).
+    // kv_read_size = score(m*k*heads) + V-cache(k*n*kv_heads); act_size = output write (m*n*heads).
+    if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+      hw_metric kv_read_size = (hw_metric)(k * n * num_kv_heads) * input->precision_byte;
+      hw_metric act_size = (hw_metric)(m * k * num_heads + m * n * num_heads) * input->precision_byte;
+      memory_duration = getAttentionMemoryDuration(config, kv_read_size, act_size, layer_info.use_chunked_attention, layer_info.chunk_size);
+    } else {
+      memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+    }
 
     if (use_ramulator) {
-      // read score
+      // Accumulate memory_duration across all three ramulator ops (score-read, kv-read, write).
+      // Overwriting would leave only the final write's latency (ramulator path only).
+      time_ns accumul_memory_duration = 0;
       auto shape = input->getShape();
 
+      // read score
       shape.at(0) = m;
       shape.at(1) = k * num_heads;
       input->setShape(shape);
@@ -236,10 +262,9 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
           issueRamulator(device, LayerType::ATTENTION_SUM, ProcessorType::GPU,
                          DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
       exec_status += temp;
-      memory_duration = temp.memory_duration;
+      accumul_memory_duration += temp.memory_duration;
 
       // read kv
-
       shape.at(0) = k;
       shape.at(1) = n * num_kv_heads;
       input->setShape(shape);
@@ -248,7 +273,7 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
           issueRamulator(device, LayerType::ATTENTION_SUM, ProcessorType::GPU,
                          DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
       exec_status += temp;
-      memory_duration = temp.memory_duration;
+      accumul_memory_duration += temp.memory_duration;
 
       // write attention output
       shape.at(0) = m;
@@ -259,7 +284,8 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
           issueRamulator(device, LayerType::ATTENTION_SUM, ProcessorType::GPU,
                          DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
       exec_status += temp;
-      memory_duration = temp.memory_duration;
+      accumul_memory_duration += temp.memory_duration;
+      memory_duration = accumul_memory_duration;
     }
     else{
       // read score
@@ -325,9 +351,6 @@ ExecStatus AttentionSumExecutionLogic(Device_Ptr device,
   int head_dim = layer_info.head_dim;
   int num_heads = layer_info.num_heads;
   int num_kv_heads = layer_info.num_kv_heads;
-  int attention_group_size = layer_info.attention_group_size;
-
-  time_ns time = 0;
 
   int m, n, k;
   double flops, memory_size;
@@ -338,8 +361,6 @@ ExecStatus AttentionSumExecutionLogic(Device_Ptr device,
   if (input->getSize() == 0) {
     return exec_status;
   }
-
-  time_ns total_duration = 0;
 
   std::vector<Sequence::Ptr> seq_list = sequences_metadata->get_sum();
   Sequence::Ptr seq;
@@ -510,9 +531,6 @@ ExecStatus AttentionSumExecutionPIM(Device_Ptr device,
   int head_dim = layer_info.head_dim;
   int num_heads = layer_info.num_heads;
   int num_kv_heads = layer_info.num_kv_heads;
-  int attention_group_size = layer_info.attention_group_size;
-
-  time_ns time = 0;
 
   int m, n, k;
   double flops, memory_size;
@@ -523,8 +541,6 @@ ExecStatus AttentionSumExecutionPIM(Device_Ptr device,
   if (input->getSize() == 0) {
     return exec_status;
   }
-
-  time_ns total_duration = 0;
 
   std::vector<Sequence::Ptr> seq_list = sequences_metadata->get_sum();
   Sequence::Ptr seq;
@@ -673,8 +689,6 @@ ExecStatus MultiLatentAttentionSumExecutionGPU(Device_Ptr device,
   int qk_rope_head_dim = layer_info.qk_rope_head_dim;
   bool use_flash_attention = layer_info.use_flash_attention;
 
-  time_ns time = 0;
-
   int m, n, k;
   double flops, memory_size;
   double total_flops = 0;
@@ -684,8 +698,6 @@ ExecStatus MultiLatentAttentionSumExecutionGPU(Device_Ptr device,
   if (input->getSize() == 0) {
     return exec_status;
   }
-
-  time_ns total_duration = 0;
 
   std::vector<Sequence::Ptr> seq_list = sequences_metadata->get_sum();
   Sequence::Ptr seq;
@@ -1138,8 +1150,6 @@ ExecStatus MultiLatentAttentionSumExecutionLogic(Device_Ptr device,
   int qk_rope_head_dim = layer_info.qk_rope_head_dim;
   bool use_flash_attention = layer_info.use_flash_attention;
 
-  time_ns time = 0;
-
   int m, n, k;
   double flops, memory_size;
   double total_flops = 0;
@@ -1149,8 +1159,6 @@ ExecStatus MultiLatentAttentionSumExecutionLogic(Device_Ptr device,
   if (input->getSize() == 0) {
     return exec_status;
   }
-
-  time_ns total_duration = 0;
 
   std::vector<Sequence::Ptr> seq_list = sequences_metadata->get_sum();
   Sequence::Ptr seq;
@@ -1603,8 +1611,6 @@ ExecStatus MultiLatentAttentionSumExecutionPIM(Device_Ptr device,
   int qk_rope_head_dim = layer_info.qk_rope_head_dim;
   bool use_flash_attention = layer_info.use_flash_attention;
 
-  time_ns time = 0;
-
   int m, n, k;
   double flops, memory_size;
   double total_flops = 0;
@@ -1614,8 +1620,6 @@ ExecStatus MultiLatentAttentionSumExecutionPIM(Device_Ptr device,
   if (input->getSize() == 0) {
     return exec_status;
   }
-
-  time_ns total_duration = 0;
 
   std::vector<Sequence::Ptr> seq_list = sequences_metadata->get_sum();
   Sequence::Ptr seq;
@@ -2066,8 +2070,6 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
   int qk_rope_head_dim = layer_info.qk_rope_head_dim;
   int kv_lora_rank = layer_info.kv_lora_rank;
   
-  time_ns time = 0;
-
   int m, n, k;
   double flops, memory_size;
   double total_flops = 0;
@@ -2077,8 +2079,6 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
   if (input->getSize() == 0) {
     return exec_status;
   }
-
-  time_ns total_duration = 0;
 
   std::vector<Sequence::Ptr> seq_list = sequences_metadata->get_sum();
   Sequence::Ptr seq;
@@ -2493,8 +2493,6 @@ ExecStatus AbsorbMLASumExecutionLogic(Device_Ptr device,
   int qk_rope_head_dim = layer_info.qk_rope_head_dim;
   int kv_lora_rank = layer_info.kv_lora_rank;
 
-  time_ns time = 0;
-
   int m, n, k;
   double flops, memory_size;
   double total_flops = 0;
@@ -2504,8 +2502,6 @@ ExecStatus AbsorbMLASumExecutionLogic(Device_Ptr device,
   if (input->getSize() == 0) {
     return exec_status;
   }
-
-  time_ns total_duration = 0;
 
   std::vector<Sequence::Ptr> seq_list = sequences_metadata->get_sum();
   Sequence::Ptr seq;
@@ -2849,8 +2845,6 @@ ExecStatus AbsorbMLASumExecutionPIM(Device_Ptr device,
   int qk_rope_head_dim = layer_info.qk_rope_head_dim;
   int kv_lora_rank = layer_info.kv_lora_rank;
 
-  time_ns time = 0;
-
   int m, n, k;
   double flops, memory_size;
   double total_flops = 0;
@@ -2860,8 +2854,6 @@ ExecStatus AbsorbMLASumExecutionPIM(Device_Ptr device,
   if (input->getSize() == 0) {
     return exec_status;
   }
-
-  time_ns total_duration = 0;
 
   std::vector<Sequence::Ptr> seq_list = sequences_metadata->get_sum();
   Sequence::Ptr seq;

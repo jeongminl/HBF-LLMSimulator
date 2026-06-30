@@ -31,12 +31,6 @@ ExpertFFN::ExpertFFN(std::string& prefix, std::string& name,
       model_config.num_routed_expert, {device->device_total_rank}, device);
   add_module(gate_fn);
 
-  int num_total_device = device->config.num_node * device->config.num_device;
-  int ne_dp_dg =
-      num_total_device / ne_tp_dg;  // (= num input in Non-Expert Execution)
-  int e_dp_dg =
-      num_total_device / e_tp_dg;  // (= num input in Expert Execution)
-
   auto gate_update =
       GateUpdate::Create(module_map_name, "gate_update", device_list, device);
   add_module(gate_update);
@@ -56,11 +50,20 @@ ExpertFFN::ExpertFFN(std::string& prefix, std::string& name,
   int num_expert_tp_gr_rank = parallel_num / e_tp_dg;
   num_expert_per_device = model_config.num_routed_expert / (num_expert_tp_gr_rank);
   int device_rank = device->device_total_rank;
+  int local_rank = 0;
+  for (int idx = 0; idx < device_list.size(); idx++) {
+    if (device_list[idx] == device_rank) {
+      local_rank = idx;
+      break;
+    }
+  }
 
-  int device_offset = (device_rank / e_tp_dg) * e_tp_dg;
-  expert_offset = num_expert_per_device * (device_rank / e_tp_dg);
+  int device_offset = (local_rank / e_tp_dg) * e_tp_dg;
+  expert_offset = num_expert_per_device * (local_rank / e_tp_dg);
   std::vector<int> expert_device_list;
-  set_device_list(expert_device_list, device_offset, e_tp_dg);
+  for (int idx = device_offset; idx < device_offset + e_tp_dg; idx++) {
+    expert_device_list.push_back(device_list.at(idx));
+  }
 
   auto moe_route =
       Route::Create(module_map_name, "moe_route", num_expert_per_device,
@@ -142,7 +145,7 @@ Tensor::Ptr ExpertFFN::forward(const Tensor::Ptr input,
   Module::Ptr gate_fn = get_module("gate_fn");
   Module::Ptr gate_update = get_module("gate_update");
 
-  Tensor::Ptr gate_out = (*gate_fn)(input, sequences_metadata);
+  (*gate_fn)(input, sequences_metadata);  // gate scoring op (result unused; timed for scheduling)
   Tensor::Ptr gate_update_out = (*gate_update)(input, sequences_metadata);
 
   // MoE Scatter //

@@ -138,8 +138,6 @@ GateUpdate::GateUpdate(std::string& prefix, std::string& name,
 
 Tensor::Ptr GateUpdate::forward(const Tensor::Ptr input,
                                 BatchedSequence::Ptr sequences_metadata) {
-  int num_expert = sequences_metadata->num_expert;
-
   Tensor::Ptr output = get_activation("gate_update_output", input->shape);
   aggregate_expert(sequences_metadata);
 

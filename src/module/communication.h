@@ -31,49 +31,6 @@ class AllReduce : public Module {
                       BatchedSequence::Ptr sequences_metadata) override;
 };
 
-class AllGather : public Module {
- public:
-  using Ptr = std::shared_ptr<AllGather>;
-
-  [[nodiscard]] static Ptr Create(std::string prefix, std::string name,
-                                  std::vector<int> device_list,
-                                  Device::Ptr device) {
-    Ptr ptr = Ptr(new AllGather(prefix, name, device_list, device));
-    ptr->set_tensor_module();
-    return ptr;
-  };
-
- private:
-  AllGather(std::string& prefix, std::string& name,
-            std::vector<int> device_list, Device::Ptr device);
-  AllGather() = default;
-
-  Tensor::Ptr forward(const Tensor::Ptr input,
-                      BatchedSequence::Ptr sequences_metadata) override;
-};
- 
-class AllScatter : public Module { // or All-to-All
- public:
-  using Ptr = std::shared_ptr<AllScatter>;
-
-  [[nodiscard]] static Ptr Create(std::string prefix, std::string name,
-                                  std::vector<int> device_list,
-                                  Device::Ptr device) {
-    Ptr ptr = Ptr(new AllScatter(prefix, name, device_list, device));
-    ptr->set_tensor_module();
-    return ptr;
-  };
-
- private:
-  AllScatter(std::string& prefix, std::string& name,
-            std::vector<int> device_list, Device::Ptr device);
-  AllScatter() = default;
-
-  Tensor::Ptr forward(const Tensor::Ptr input,
-                      BatchedSequence::Ptr sequences_metadata) override;
-  int parallel_num;
-};
-
 class MoEScatter : public Module {
  public:
   using Ptr = std::shared_ptr<MoEScatter>;
@@ -177,6 +134,29 @@ class Sync__ : public Module {
 
   Tensor::Ptr forward(const Tensor::Ptr input,
                       BatchedSequence::Ptr sequences_metadata) override;
+};
+
+class PipelineStage : public Module {
+ public:
+  using Ptr = std::shared_ptr<PipelineStage>;
+
+  [[nodiscard]] static Ptr Create(std::string prefix, std::string name,
+                                  int src_rank, int dst_rank,
+                                  Device::Ptr device) {
+    Ptr ptr = Ptr(new PipelineStage(prefix, name, src_rank, dst_rank, device));
+    ptr->set_tensor_module();
+    return ptr;
+  }
+
+ private:
+  PipelineStage(std::string& prefix, std::string& name,
+                int src_rank, int dst_rank, Device::Ptr device);
+  PipelineStage() = default;
+
+  Tensor::Ptr forward(const Tensor::Ptr input,
+                      BatchedSequence::Ptr sequences_metadata) override;
+  int src_rank;
+  int dst_rank;
 };
 
 }  // namespace llm_system

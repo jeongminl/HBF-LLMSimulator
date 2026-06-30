@@ -37,18 +37,20 @@ class Model : public Module {
   void model_distribute(Module::Ptr top_module, Cluster::Ptr cluster,
                         Scheduler::Ptr scheduler, int device_rank) {
     BatchedSequence::Ptr max_metadata = scheduler->getMaxMetadata(model_config.num_routed_expert, model_config.top_k);
-    // Tensor::Ptr input_tensor = Tensor::Create(
-    //     "EmbeddingVector", {1, max_metadata->get_process_token()}, "act",
-    //     cluster->get_device(device_rank));
 
+    int ne_tp_dg = model_config.ne_tp_dg;
+    int pp_stage = (device_rank / ne_tp_dg) % model_config.pp_dg;
 
-    Tensor::Ptr input_tensor = Tensor::Create(
-          "EmbeddingVector", {1, scheduler->model_config.n_vocab}, "act",
-          cluster->get_device(device_rank), scheduler->model_config.precision_byte);
-    // Tensor::Ptr input_tensor =
-    //     Tensor::Create("EmbeddingVector", {64, model_config.hidden_dim},
-    //     "act",
-    //                    cluster->get_device(device_rank));
+    Tensor::Ptr input_tensor;
+    if (pp_stage == 0) {
+      input_tensor = Tensor::Create(
+            "EmbeddingVector", {1, scheduler->model_config.n_vocab}, "act",
+            cluster->get_device(device_rank), scheduler->model_config.precision_byte);
+    } else {
+      input_tensor = Tensor::Create(
+            "EmbeddingVector", {1, scheduler->model_config.hidden_dim}, "act",
+            cluster->get_device(device_rank), scheduler->model_config.precision_byte);
+    }
     (*top_module)(input_tensor, max_metadata);
   };
 

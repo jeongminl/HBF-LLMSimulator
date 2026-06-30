@@ -13,409 +13,188 @@ class Tensor;
 using Tensor_Ptr = std::shared_ptr<Tensor>;
 using DRAMRequest_Ptr = std::shared_ptr<DRAMRequest>;
 
+// Per-variant descriptor: the only things that differ between GPU/Logic/PIM.
+struct LinearDesc {
+  hw_metric compute_peak_flops;
+  hw_metric memory_bandwidth;
+  bool fp8_double;           // Logic/PIM double compute_peak_flops when precision_byte==1
+  bool set_opb;              // GPU sets exec_status.opb; Logic/PIM do not
+  ProcessorType weight_ramul_proc;  // ProcessorType for issueRamulator weight op
+  DRAMRequestType weight_ramul_req; // DRAMRequestType for issueRamulator weight op
+  PIMOperandType weight_ramul_pim;  // PIMOperandType for issueRamulator weight op
+  ProcessorType weight_ideal_proc;  // ProcessorType for getIdealMemoryStatus weight op
+};
+
+// Shared core for Linear and BatchedLinear across all three processor variants.
+// When num_heads > 1, operates on 3D tensors (batched-linear): shape is
+// [num_heads, m, k] for input and [num_heads, k, n] for weight; all three variants
+// use the same 3D logic (Logic and PIM must not ignore num_heads or duplicated_input).
+static ExecStatus linearCore(
+    Device_Ptr device, Tensor_Ptr input, Tensor_Ptr weight, Tensor_Ptr output,
+    bool use_ramulator, LinearDesc desc,
+    int num_heads = 1, bool duplicated_input = false)
+{
+  auto& config = device->config;
+
+  if (num_heads > 1) {
+    assertTrue(input->shape.size()  == 3, "input tensor is not 3D tensor");
+    assertTrue(weight->shape.size() == 3, "weight tensor is not 3D tensor");
+    assertTrue(output->shape.size() == 3, "output tensor is not 3D tensor");
+  }
+
+  if (desc.fp8_double && input->precision_byte == 1)
+    desc.compute_peak_flops *= 2;
+
+  // Extract m/k/n from the appropriate shape dimensions.
+  double m, k, n;
+  std::vector<int> input_orig, weight_orig, output_orig;
+  if (num_heads > 1) {
+    input_orig  = input->shape;
+    weight_orig = weight->shape;
+    output_orig = output->shape;
+    m = input->shape[1];
+    k = input->shape[2];
+    n = weight->shape[2];
+  } else {
+    m = input->shape[0];
+    k = input->shape[1];
+    n = weight->shape[1];
+  }
+
+  hw_metric total_flops = 2.0 * m * k * n * num_heads;
+  hw_metric total_memory_size;
+  if (num_heads > 1 && duplicated_input)
+    total_memory_size = (m * k + (k * n + m * n) * num_heads) * weight->precision_byte;
+  else
+    total_memory_size = (m * k + k * n + m * n) * num_heads * weight->precision_byte;
+
+  ExecStatus exec_status;
+  if (input->getSize() == 0) return exec_status;
+
+  time_ns compute_duration = total_flops / desc.compute_peak_flops * 1000 * 1000 * 1000;
+  time_ns memory_duration  = getLinearMemoryDuration(config, m, k, n, weight->precision_byte,
+                                                      total_memory_size, desc.memory_bandwidth,
+                                                      num_heads, duplicated_input);
+  exec_status.compute_duration = compute_duration;
+
+  if (use_ramulator) {
+    if (num_heads > 1) {
+      // Flatten 3D tensors to 2D shapes for the ramulator path.
+      input->setShape(duplicated_input
+          ? std::vector<int>{(int)m, (int)k}
+          : std::vector<int>{(int)m, (int)(k * num_heads)});
+      weight->setShape({(int)(k * num_heads), (int)n});
+      output->setShape({(int)m, (int)(n * num_heads)});
+    }
+    exec_status += issueRamulator(device, LayerType::LINEAR,
+        ProcessorType::GPU, DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
+    exec_status += issueRamulator(device, LayerType::LINEAR,
+        desc.weight_ramul_proc, desc.weight_ramul_req, desc.weight_ramul_pim, weight);
+    exec_status += issueRamulator(device, LayerType::LINEAR,
+        ProcessorType::GPU, DRAMRequestType::kWrite, PIMOperandType::kDRAM, output);
+    if (num_heads > 1) {
+      input->setShape(input_orig);
+      weight->setShape(weight_orig);
+      output->setShape(output_orig);
+    }
+  } else {
+    exec_status.memory_duration = memory_duration;
+    exec_status += getIdealMemoryStatus(device, ProcessorType::GPU,     DRAMRequestType::kRead,  input);
+    exec_status += getIdealMemoryStatus(device, desc.weight_ideal_proc, DRAMRequestType::kRead,  weight);
+    exec_status += getIdealMemoryStatus(device, ProcessorType::GPU,     DRAMRequestType::kWrite, output);
+  }
+
+  exec_status.total_duration = std::max(exec_status.compute_duration, exec_status.memory_duration);
+
+  double eff_bw = (config.use_hbf && config.hbf_config.num_flash_stacks > 0)
+      ? config.hbf_config.flash_read_bandwidth : desc.memory_bandwidth;
+  exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /
+                             desc.compute_peak_flops / exec_status.total_duration;
+  exec_status.memory_util  = 1000.0 * 1000.0 * 1000.0 * total_memory_size /
+                             eff_bw / exec_status.total_duration;
+  exec_status.flops        = total_flops;
+  exec_status.memory_size  = total_memory_size;
+  if (desc.set_opb) exec_status.opb = total_flops / total_memory_size;
+
+  return exec_status;
+}
+
+// ---- Public entry points --------------------------------------------------
+// Each just builds a LinearDesc and delegates to linearCore.
+
 ExecStatus LinearExecutionGPU(Device_Ptr device, Tensor_Ptr input,
                               Tensor_Ptr weight, Tensor_Ptr output,
                               bool use_ramulator) {
-  auto config = device->config;
-  hw_metric compute_peak_flops = config.compute_peak_flops;
-  hw_metric memory_bandwidth = config.memory_bandwidth;
-
-  double m = input->shape[0];
-  double k = input->shape[1];
-  double n = weight->shape[1];
-
-  hw_metric total_flops = 2.0 * m * k * n;
-  hw_metric total_memory_size = (m * k + k * n + m * n) * weight->precision_byte;
-
-  time_ns compute_duration =
-      total_flops / compute_peak_flops * 1000 * 1000 * 1000;
-  time_ns memory_duration =
-      total_memory_size / memory_bandwidth * 1000 * 1000 * 1000;
-
-  ExecStatus exec_status;
-  if (input->getSize() == 0) {
-    return exec_status;
-  }
-
-  exec_status.compute_duration = compute_duration;
-  
-  if (use_ramulator) {
-    exec_status +=
-        issueRamulator(device, LayerType::LINEAR, ProcessorType::GPU,
-                       DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
-    exec_status +=
-        issueRamulator(device, LayerType::LINEAR, ProcessorType::GPU,
-                       DRAMRequestType::kRead, PIMOperandType::kDRAM, weight);
-    exec_status +=
-        issueRamulator(device, LayerType::LINEAR, ProcessorType::GPU,
-                       DRAMRequestType::kWrite, PIMOperandType::kDRAM, output);
-  } else {
-    exec_status.memory_duration = memory_duration;
-    exec_status += getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, input);
-
-    exec_status += getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, weight);
-    
-    exec_status += getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kWrite, output);
-  }
-
-  exec_status.total_duration =
-      std::max(exec_status.compute_duration, exec_status.memory_duration);
-
-  exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /
-                             compute_peak_flops / exec_status.total_duration;
-  exec_status.memory_util = 1000.0 * 1000.0 * 1000.0 * total_memory_size /
-                            memory_bandwidth / exec_status.total_duration;
-
-  exec_status.flops = total_flops;
-  exec_status.memory_size = total_memory_size;
-
-  exec_status.opb = total_flops / total_memory_size;
-
-  return exec_status;
-};
+  auto& c = device->config;
+  return linearCore(device, input, weight, output, use_ramulator, {
+      c.compute_peak_flops, c.memory_bandwidth,
+      /*fp8_double=*/false, /*set_opb=*/true,
+      ProcessorType::GPU, DRAMRequestType::kRead, PIMOperandType::kDRAM,
+      ProcessorType::GPU
+  });
+}
 
 ExecStatus LinearExecutionLogic(Device_Ptr device, Tensor_Ptr input,
                                 Tensor_Ptr weight, Tensor_Ptr output,
                                 bool use_ramulator) {
-  auto config = device->config;
-  hw_metric compute_peak_flops =
-      config.logic_memory_bandwidth * config.logic_op_b;
-  hw_metric memory_bandwidth = config.logic_memory_bandwidth;
-
-  if(input->precision_byte == 1){
-    compute_peak_flops *= 2;
-  }
-
-  double m = input->shape[0];
-  double k = input->shape[1];
-  double n = weight->shape[1];
-
-  hw_metric total_flops = 2.0 * m * k * n;
-  hw_metric total_memory_size = (m * k + k * n + m * n) * weight->precision_byte;
-
-  time_ns compute_duration =
-      total_flops / compute_peak_flops * 1000 * 1000 * 1000;
-  time_ns memory_duration =
-      total_memory_size / memory_bandwidth * 1000 * 1000 * 1000;
-
-  ExecStatus exec_status;
-  if (input->getSize() == 0) {
-    return exec_status;
-  }
-  exec_status.compute_duration = compute_duration;
-
-  if (use_ramulator) {
-    exec_status +=
-        issueRamulator(device, LayerType::LINEAR, ProcessorType::GPU,
-                       DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
-    exec_status +=
-        issueRamulator(device, LayerType::LINEAR, ProcessorType::LOGIC,
-                       DRAMRequestType::kGEMV, PIMOperandType::kSrc, weight);
-
-    exec_status +=
-        issueRamulator(device, LayerType::LINEAR, ProcessorType::GPU,
-                       DRAMRequestType::kWrite, PIMOperandType::kDRAM, output);
-  } else {
-    exec_status.memory_duration = memory_duration;
-    exec_status += getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, input);
-
-    exec_status += getIdealMemoryStatus(device, ProcessorType::LOGIC, DRAMRequestType::kRead, weight);
-    
-    exec_status += getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kWrite, output);
-  }
-
-  exec_status.total_duration =
-      std::max(exec_status.compute_duration, exec_status.memory_duration);
-
-  exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /
-                             compute_peak_flops / exec_status.total_duration;
-  exec_status.memory_util = 1000.0 * 1000.0 * 1000.0 * total_memory_size /
-                            memory_bandwidth / exec_status.total_duration;
-
-  exec_status.flops = total_flops;
-  exec_status.memory_size = total_memory_size;
-
-  return exec_status;
-};
+  auto& c = device->config;
+  return linearCore(device, input, weight, output, use_ramulator, {
+      c.logic_memory_bandwidth * c.logic_op_b, c.logic_memory_bandwidth,
+      /*fp8_double=*/true, /*set_opb=*/false,
+      ProcessorType::LOGIC, DRAMRequestType::kGEMV, PIMOperandType::kSrc,
+      ProcessorType::LOGIC
+  });
+}
 
 ExecStatus LinearExecutionPIM(Device_Ptr device, Tensor_Ptr input,
                               Tensor_Ptr weight, Tensor_Ptr output,
                               bool use_ramulator) {
-  auto config = device->config;
-  hw_metric compute_peak_flops = config.pim_memory_bandwidth * config.pim_op_b;
-  hw_metric memory_bandwidth = config.pim_memory_bandwidth;
-
-  if(input->precision_byte == 1){
-    compute_peak_flops *= 2;
-  }
-
-  double m = input->shape[0];
-  double k = input->shape[1];
-  double n = weight->shape[1];
-
-  hw_metric total_flops = 2.0 * m * k * n;
-  hw_metric total_memory_size = (m * k + k * n + m * n) * weight->precision_byte;
-
-  time_ns compute_duration =
-      total_flops / compute_peak_flops * 1000 * 1000 * 1000;
-  time_ns memory_duration =
-      total_memory_size / memory_bandwidth * 1000 * 1000 * 1000;
-
-  ExecStatus exec_status;
-  if (input->getSize() == 0) {
-    return exec_status;
-  }
-  exec_status.compute_duration = compute_duration;
-
-  if (use_ramulator) {
-    exec_status +=
-        issueRamulator(device, LayerType::LINEAR, ProcessorType::GPU,
-                       DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
-    exec_status +=
-        issueRamulator(device, LayerType::LINEAR, ProcessorType::PIM,
-                       DRAMRequestType::kGEMV, PIMOperandType::kSrc, weight);
-
-    exec_status +=
-        issueRamulator(device, LayerType::LINEAR, ProcessorType::GPU,
-                       DRAMRequestType::kWrite, PIMOperandType::kDRAM, output);
-  } else {
-    exec_status.memory_duration = memory_duration;
-    exec_status += getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, input);
-
-    exec_status += getIdealMemoryStatus(device, ProcessorType::PIM, DRAMRequestType::kRead, weight);
-    
-    exec_status += getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kWrite, output);
-  }
-
-  exec_status.total_duration =
-      std::max(exec_status.compute_duration, exec_status.memory_duration);
-
-  exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /
-                             compute_peak_flops / exec_status.total_duration;
-  exec_status.memory_util = 1000.0 * 1000.0 * 1000.0 * total_memory_size /
-                            memory_bandwidth / exec_status.total_duration;
-
-  exec_status.flops = total_flops;
-  exec_status.memory_size = total_memory_size;
-
-  return exec_status;
-};
+  auto& c = device->config;
+  return linearCore(device, input, weight, output, use_ramulator, {
+      c.pim_memory_bandwidth * c.pim_op_b, c.pim_memory_bandwidth,
+      /*fp8_double=*/true, /*set_opb=*/false,
+      ProcessorType::PIM, DRAMRequestType::kGEMV, PIMOperandType::kSrc,
+      ProcessorType::PIM
+  });
+}
 
 ExecStatus BatchedLinearExecutionGPU(Device_Ptr device, Tensor_Ptr input,
                               Tensor_Ptr weight, Tensor_Ptr output,
                               bool use_ramulator, bool duplicated_input) {
-  assertTrue(input->shape.size() == 3, "input tensor is not 3D tensor");
-  assertTrue(weight->shape.size() == 3, "weight tensor is not 3D tensor");
-  assertTrue(output->shape.size() == 3, "output tensor is not 3D tensor");
-
-  auto config = device->config;
-  hw_metric compute_peak_flops = config.compute_peak_flops;
-  hw_metric memory_bandwidth = config.memory_bandwidth;
-
+  auto& c = device->config;
   int num_heads = input->shape[0];
-  std::vector<int> input_orig_shape = input->shape;
-  std::vector<int> weight_orig_shape = weight->shape;
-  std::vector<int> output_orig_shape = output->shape;
-
-  int m = input->shape[1];
-  int k = input->shape[2];
-  int n = weight->shape[2];
-
-  hw_metric total_flops = 2.0 * m * k * n * 1.0 * num_heads;
-  
-  hw_metric total_memory_size;
-  if(duplicated_input){
-    total_memory_size = 1.0 * (m * k + k * n * 1.0  * num_heads + m * n * 1.0  * num_heads) * weight->precision_byte;
-  }
-  else{
-    total_memory_size = 1.0 * (m * k + k * n + m * n) * 1.0  * num_heads * weight->precision_byte;
-  }
-
-  time_ns compute_duration =
-      total_flops / compute_peak_flops * 1000 * 1000 * 1000;
-  time_ns memory_duration =
-      total_memory_size / memory_bandwidth * 1000 * 1000 * 1000;
-
-  ExecStatus exec_status;
-  if (input->getSize() == 0) {
-    return exec_status;
-  }
-
-  exec_status.compute_duration = compute_duration;
-
-  if (use_ramulator) {
-    if(duplicated_input){
-      input->setShape({m, k});
-    }
-    else{
-      input->setShape({m, k * num_heads});
-    }
-    exec_status +=
-        issueRamulator(device, LayerType::LINEAR, ProcessorType::GPU,
-                       DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
-    
-    weight->setShape({k * num_heads, n});
-    exec_status +=
-        issueRamulator(device, LayerType::LINEAR, ProcessorType::GPU,
-                       DRAMRequestType::kRead, PIMOperandType::kDRAM, weight);
-
-    output->setShape({m, n * num_heads});
-    exec_status +=
-        issueRamulator(device, LayerType::LINEAR, ProcessorType::GPU,
-                       DRAMRequestType::kWrite, PIMOperandType::kDRAM, output);
-  } else {
-    exec_status.memory_duration = memory_duration;
-    exec_status += getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, input);
-
-    exec_status += getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, weight);
-    
-    exec_status += getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kWrite, output);
-  }
-
-  exec_status.total_duration =
-      std::max(exec_status.compute_duration, exec_status.memory_duration);
-
-  exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /
-                             compute_peak_flops / exec_status.total_duration;
-  exec_status.memory_util = 1000.0 * 1000.0 * 1000.0 * total_memory_size /
-                            memory_bandwidth / exec_status.total_duration;
-
-  exec_status.flops = total_flops;
-  exec_status.memory_size = total_memory_size;
-
-  exec_status.opb = total_flops / total_memory_size;
-
-  input->setShape(input_orig_shape);
-  weight->setShape(weight_orig_shape);
-  output->setShape(output_orig_shape);
-
-  return exec_status;
-};
+  return linearCore(device, input, weight, output, use_ramulator, {
+      c.compute_peak_flops, c.memory_bandwidth,
+      /*fp8_double=*/false, /*set_opb=*/true,
+      ProcessorType::GPU, DRAMRequestType::kRead, PIMOperandType::kDRAM,
+      ProcessorType::GPU
+  }, num_heads, duplicated_input);
+}
 
 ExecStatus BatchedLinearExecutionLogic(Device_Ptr device, Tensor_Ptr input,
                                 Tensor_Ptr weight, Tensor_Ptr output,
                                 bool use_ramulator, bool duplicated_input) {
-  auto config = device->config;
-  hw_metric compute_peak_flops =
-      config.logic_memory_bandwidth * config.logic_op_b;
-  hw_metric memory_bandwidth = config.logic_memory_bandwidth;
-  if(input->precision_byte == 1){
-    compute_peak_flops *= 2;
-  }
-
-  double m = input->shape[0];
-  double k = input->shape[1];
-  double n = weight->shape[1];
-
-  hw_metric total_flops = 2.0 * m * k * n;
-  hw_metric total_memory_size = (m * k + k * n + m * n) * weight->precision_byte;
-
-  time_ns compute_duration =
-      total_flops / compute_peak_flops * 1000 * 1000 * 1000;
-  time_ns memory_duration =
-      total_memory_size / memory_bandwidth * 1000 * 1000 * 1000;
-
-  ExecStatus exec_status;
-  if (input->getSize() == 0) {
-    return exec_status;
-  }
-  exec_status.compute_duration = compute_duration;
-
-  if (use_ramulator) {
-    exec_status +=
-        issueRamulator(device, LayerType::LINEAR, ProcessorType::GPU,
-                       DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
-    exec_status +=
-        issueRamulator(device, LayerType::LINEAR, ProcessorType::LOGIC,
-                       DRAMRequestType::kGEMV, PIMOperandType::kSrc, weight);
-
-    exec_status +=
-        issueRamulator(device, LayerType::LINEAR, ProcessorType::GPU,
-                       DRAMRequestType::kWrite, PIMOperandType::kDRAM, output);
-  } else {
-    exec_status.memory_duration = memory_duration;
-    exec_status += getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, input);
-
-    exec_status += getIdealMemoryStatus(device, ProcessorType::LOGIC, DRAMRequestType::kRead, weight);
-    
-    exec_status += getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kWrite, output);
-  }
-
-  exec_status.total_duration =
-      std::max(exec_status.compute_duration, exec_status.memory_duration);
-
-  exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /
-                             compute_peak_flops / exec_status.total_duration;
-  exec_status.memory_util = 1000.0 * 1000.0 * 1000.0 * total_memory_size /
-                            memory_bandwidth / exec_status.total_duration;
-
-  exec_status.flops = total_flops;
-  exec_status.memory_size = total_memory_size;
-
-  return exec_status;
-};
+  auto& c = device->config;
+  int num_heads = input->shape[0];
+  return linearCore(device, input, weight, output, use_ramulator, {
+      c.logic_memory_bandwidth * c.logic_op_b, c.logic_memory_bandwidth,
+      /*fp8_double=*/true, /*set_opb=*/false,
+      ProcessorType::LOGIC, DRAMRequestType::kGEMV, PIMOperandType::kSrc,
+      ProcessorType::LOGIC
+  }, num_heads, duplicated_input);
+}
 
 ExecStatus BatchedLinearExecutionPIM(Device_Ptr device, Tensor_Ptr input,
                               Tensor_Ptr weight, Tensor_Ptr output,
                               bool use_ramulator, bool duplicated_input) {
-  auto config = device->config;
-  hw_metric compute_peak_flops = config.pim_memory_bandwidth * config.pim_op_b;
-  hw_metric memory_bandwidth = config.pim_memory_bandwidth;
-
-  if(input->precision_byte == 1){
-    compute_peak_flops *= 2;
-  }
-
-  double m = input->shape[0];
-  double k = input->shape[1];
-  double n = weight->shape[1];
-
-  hw_metric total_flops = 2.0 * m * k * n;
-  hw_metric total_memory_size = (m * k + k * n + m * n) * weight->precision_byte;
-
-  time_ns compute_duration =
-      total_flops / compute_peak_flops * 1000 * 1000 * 1000;
-  time_ns memory_duration =
-      total_memory_size / memory_bandwidth * 1000 * 1000 * 1000;
-
-  ExecStatus exec_status;
-  if (input->getSize() == 0) {
-    return exec_status;
-  }
-  exec_status.compute_duration = compute_duration;
-
-  if (use_ramulator) {
-    exec_status +=
-        issueRamulator(device, LayerType::LINEAR, ProcessorType::GPU,
-                       DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
-    exec_status +=
-        issueRamulator(device, LayerType::LINEAR, ProcessorType::PIM,
-                       DRAMRequestType::kGEMV, PIMOperandType::kSrc, weight);
-
-    exec_status +=
-        issueRamulator(device, LayerType::LINEAR, ProcessorType::GPU,
-                       DRAMRequestType::kWrite, PIMOperandType::kDRAM, output);
-  } else {
-    exec_status.memory_duration = memory_duration;
-    exec_status += getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, input);
-
-    exec_status += getIdealMemoryStatus(device, ProcessorType::PIM, DRAMRequestType::kRead, weight);
-    
-    exec_status += getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kWrite, output);
-  }
-
-  exec_status.total_duration =
-      std::max(exec_status.compute_duration, exec_status.memory_duration);
-
-  exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /
-                             compute_peak_flops / exec_status.total_duration;
-  exec_status.memory_util = 1000.0 * 1000.0 * 1000.0 * total_memory_size /
-                            memory_bandwidth / exec_status.total_duration;
-
-  exec_status.flops = total_flops;
-  exec_status.memory_size = total_memory_size;
-
-  return exec_status;
-};
+  auto& c = device->config;
+  int num_heads = input->shape[0];
+  return linearCore(device, input, weight, output, use_ramulator, {
+      c.pim_memory_bandwidth * c.pim_op_b, c.pim_memory_bandwidth,
+      /*fp8_double=*/true, /*set_opb=*/false,
+      ProcessorType::PIM, DRAMRequestType::kGEMV, PIMOperandType::kSrc,
+      ProcessorType::PIM
+  }, num_heads, duplicated_input);
+}
 
 }  // namespace llm_system

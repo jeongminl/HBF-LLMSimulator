@@ -12,7 +12,7 @@ Scheduler::Scheduler(SystemConfig system_config, ModelConfig& model_config,
       num_max_batched_token(num_max_batched_token),
       max_process_token(max_process_token) {
   dp_degree =
-      system_config.num_device * system_config.num_node / model_config.ne_tp_dg;
+      system_config.num_device * system_config.num_node / (model_config.ne_tp_dg * model_config.pp_dg);
   batch_size_per_dp = total_batch_size / dp_degree;
   total_seq_num = 0;
   total_time = 0;
@@ -542,7 +542,9 @@ int Scheduler::getGenSize() {
     SequenceInfo::Ptr cur_seq = SequenceInfo::Ptr(new SequenceInfo);
     std::string line;
 
-    int num_layer = model_config.num_layers / model_config.expert_freq;
+    int num_layer = model_config.expert_freq
+        ? model_config.num_layers / model_config.expert_freq
+        : model_config.num_layers;
 
     auto start = std::chrono::high_resolution_clock::now();
     std::cout << "Loading sequences Start" << std::endl;

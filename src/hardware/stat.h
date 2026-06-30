@@ -31,6 +31,7 @@ struct Stat {
   time_ns ffn = 0;
   time_ns expert_ffn = 0;
   time_ns communication = 0;
+  time_ns kv_write = 0;  // measured unhidden KV write duration
 
   // for MLA //
   time_ns q_down_proj = 0;
@@ -49,6 +50,7 @@ struct Stat {
   time_ns rope = 0;
   time_ns layernorm = 0;
   time_ns residual = 0;
+  time_ns lm_head = 0;
 
   energy_nJ act_energy = 0;
   energy_nJ read_energy = 0;

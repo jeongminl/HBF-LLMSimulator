@@ -24,6 +24,11 @@ Tensor::Ptr LayerNorm::forward(const Tensor::Ptr input,
   Tensor::Ptr layer_norm_weight = tensor_list.at("layer_norm_weight");
   Tensor::Ptr output = get_activation("layer_norm_output", input->shape);
 
+  if (k != layer_norm_weight->shape[0]) {
+    std::cerr << "RMSNorm/LayerNorm Error: Input shape[1] (k) = " << k 
+              << ", weight shape[0] = " << layer_norm_weight->shape[0] 
+              << ", input shape[0] (m) = " << input->shape[0] << std::endl;
+  }
   assertTrue(k == layer_norm_weight->shape[0], "input shape doesn't match with layer norm weight (= hidden dim)");
 
   long size = input->getSize();
@@ -39,7 +44,22 @@ Tensor::Ptr LayerNorm::forward(const Tensor::Ptr input,
   memory_size = (2.0 * m * k + 1.0 * k * n) * input->precision_byte;
 
   time_ns compute_duration = flops / compute_peak_flops * 1000 * 1000 * 1000;
-  time_ns memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+  time_ns memory_duration;
+  const auto& sys_config = device->config;
+  if (sys_config.use_hbf && sys_config.hbf_config.num_flash_stacks > 0) {
+    const auto& hbf = sys_config.hbf_config;
+    // LayerNorm weight (gamma/beta, shape [k,1]) lives on flash.
+    double weight_bytes = (double)k * n * input->precision_byte;
+    double weight_read = weight_bytes / hbf.flash_read_bandwidth * 1e9 + hbf.flash_page_read_latency_ns;
+    // Activations (input read + output write) are on the scarce tier.
+    // When num_hbm_stacks==0 (HBF+/CONV+), activations stage in logic-die SRAM
+    // (~320 MB, fast) → modeled as free to match all other ops (e.g. activation_impl.cpp).
+    double act_bytes = 2.0 * (double)m * k * input->precision_byte;
+    double act_time = (hbf.num_hbm_stacks > 0) ? act_bytes / hbf.hbm_read_bandwidth * 1e9 : 0.0;
+    memory_duration = (time_ns)std::max(weight_read, act_time);
+  } else {
+    memory_duration = (time_ns)(memory_size / memory_bandwidth * 1000 * 1000 * 1000);
+  }
 
   time_ns total_time = std::max(compute_duration, memory_duration);
 

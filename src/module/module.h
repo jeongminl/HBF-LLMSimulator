@@ -54,6 +54,10 @@ class Module : public std::enable_shared_from_this<Module> {
   void add_tensor(std::string name, Tensor::Ptr tensor);
 
   Module::Ptr get_module(std::string module_name) {
+    if (module_list.find(module_name) == module_list.end()) {
+      std::cerr << "Module Lookup Error: Parent module '" << this->name 
+                << "' cannot find child module '" << module_name << "'" << std::endl;
+    }
     return module_list.at(module_name);
   }
   Tensor::Ptr get_activation(std::string name, std::vector<int> shape = {1, 1},

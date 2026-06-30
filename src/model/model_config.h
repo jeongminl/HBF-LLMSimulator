@@ -82,6 +82,7 @@ class ModelConfig {
 
   int ne_tp_dg;  // non-expert tensor parallelism degree
   int e_tp_dg;   // expert tensor parallelism degree
+  int pp_dg = 1; // pipeline parallelism degree
   std::string dataset;
 
   int input_len;

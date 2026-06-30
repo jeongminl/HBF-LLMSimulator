@@ -33,6 +33,10 @@ class TimeStamp {
     return status.end_time - status.start_time;
   }
 
+  time_ns get_kv_write(){
+    return status.kv_write_time;
+  }
+
   energy_nJ getDramEnergy(){
     return status.act_energy + status.read_energy + status.write_energy +
     status.all_act_energy + status.all_read_energy + status.all_write_energy;

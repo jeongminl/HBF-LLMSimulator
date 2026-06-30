@@ -152,8 +152,6 @@ class TopModuleGraph {
   void set_pop_status();
 
   void set_stamp();
-  void push_stamp();
-  void pop_stamp();
 
   StatusBoard& status;
 

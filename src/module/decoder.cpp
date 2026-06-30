@@ -80,10 +80,13 @@ Tensor::Ptr Decoder::forward(const Tensor::Ptr input,
   Tensor::Ptr input_ln_out = (*input_layer_norm)(input, sequences_metadata);
   Tensor::Ptr attention_out = (*attention)(input_ln_out, sequences_metadata);
   Tensor::Ptr res_1_out = (*residual_1)(attention_out, sequences_metadata);
-  Tensor::Ptr post_attn_ln_out = (*post_attn_layer_norm)(attention_out, sequences_metadata);
+  // Thread res_1_out into post_attn_layer_norm: the LayerNorm must consume the
+  // residual-summed representation (input + attention), not raw attention_out.
+  // Timing is identical (same shape); this corrects the dependency-graph chain.
+  Tensor::Ptr post_attn_ln_out = (*post_attn_layer_norm)(res_1_out, sequences_metadata);
   Tensor::Ptr ffn_out = (*feedforward)(post_attn_ln_out, sequences_metadata);
   Tensor::Ptr result = (*all_reduce)(ffn_out, sequences_metadata);
-  Tensor::Ptr res_2_out = (*residual_1)(result, sequences_metadata);
+  Tensor::Ptr res_2_out = (*residual_2)(result, sequences_metadata);
 
 
   return res_2_out;
@@ -121,7 +124,9 @@ MoEDecoder::MoEDecoder(std::string& prefix, std::string& name,
     add_module(attention);
   }
 
-  auto residual_1 = LayerNorm::Create(module_map_name, "residual_1", model_config.hidden_dim,
+  // A transformer block has 2 LayerNorms (input + post_attn) and 2 residual adds.
+  // Using LayerNorm for the adds would over-charge each MoE layer.
+  auto residual_1 = Residual::Create(module_map_name, "residual_1", model_config.hidden_dim,
       non_moe_device_list, device);
   add_module(residual_1);
 
@@ -129,13 +134,12 @@ MoEDecoder::MoEDecoder(std::string& prefix, std::string& name,
     non_moe_device_list, device);
   add_module(post_attn_layer_norm);
 
-  set_device_list(device_list, 0, device_list.size());
   auto expert_ffn =
       ExpertFFN::Create(module_map_name, "expertFFN", model_config, scheduler,
                         device_list, device);
   add_module(expert_ffn);
 
-  auto residual_2 = LayerNorm::Create(module_map_name, "residual_2", model_config.hidden_dim,
+  auto residual_2 = Residual::Create(module_map_name, "residual_2", model_config.hidden_dim,
       non_moe_device_list, device);
   add_module(residual_2);
 }
@@ -153,12 +157,11 @@ Tensor::Ptr MoEDecoder::forward(const Tensor::Ptr input,
   Tensor::Ptr input_ln_out = (*input_layer_norm)(input, sequences_metadata);
   Tensor::Ptr attention_out = (*attention)(input_ln_out, sequences_metadata);
   Tensor::Ptr res_1_out = (*residual_1)(attention_out, sequences_metadata);
-  Tensor::Ptr post_attn_ln_out = (*post_attn_layer_norm)(attention_out, sequences_metadata);
+  Tensor::Ptr post_attn_ln_out = (*post_attn_layer_norm)(res_1_out, sequences_metadata);
   Tensor::Ptr result = (*expert_ffn)(post_attn_ln_out, sequences_metadata);
   Tensor::Ptr res_2_out = (*residual_2)(result, sequences_metadata);
 
   return res_2_out;
-  // return result;
 }
 
 }  // namespace llm_system

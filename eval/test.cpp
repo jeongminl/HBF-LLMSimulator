@@ -1,13 +1,17 @@
 #include <yaml-cpp/yaml.h>
+#include <filesystem>
 
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 
+#include "common/assert.h"
 #include "hardware/stat.h"
 #include "model/model.h"
 #include "model/util.h"
 #include "module/layer.h"
 #include "module/module_graph.h"
+#include "optimizer/parallelism_optimizer.h"
 
 using namespace llm_system;
 
@@ -32,11 +36,13 @@ int main(int argc, char *argv[]) {
   int input_len = config["simulation"]["input_len"].as<int>();
   int output_len = config["simulation"]["output_len"].as<int>();
   int iter = config["simulation"]["iter"].as<int>();
+  int injection_rate = config["simulation"]["injection_rate"].as<int>();
 
   int max_batch_size = config["serving"]["max_batch_size"].as<int>();
 
   int max_process_token = config["serving"]["max_process_token"].as<int>();
   std::string output_path = config["log"]["output_directory"].as<std::string>();
+  std::filesystem::create_directories(output_path);
 
   SystemConfig system_config;
   if(config["system"]["gpu_gen"].as<std::string>() == "A100"){
@@ -90,6 +96,41 @@ int main(int argc, char *argv[]) {
   
   system_config.num_node = num_node;
   system_config.num_device = num_device;
+  if (injection_rate > 0) {
+    system_config.use_inject_rate = true;
+    system_config.request_per_second = injection_rate;
+  }
+
+  if (config["system"]["memory_type"]) {
+    std::string mem_type = config["system"]["memory_type"].as<std::string>();
+    system_config.memory_type = mem_type;
+    if (mem_type == "HBM") {
+      system_config.use_hbf = false;
+    } else {
+      system_config.use_hbf = true;
+      if (mem_type == "HBM4") {
+        system_config.hbf_config = hbm4_preset;
+      } else if (mem_type == "HBF") {
+        system_config.hbf_config = hbf_preset;
+      } else if (mem_type == "HBF+") {
+        system_config.hbf_config = hbf_plus_preset;
+      } else if (mem_type == "CONV") {
+        system_config.hbf_config = conv_preset;
+      } else if (mem_type == "CONV+") {
+        system_config.hbf_config = conv_plus_preset;
+      } else {
+        fail("Unsupported memory_type: " + mem_type);
+      }
+      system_config.memory_capacity = system_config.hbf_config.total_capacity_bytes;
+      system_config.memory_bandwidth = (system_config.hbf_config.num_flash_stacks > 0) ?
+          system_config.hbf_config.flash_read_bandwidth : system_config.hbf_config.hbm_read_bandwidth;
+    }
+  }
+
+  // Chunked-attention chunk size (bytes); 0 = auto (per-stack SRAM staging capacity).
+  if (config["system"]["chunk_size"]) {
+    system_config.chunk_size = config["system"]["chunk_size"].as<int>();
+  }
 
 
   system_config.high_processor_type = ProcessorType::GPU;
@@ -185,6 +226,86 @@ int main(int argc, char *argv[]) {
       config["system"]["distribution"]["expert_tensor_degree"].as<int>();
   model_config.ne_tp_dg =
       config["system"]["distribution"]["none_expert_tensor_degree"].as<int>();
+
+  bool optimize_parallelism = false;
+  if (config["system"]["optimize_parallelism"]) {
+    optimize_parallelism = config["system"]["optimize_parallelism"].as<bool>();
+  }
+
+  // Precision: the model preset encodes the intended precision_byte.  Only
+  // override it when the config explicitly sets a non-zero value; 0 means
+  // "use model preset" (e.g. Maverick=2 → 746 GiB, llama3_405B=1 → 405 GB).
+  {
+    int cfg_precision = config["simulation"]["precision_byte"].as<int>();
+    if (cfg_precision > 0) {
+      model_config.precision_byte = cfg_precision;
+    }
+    // else: keep the model preset's precision_byte unchanged.
+  }
+  if (model_config.precision_byte == 1) {  // FP8 / INT8: double effective flops
+    system_config.compute_peak_flops *= 2;
+  }
+
+  // Part D/E: parse optimizer alignment flags (all optional; fall back to in-class defaults)
+  if (config["simulation"]["validate_optimizer"]) {
+    system_config.validate_optimizer =
+        config["simulation"]["validate_optimizer"].as<std::string>();
+  }
+  if (config["simulation"]["validate_optimizer_threshold"]) {
+    system_config.validate_optimizer_threshold =
+        config["simulation"]["validate_optimizer_threshold"].as<double>();
+  }
+  if (config["simulation"]["optimizer_latency_model"]) {
+    system_config.optimizer_latency_model =
+        config["simulation"]["optimizer_latency_model"].as<std::string>();
+  }
+  if (config["simulation"]["latency_margin"]) {
+    system_config.latency_margin =
+        config["simulation"]["latency_margin"].as<double>();
+  }
+
+  // Part E: hold predictions outside the if(optimize_parallelism) scope so
+  // checkMemorySize and the latency harness can access them.
+  ParallelConfig opt_pred;
+  bool have_opt_pred = false;
+
+  if (optimize_parallelism) {
+    std::cout << "[Parallelism Optimizer] Searching optimal 3D parallelism strategy..." << std::endl;
+    int total_gpus = num_node * num_device;
+    double tpot_slo_ms = 100.0;
+    if (config["system"]["tpot_slo"]) {
+      tpot_slo_ms = config["system"]["tpot_slo"].as<double>() * 1000.0;
+    }
+    ParallelConfig opt = ParallelismOptimizer::Optimize(model_config, system_config, total_gpus, max_batch_size, input_len + output_len, tpot_slo_ms);
+    opt_pred = opt;
+    have_opt_pred = true;
+    if (opt.oom) {
+      // Spec: a batch size FAILS when NO parallelism configuration can satisfy
+      // GPU-memory capacity, the SRAM / intermediate-data limit, AND the TPOT
+      // SLO simultaneously (all three are enforced inside Optimize()).  Emit an
+      // "Out of Memory" marker and exit non-zero so the batch-size sweep treats
+      // this as a hard failure instead of silently continuing with pp=1.
+      std::cout << "[Parallelism Optimizer] Out of Memory: no parallelism configuration "
+                << "satisfies capacity/SRAM/SLO constraints. Reason: " << opt.oom_reason << std::endl;
+      std::exit(EXIT_FAILURE);
+    } else {
+      std::cout << "[Parallelism Optimizer] Found optimal configuration: TP=" << opt.tp
+                << ", PP=" << opt.pp << ", DP=" << opt.dp << ", EP=" << opt.ep
+                << " (Estimated Latency: " << opt.estimated_latency_ms << " ms)" << std::endl;
+      model_config.ne_tp_dg = opt.tp;
+      model_config.e_tp_dg = opt.ep;  // expert parallelism swept independently of non-expert TP
+      model_config.pp_dg = opt.pp;
+      std::cout << "[Parallelism Optimizer] Overriding none_expert_tensor_degree to " << opt.tp
+                << ", expert_tensor_degree to " << opt.ep
+                << " and pp_dg to " << opt.pp << std::endl;
+    }
+  } else {
+    if (config["system"]["distribution"]["pipeline_degree"]) {
+      model_config.pp_dg = config["system"]["distribution"]["pipeline_degree"].as<int>();
+    } else {
+      model_config.pp_dg = 1;
+    }
+  }
   
   model_config.compressed_kv =
       config["system"]["optimization"]["compressed_kv"].as<bool>();
@@ -193,10 +314,8 @@ int main(int argc, char *argv[]) {
   model_config.skewness =
       config["simulation"]["skewness"].as<double>();
   
-  model_config.precision_byte = config["simulation"]["precision_byte"].as<int>();
-  if(model_config.precision_byte == 1){ // if FP8 or INT8 
-    system_config.compute_peak_flops *= 2; // system_config has FP16 peak FLOPS information
-  }
+  // precision_byte was applied before the optimizer (above). No re-assignment
+  // here — doing so would lose the preset value when cfg_precision == 0.
 
   system_config.exit_out_of_memory = config["simulation"]["exit_out_of_memory"].as<bool>();
   system_config.mem_cap_limit = config["simulation"]["mem_cap_limit"].as<bool>();
@@ -229,7 +348,13 @@ int main(int argc, char *argv[]) {
 
   Model model(model_config, cluster, scheduler);
 
-  bool out_of_memory = cluster->checkMemorySize();
+  // Part E: pass optimizer predictions to checkMemorySize for drift comparison.
+  bool out_of_memory = have_opt_pred
+      ? cluster->checkMemorySize(opt_pred.pred_weight_bytes,
+                                  opt_pred.pred_kv_bytes,
+                                  opt_pred.pred_act_bytes,
+                                  opt_pred.pred_total_bytes)
+      : cluster->checkMemorySize();
   cluster->set_dependency();
 
   std::cout << "-----------------------------------" << std::endl;
@@ -339,8 +464,52 @@ int main(int argc, char *argv[]) {
     std::cout << "Out of Memory: " << file_name << std::endl;
     return 0;
   }
+
+  // Emit PEC geometry so Python post-processing never needs to duplicate model
+  // dimensions or precision.  Matches getKVWriteDuration() exactly:
+  //   standard KV: 2 * num_layers * num_kv_heads * head_dim * precision_byte
+  //   compressed KV (MLA): (kv_lora_rank + qk_rope_head_dim) * num_layers * precision_byte
+  {
+    double kv_bytes_per_token = model_config.compressed_kv
+        ? (double)(model_config.kv_lora_rank + model_config.qk_rope_head_dim)
+            * model_config.num_layers * model_config.precision_byte
+        : 2.0 * model_config.num_layers * model_config.num_kv_heads
+            * model_config.head_dim * model_config.precision_byte;
+    double flash_capacity = (system_config.use_hbf && system_config.hbf_config.num_flash_stacks > 0)
+        ? (double)system_config.hbf_config.total_capacity_bytes
+        : (double)system_config.memory_capacity;
+    std::cout << "PEC_KV_BYTES_PER_TOKEN: " << kv_bytes_per_token << std::endl;
+    std::cout << "PEC_FLASH_CAPACITY_BYTES: " << flash_capacity << std::endl;
+  }
+
   scheduler->getActualArrivalTime(total_iter);
   stat_list = cluster->runIteration(total_iter, file_name);
+
+  // Part E: latency drift harness — compare optimizer prediction vs measured.
+  // measured_latency_ms = total simulation time / num_iterations / 1e6.
+  // Uses a looser threshold (2x) since the predictive model is coarse-grained.
+  if (have_opt_pred && system_config.validate_optimizer != "off") {
+    double measured_latency_ms = (total_iter > 0)
+        ? (double)scheduler->total_time / ((double)total_iter * 1e6)
+        : 0.0;
+    if (measured_latency_ms > 0.0) {
+      double div = std::abs(opt_pred.estimated_latency_ms - measured_latency_ms) /
+                   measured_latency_ms;
+      double lat_thresh = system_config.validate_optimizer_threshold * 2.0;
+      if (div > lat_thresh) {
+        std::string msg = "[OptValidation] latency: pred=" +
+                          std::to_string(opt_pred.estimated_latency_ms) + "ms" +
+                          " actual=" + std::to_string(measured_latency_ms) + "ms" +
+                          " div=" + std::to_string(div * 100.0) + "% WARN";
+        if (system_config.validate_optimizer == "strict") {
+          fail(msg);
+        } else {
+          std::cout << msg << std::endl;
+        }
+      }
+    }
+  }
+
   // TopModuleGraph::Ptr top1 = cluster->get_device(8)->top_module_graph;
   std::string gantt_file_path =
       config["log"]["gantt_directory"].as<std::string>();

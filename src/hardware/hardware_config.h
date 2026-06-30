@@ -4,6 +4,7 @@
 
 #include "common/type.h"
 #include "hardware/base.h"
+#include "dram/hbf_memory_config.h"
 
 namespace llm_system {
 
@@ -157,6 +158,31 @@ class SystemConfig {
   int num_cube; //8: for HBM3E (B100), 5 for HBM3 (H100)
   int num_logic_cube;
   // Device
+  std::string memory_type = "HBM";
+  HBFMemoryConfig hbf_config;
+  bool use_hbf = false;
+
+  // Optimizer alignment flags (parsed from config.yaml: simulation section)
+  // validate_optimizer: "off" | "warn" | "strict"
+  //   off    – comparison code skipped entirely (zero output / overhead)
+  //   warn   – print [OptValidation] lines when divergence exceeds threshold (default)
+  //   strict – call fail() instead of printing when over threshold (for CI)
+  std::string validate_optimizer = "warn";
+  double validate_optimizer_threshold = 0.10;  // relative divergence threshold (10%)
+
+  // optimizer_latency_model: "sum" | "max"
+  //   sum – conservative: compute + memory (current default, never under-predicts)
+  //   max – tighter: max(compute, memory) per stage, hidden behind compute
+  std::string optimizer_latency_model = "sum";
+  double latency_margin = 1.0;  // multiplicative safety margin on the estimated latency
+
+  // Chunked-attention chunk granularity, in BYTES of KV staged per chunk.
+  //   0  – auto: use the full per-stack SRAM staging capacity
+  //        (sram_per_stack_bytes * num_flash_stacks), i.e. the legacy behavior.
+  //   >0 – explicit chunk size; physically clamped to the SRAM staging capacity
+  //        (a double-buffer cannot stage more KV than the SRAM holds).
+  // Parsed from config.yaml: system.chunk_size.
+  int chunk_size = 0;
 };
 
 

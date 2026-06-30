@@ -70,7 +70,12 @@ class Cluster : public std::enable_shared_from_this<Cluster> {
 
   std::vector<std::map<std::string, Module::Ptr>> module_map;
 
-  bool checkMemorySize();
+  // pred_* args (all default -1) carry the optimizer's footprint prediction for
+  // the drift harness (Part E).  Pass negative values to skip comparison.
+  bool checkMemorySize(double pred_weight_bytes = -1,
+                       double pred_kv_bytes     = -1,
+                       double pred_act_bytes    = -1,
+                       double pred_total_bytes  = -1);
   bool checkHeteroMemorySize();
   std::vector<energy_nJ> getTotalEnergy();
 

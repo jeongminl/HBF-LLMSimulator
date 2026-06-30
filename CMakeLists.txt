@@ -21,6 +21,7 @@ target_link_libraries(
     PRIVATE module
     PRIVATE model
     PRIVATE scheduler
+    PRIVATE optimizer
 )
 
 set(EXECUTABLE_OUTPUT_PATH ${CMAKE_BINARY_DIR})

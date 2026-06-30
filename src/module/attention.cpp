@@ -59,6 +59,7 @@ Tensor::Ptr SelfAttentionGen::forward(const Tensor::Ptr input,
   layer_info.num_kv_heads = num_kv_heads;
   layer_info.head_dim = head_dim;
   layer_info.qk_rope_head_dim = qk_rope_head_dim;
+  layer_info.use_chunked_attention = true; // chunked attention should always be used regardless of configuration
 
   std::vector<Tensor::Ptr> tensor_list;
   tensor_list.resize(0);
@@ -104,11 +105,12 @@ Tensor::Ptr SelfAttentionSum::forward(const Tensor::Ptr input,
     output_tensor->setPerformHigh();
   }
 
-  layer_info.attention_group_size = head_dim / num_heads;
+  layer_info.attention_group_size = num_heads / num_kv_heads; // GQA group = Q-heads / KV-heads
   layer_info.num_heads = num_heads;
   layer_info.num_kv_heads = num_kv_heads;
   layer_info.head_dim = head_dim;
   layer_info.qk_rope_head_dim = qk_rope_head_dim;
+  layer_info.use_chunked_attention = true; // chunked attention should always be used regardless of configuration
 
   std::vector<Tensor::Ptr> tensor_list;
   tensor_list.resize(0);
@@ -146,11 +148,12 @@ Tensor::Ptr SelfAttentionMixed::forward(
     const Tensor::Ptr input, BatchedSequence::Ptr sequences_metadata) {
   LayerInfo layer_info;
   layer_info.processor_type = device->config.processor_type;
-  layer_info.attention_group_size = head_dim / num_heads;
+  layer_info.attention_group_size = num_heads / num_kv_heads; // GQA group = Q-heads / KV-heads
   layer_info.num_heads = num_heads;
   layer_info.num_kv_heads = num_kv_heads;
   layer_info.head_dim = head_dim;
   layer_info.qk_rope_head_dim = qk_rope_head_dim;
+  layer_info.use_chunked_attention = true; // chunked attention should always be used regardless of configuration
 
   std::vector<Tensor::Ptr> tensor_list;
   tensor_list.resize(0);
@@ -228,14 +231,8 @@ TensorVec AttentionSplit::forward(const TensorVec input,
   }
 
   tensor_list.resize(0);
-  if(use_absorb){
-    tensor_list.push_back(sum_tensor);
-    tensor_list.push_back(gen_tensor);
-  }
-  else{
-    tensor_list.push_back(sum_tensor);
-    tensor_list.push_back(gen_tensor);
-  }
+  tensor_list.push_back(sum_tensor);
+  tensor_list.push_back(gen_tensor);
   return tensor_list;
 }
 
@@ -363,14 +360,12 @@ Tensor::Ptr MultiLatentAttentionGen::forward(const Tensor::Ptr input,
   layer_info.head_dim = head_dim;
   layer_info.qk_rope_head_dim = qk_rope_head_dim;
   layer_info.use_flash_mla = use_flash_mla;
+  layer_info.use_chunked_attention = true; // chunked attention should always be used regardless of configuration
 
   std::vector<Tensor::Ptr> tensor_list;
   tensor_list.resize(0);
   tensor_list.push_back(input);
-  if(compressed_kv){
-    
-  }
-  else{
+  if (!compressed_kv) {
     tensor_list.push_back(get_cache("k_cache", 0, 0, false));
     tensor_list.push_back(get_cache("v_cache", 0, 0, false));
   }
@@ -417,7 +412,7 @@ Tensor::Ptr MultiLatentAttentionSum::forward(const Tensor::Ptr input,
     output_tensor->setPerformHigh();
   }
 
-  layer_info.attention_group_size = head_dim / num_heads;
+  layer_info.attention_group_size = num_heads / num_kv_heads; // GQA group = Q-heads / KV-heads
   layer_info.num_heads = num_heads;
   layer_info.num_kv_heads = num_kv_heads;
   layer_info.head_dim = head_dim;
@@ -492,16 +487,17 @@ Tensor::Ptr AbsorbMLAGen::forward(const Tensor::Ptr input,
   layer_info.qk_rope_head_dim = qk_rope_head_dim;
   layer_info.kv_lora_rank = kv_lora_rank;
   layer_info.use_flash_mla = use_flash_mla;
+  layer_info.use_chunked_attention = true; // chunked attention should always be used regardless of configuration
 
   std::vector<Tensor::Ptr> tensor_list;
   tensor_list.resize(0);
   tensor_list.push_back(input);
 
   int batch_size = sequences_metadata->get_gen().size();
-  
+
   for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
-    Tensor::Ptr latent_kv_cache = get_cache("latent_kv_cache", seq_idx, 0, true);
-    Tensor::Ptr latent_pe_cache = get_cache("latent_pe_cache", seq_idx, 0, true);
+    tensor_list.push_back(get_cache("latent_kv_cache", seq_idx, 0, true));
+    tensor_list.push_back(get_cache("latent_pe_cache", seq_idx, 0, true));
   }
 
   device->execution(LayerType::ABSORBED_MLA_GEN, tensor_list, sequences_metadata, layer_info);
@@ -545,7 +541,7 @@ Tensor::Ptr AbsorbMLASum::forward(const Tensor::Ptr input,
     output_tensor->setPerformHigh();
   }
 
-  layer_info.attention_group_size = head_dim / num_heads;
+  layer_info.attention_group_size = num_heads / num_kv_heads; // GQA group = Q-heads / KV-heads
   layer_info.num_heads = num_heads;
   layer_info.num_kv_heads = num_kv_heads;
   layer_info.head_dim = head_dim;

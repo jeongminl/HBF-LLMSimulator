@@ -3,14 +3,20 @@ model:
 
 system:
   gpu_gen: B100 # e.g. A100, H100, B100, B200 (currently only support 4 generation)
+  memory_type: HBM
   nvlink_gen: 5
   infiniband_gen: 800
   num_node: 1
   num_device: 8
   processor_type: GPU
+  optimize_parallelism: false
+  tpot_slo: 0.1
+  chunk_size: 0  # chunked-attention chunk granularity in bytes; 0 = auto (per-stack SRAM staging capacity)
+
   distribution:
     expert_tensor_degree: 1
-    none_expert_tensor_degree: 1
+    none_expert_tensor_degree: 8
+    pipeline_degree: 1
   optimization:
     parallel_execution: off
     hetero_subbatch: off
@@ -22,7 +28,7 @@ system:
     use_flash_mla: on
     use_flash_attention: on
     reuse_kv_cache: on
-    kv_cache_reuse_rate: 0.0
+    kv_cache_reuse_rate: 0.2
     prefill_mode: off
     decode_mode: on
 
@@ -33,13 +39,18 @@ serving:
 simulation:
   data: synthesis
   input_len: 1024
-  output_len: 10
-  precision_byte: 1
-  skewness: 0.0
-  iter: 5
-  injection_rate: 0
+  output_len: 256
+  precision_byte: 0  # 0 = use model preset precision (llama3_405B→FP8, llama4_maverick→FP16/BF16=746GB)
+  skewness: 0.8
+  iter: 500
+  injection_rate: 20
   exit_out_of_memory: off
   mem_cap_limit: off # if memory usage exceed memory capacity, batchsize modifies
+  # Optimizer alignment flags (only active when optimize_parallelism: true)
+  validate_optimizer: warn            # "off" | "warn" | "strict"
+  validate_optimizer_threshold: 0.10  # relative divergence threshold (10%)
+  optimizer_latency_model: sum        # "sum" (conservative) | "max" (tighter)
+  latency_margin: 1.0                 # multiplicative safety margin on predicted latency
 
 log:
   print_log: on

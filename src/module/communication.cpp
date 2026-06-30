@@ -48,45 +48,6 @@ Tensor::Ptr AllReduce::forward(const Tensor::Ptr input,
   return output;
 }
 
-AllGather::AllGather(std::string& prefix, std::string& name,
-                     std::vector<int> device_list, Device::Ptr device)
-    : Module(prefix, name, device, device_list, true, true) {
-  std::vector<int> shape = {1, 1};
-
-  Tensor::Ptr output = Tensor::Create("allgather_output", shape, "act", device, device->model_config.precision_byte);
-  add_tensor(output);
-}
-
-Tensor::Ptr AllGather::forward(const Tensor::Ptr input,
-                               BatchedSequence::Ptr sequences_metadata) {
-
-  Tensor::Ptr output = get_activation("allgather_output", input->shape);
-  return output;
-}
-
-AllScatter::AllScatter(std::string& prefix, std::string& name,
-                     std::vector<int> device_list, Device::Ptr device)
-    : Module(prefix, name, device, device_list, true, true) {
-  std::vector<int> shape = {1, 1};
-
-  parallel_num = device_list.size();
-
-  Tensor::Ptr output = Tensor::Create("allscatter_output", shape, "act", device, device->model_config.precision_byte);
-  add_tensor(output);
-}
-
-Tensor::Ptr AllScatter::forward(const Tensor::Ptr input,
-                                BatchedSequence::Ptr sequences_metadata) {
-  long m = input->shape[0];
-  long k = input->shape[1];
-
-  std::vector<int> shape = {input->shape[0], input->shape[1] / parallel_num};
-
-  Tensor::Ptr output = get_activation("allscatter_output", shape);
-
-  return output;
-}
-
 MoEScatter::MoEScatter(std::string& prefix, std::string& name,
                        std::vector<int> device_list, Device::Ptr device)
     : Module(prefix, name, device, device_list, true, true) {
@@ -140,7 +101,7 @@ Tensor::Ptr MoEScatter::forward(const Tensor::Ptr input,
       int expert_id_offset = device->model_config.num_routed_expert / total_num_device * (dst / e_tp_dg) * e_tp_dg;
       int num_expert_per_device = device->model_config.num_routed_expert / total_num_device * e_tp_dg;
 
-      if((int)(dst / 8) == src_node){ 
+      if((int)(dst / device->config.num_device) == src_node){
         // intra node
         for(int e_id = expert_id_offset; e_id < expert_id_offset + num_expert_per_device; e_id ++){
           intra_node_comm_token += sequences_metadata->local_num_token_in_expert[e_id]; // to the experts in a dst device
@@ -197,12 +158,13 @@ Tensor::Ptr MoEScatter::forward(const Tensor::Ptr input,
   int dst_device_rank = device->device_total_rank; // dst: destination device, current device
   int dst_node = dst_device_rank / device->config.num_device;
 
-  int dst_dp_rank = device->device_total_rank / ne_tp_dg; // data parallel index
+  int pp_dg = device->model_config.pp_dg;
+  int dst_dp_rank = (device->device_total_rank / ne_tp_dg) / pp_dg; // data parallel index
   
   int expert_id_offset = device->model_config.num_routed_expert / total_num_device * (dst_device_rank / e_tp_dg) * e_tp_dg; // experts in a dst_device
   int num_expert_per_device = device->model_config.num_routed_expert / total_num_device * e_tp_dg;
 
-  for(int src_dp_idx = 0; src_dp_idx < total_num_device / ne_tp_dg; src_dp_idx ++){ 
+  for(int src_dp_idx = 0; src_dp_idx < (total_num_device / ne_tp_dg) / pp_dg; src_dp_idx ++){ 
     if(src_dp_idx != dst_dp_rank){ // from other dp space
 
       int src_device_rank = src_dp_idx * ne_tp_dg;
@@ -325,7 +287,7 @@ TensorVec MoEGather::forward(const TensorVec input_vec,
       int expert_id_offset = device->model_config.num_routed_expert / total_num_device * (src / e_tp_dg) * e_tp_dg;
       int num_expert_per_device = device->model_config.num_routed_expert / total_num_device * e_tp_dg;
 
-      if((int)(src / 8) == dst_node){ 
+      if((int)(src / device->config.num_device) == dst_node){
         // intra node
         for(int e_id = expert_id_offset; e_id < expert_id_offset + num_expert_per_device; e_id ++){
           intra_node_comm_token += sequences_metadata->local_num_token_in_expert[e_id]; // to the experts in a src device
@@ -389,12 +351,13 @@ TensorVec MoEGather::forward(const TensorVec input_vec,
   int src_device_rank = device->device_total_rank; // src: source device, current device
   int src_node = src_device_rank / device->config.num_device;
 
-  int src_dp_rank = device->device_total_rank / ne_tp_dg; // data parallel index
+  int pp_dg = device->model_config.pp_dg;
+  int src_dp_rank = (device->device_total_rank / ne_tp_dg) / pp_dg; // data parallel index
   
   int expert_id_offset = device->model_config.num_routed_expert / total_num_device * (src_device_rank / e_tp_dg) * e_tp_dg; // experts in a src_device
   int num_expert_per_device = device->model_config.num_routed_expert / total_num_device * e_tp_dg;
 
-  for(int dst_dp_idx = 0; dst_dp_idx < total_num_device / ne_tp_dg; dst_dp_idx ++){ 
+  for(int dst_dp_idx = 0; dst_dp_idx < (total_num_device / ne_tp_dg) / pp_dg; dst_dp_idx ++){ 
     if(dst_dp_idx != src_dp_rank){ // to other dp space
 
       int dst_device_rank = dst_dp_idx * ne_tp_dg;
@@ -513,6 +476,40 @@ Sync__::Sync__(std::string& prefix, std::string& name,
 Tensor::Ptr Sync__::forward(const Tensor::Ptr input,
                             BatchedSequence::Ptr sequences_metadata) {
   return input;
+}
+
+PipelineStage::PipelineStage(std::string& prefix, std::string& name,
+                             int src_rank, int dst_rank, Device::Ptr device)
+    : Module(prefix, name, device, {src_rank}, true),
+      src_rank(src_rank),
+      dst_rank(dst_rank) {
+  std::vector<int> shape = {1, 1};
+  Tensor::Ptr output = Tensor::Create("pipeline_output", shape, "act", device, device->model_config.precision_byte);
+  add_tensor(output);
+}
+
+Tensor::Ptr PipelineStage::forward(const Tensor::Ptr input,
+                                   BatchedSequence::Ptr sequences_metadata) {
+  Tensor::Ptr output = get_activation("pipeline_output", input->shape);
+  long size = input->getSize();
+  if (size == 0) {
+    return output;
+  }
+
+  int src_node = src_rank / device->config.num_device;
+  int dst_node = dst_rank / device->config.num_device;
+
+  time_ns comm_time = 0;
+  if (src_node == dst_node) {
+    comm_time = device->config.device_ict_latency +
+                (double)size / device->config.device_ict_bandwidth * 1e9;
+  } else {
+    comm_time = device->config.node_ict_latency +
+                (double)size / device->config.node_ict_bandwidth * 1e9;
+  }
+
+  device->status.device_time += comm_time;
+  return output;
 }
 
 }  // namespace llm_system
