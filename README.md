@@ -63,7 +63,7 @@ Baseline for normalized metrics: 8-GPU HBM4 under the same SLO.
 
 - g++ 11.4+ with C++17
 - cmake 3.16+
-- Python 3.8+ with PyYAML (for sweep scripts; use conda env `fluidlab`)
+- Python 3.8+ with PyYAML
 
 ## Building
 
@@ -111,12 +111,12 @@ Exit code 0 = success; 1 = OOM (capacity or SRAM limit exceeded).
 
 **Flash-only fast check** — 8 GPU, HBF/HBF+/CONV/CONV+, llama3/llama4, short/long:
 ```bash
-conda run -n fluidlab python3 run_flash_only.py
+python3 run_flash_only.py
 ```
 
 **Full experiment sweep** — all GPU counts (1/2/4/8/16), all presets, all workloads and SLOs:
 ```bash
-conda run -n fluidlab python3 run_experiments.py
+python3 run_experiments.py
 ```
 
 Simulation CSV outputs go to `data/`. The sweep scripts invoke the optimizer, binary-search for max batch, then run the final simulation and extract metrics.
