@@ -82,7 +82,13 @@ std::vector<int> getIdxHigh(std::vector<int> list, SystemConfig config) {
     return getIdxHighOptimal(list, config);
   }
 
-  assertTrue(list.size() % 4 == 0, "Expert group size is not mached");
+  // getIdxHighOptimal handles any list size correctly (per-expert, not
+  // grouped-by-4); fall back to it instead of aborting when the EP split
+  // yields an expert-per-device count that isn't a multiple of 4
+  // (BUGS_HIDDEN_BY_FLAGS #6).
+  if (list.size() % 4 != 0) {
+    return getIdxHighOptimal(list, config);
+  }
 
   int group_size = list.size() / 4;
 

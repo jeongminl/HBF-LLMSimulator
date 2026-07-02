@@ -230,6 +230,8 @@ MultiLatentAttentionParallel::MultiLatentAttentionParallel(std::string& prefix,
   int parallel_num = device_list.size();
 
   assertTrue(num_heads % parallel_num == 0, "num_head mod parallel_num == 0");
+  assertTrue(num_kv_heads % parallel_num == 0,
+             "num_kv_head mod parallel_num == 0");
 
   Module::Ptr attention_split = AttentionSplit::Create(
   module_map_name, "AttentionSplit", head_dim, num_heads / parallel_num,
@@ -298,6 +300,8 @@ AbsorbMLAParallel::AbsorbMLAParallel(std::string& prefix,
   int parallel_num = device_list.size();
 
   assertTrue(num_heads % parallel_num == 0, "num_head mod parallel_num == 0");
+  assertTrue(num_kv_heads % parallel_num == 0,
+             "num_kv_head mod parallel_num == 0");
 
   Module::Ptr attention_split = AttentionSplit::Create(
   module_map_name, "AttentionSplit", head_dim, num_heads / parallel_num,

@@ -455,10 +455,28 @@ ExecStatus AttentionGenExecutionPIM(Device_Ptr device,
     exec_status += temp;
   }
 
-  double opb = total_flops / total_memory_size;
-  exec_status.total_duration += accumul_memory_duration * opb;
+  // GPU/LOGIC both take total_duration += max(compute, memory) (roofline overlap);
+  // this used to be accumul_memory_duration * opb, inflating PIM decode-attention
+  // latency by roughly the compute/memory ratio (BUGS_HIDDEN_BY_FLAGS #5).
+  exec_status.total_duration +=
+      std::max(accumul_compute_duration, accumul_memory_duration);
 
-  // Softmax //
+  // Softmax // -- mirrors the GPU/LOGIC softmax compute charge; previously absent,
+  // so PIM/LOGIC silently skipped this time (BUGS_HIDDEN_BY_FLAGS #5).
+  for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
+    seq = seq_list.at(seq_idx);
+
+    int softmax_m = seq->num_process_token;
+    int softmax_n = seq->current_len + seq->num_process_token;
+
+    double softmax_flops = 7.0 * softmax_m * softmax_n * num_heads; // scale + mask + softmax
+    total_flops += softmax_flops;
+
+    time_ns softmax_compute_duration = softmax_flops /
+        (compute_peak_flops * effectiveMFU(config, softmax_m)) * 1000 * 1000 * 1000;
+
+    exec_status.total_duration += softmax_compute_duration;
+  }
 
   // Context //
   accumul_len = 0;
@@ -505,9 +523,9 @@ ExecStatus AttentionGenExecutionPIM(Device_Ptr device,
     exec_status += temp;
   }
 
-  opb = total_flops / total_memory_size;
-  exec_status.total_duration += accumul_memory_duration * opb;
-
+  // Same max(compute, memory) fix as the Scoring section above (BUGS_HIDDEN_BY_FLAGS #5).
+  exec_status.total_duration +=
+      std::max(accumul_compute_duration, accumul_memory_duration);
 
   exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /
                              compute_peak_flops / exec_status.total_duration;

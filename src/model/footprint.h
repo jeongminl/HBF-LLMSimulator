@@ -153,24 +153,29 @@ inline double peakIntermediateBytes(const ModelConfig& model,
 
   double attn_total;
   if (model.use_absorb) {
+    // Query's non-rope output width is qk_nope_head_dim, not head_dim (which is V's
+    // up-projected width, used correctly below in "v_up out") -- dormant on this
+    // model's own preset since deepseekV3 sets qk_nope_head_dim == head_dim == 128,
+    // but was silently wrong for any config where they diverge (BUGS_HIDDEN_BY_FLAGS #7).
     double common_prefix =
         (batch_per_dp * hidden_dim) +
         (batch_per_dp * model.q_lora_rank) +
         (batch_per_dp * model.kv_lora_rank) +
         (batch_per_dp * model.qk_rope_head_dim) +
-        (batch_per_dp * (3.0 * model.qk_rope_head_dim + model.head_dim) * model.num_heads / tp);
+        (batch_per_dp * (3.0 * model.qk_rope_head_dim + model.qk_nope_head_dim) * model.num_heads / tp);
     attn_total = (common_prefix +
                   (batch_per_dp * model.num_heads * model.kv_lora_rank / tp) +  // tr_k up out
                   (batch_per_dp * model.num_heads * model.kv_lora_rank / tp) +  // attn context out
                   (batch_per_dp * model.num_heads * model.head_dim / tp) +      // v_up out
                   (batch_per_dp * hidden_dim)) * precision;                     // out proj out
   } else if (model.compressed_kv) {
+    // Same qk_nope_head_dim fix as the absorb branch above.
     double common_prefix =
         (batch_per_dp * hidden_dim) +
         (batch_per_dp * model.q_lora_rank) +
         (batch_per_dp * model.kv_lora_rank) +
         (batch_per_dp * model.qk_rope_head_dim) +
-        (batch_per_dp * (3.0 * model.qk_rope_head_dim + model.head_dim) * model.num_heads / tp);
+        (batch_per_dp * (3.0 * model.qk_rope_head_dim + model.qk_nope_head_dim) * model.num_heads / tp);
     attn_total = (common_prefix +
                   (batch_per_dp * model.num_heads * model.head_dim / tp) +  // attn context out
                   (batch_per_dp * hidden_dim)) * precision;                 // out proj out

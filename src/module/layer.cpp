@@ -135,8 +135,13 @@ MultiLatentAttention::MultiLatentAttention(std::string& prefix, std::string& nam
         false, false, device_list, device);
     add_module(attn_v_up_proj);
 
+    // Input width must match attn_v_up_proj's output width (num_heads * head_dim,
+    // just above) -- attention output is a weighted sum of V vectors, not Q_nope
+    // vectors. The sibling non-absorb branch below wires attn_o_proj identically
+    // with head_dim. Previously qk_nope_head_dim here, dormant only because this
+    // model's preset sets qk_nope_head_dim == head_dim (BUGS_HIDDEN_BY_FLAGS #7).
     auto attn_o_up_proj = BatchedRowParallelLinear::Create(
-        module_map_name, "attn_o_proj", model_config.num_heads * model_config.qk_nope_head_dim, 
+        module_map_name, "attn_o_proj", model_config.num_heads * model_config.head_dim,
         model_config.hidden_dim, model_config.num_heads, false, true, device_list, device);
     add_module(attn_o_up_proj);
 

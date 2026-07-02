@@ -37,7 +37,15 @@ Device::Device(SystemConfig config, int device_total_rank, Cluster_ptr cluster)
   top_module_graph = TopModuleGraph::Create(status);
 
   std::string dram_cfg_path;
-  if(config.gpu_gen == "H100"){
+  if(config.gpu_gen == "A100"){
+    // A100 has no dedicated Ramulator2 DRAM config file (its real HBM2e generation
+    // isn't one of the presets below); reuse H100's HBM3 80GB file as a placeholder,
+    // matching the real A100-80GB SKU's capacity. Inert for every sweep in this repo
+    // (see the Rubin comment below for why) -- was previously a dormant crash
+    // (BUGS.md item 1: empty dram_cfg_path -> YAML::LoadFile("") -> YAML::BadFile).
+    dram_cfg_path = "./dram_config_HBM3_80GB.yaml";
+  }
+  else if(config.gpu_gen == "H100"){
     dram_cfg_path = "./dram_config_HBM3_80GB.yaml";
   }
   else if(config.gpu_gen == "B100" || config.gpu_gen == "B200" || config.gpu_gen == "Rubin"){
@@ -49,11 +57,22 @@ Device::Device(SystemConfig config, int device_total_rank, Cluster_ptr cluster)
     // actually governs simulated behavior regardless of this file's contents.
     dram_cfg_path = "./dram_config_HBM3E_192GB.yaml";
   }
+  else {
+    fail("Device: unsupported gpu_gen '" + config.gpu_gen +
+         "' -- no Ramulator2 DRAM config mapping (see device.cpp)");
+  }
   YAML::Node cfg = YAML::LoadFile(dram_cfg_path);
 
   double memory_scale_factor = 0;
   MemoryConfig memory_config = MemoryConfig(config.num_cube, config.num_logic_cube);
-  if(config.gpu_gen == "H100"){
+  if(config.gpu_gen == "A100"){
+    // A100, HBM2e 80GB, ~2.4Gbps (estimate; inert placeholder, see dram_cfg_path comment above)
+    memory_scale_factor = 0.355;
+    memory_config = hbm3_80GB;
+    memory_config.num_cube = config.num_cube;
+    memory_config.num_logic_cube = config.num_logic_cube;
+  }
+  else if(config.gpu_gen == "H100"){
     // H100, HBM3 80GB, 5.2Gbps
     memory_scale_factor = 0.76923;
     memory_config = hbm3_80GB;

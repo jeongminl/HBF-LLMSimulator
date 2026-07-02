@@ -134,21 +134,25 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
   }
   else{ // prefill mode & colocated system (mixed)
     if(device->model_config.use_absorb){
+      // Every product below leads with a (double) cast on batch_size_per_dp so the
+      // whole left-to-right multiply chain evaluates in double -- with realistic
+      // input_len (thousands) and num_heads (128), the equivalent all-int expression
+      // overflows INT_MAX before ever reaching a double operand (BUGS_HIDDEN_BY_FLAGS #2).
       activation_size =
-        ((batch_size_per_dp * input_len * hidden_dim) + // input seqeunces (or tokens)
-        (batch_size_per_dp * input_len * q_lora_rank) + // c_q
-        (batch_size_per_dp * input_len * kv_lora_rank) + // c_kv
-        (batch_size_per_dp * input_len * qk_rope_head_dim) + // kr
+        ((double)batch_size_per_dp * input_len * hidden_dim + // input seqeunces (or tokens)
+        (double)batch_size_per_dp * input_len * q_lora_rank + // c_q
+        (double)batch_size_per_dp * input_len * kv_lora_rank + // c_kv
+        (double)batch_size_per_dp * input_len * qk_rope_head_dim + // kr
 
-        (batch_size_per_dp * input_len * (3.0 * qk_rope_head_dim + head_dim) * num_heads / ne_tp_dg) + // query + rope out + cos/sin
-        (batch_size_per_dp * input_len * num_heads * kv_lora_rank / ne_tp_dg) + // tr_k up out
+        (double)batch_size_per_dp * input_len * (3.0 * qk_rope_head_dim + head_dim) * num_heads / ne_tp_dg + // query + rope out + cos/sin
+        (double)batch_size_per_dp * input_len * num_heads * kv_lora_rank / ne_tp_dg + // tr_k up out
 
-        2.0 * (batch_size_per_dp * input_len *  num_heads * input_len / ne_tp_dg) + // attn score out
-        (batch_size_per_dp * input_len * num_heads * kv_lora_rank / ne_tp_dg) + // attn context out
+        2.0 * ((double)batch_size_per_dp * input_len *  num_heads * input_len / ne_tp_dg) + // attn score out
+        (double)batch_size_per_dp * input_len * num_heads * kv_lora_rank / ne_tp_dg + // attn context out
 
-        (batch_size_per_dp * input_len * num_heads * head_dim / ne_tp_dg) + // v_up out
+        (double)batch_size_per_dp * input_len * num_heads * head_dim / ne_tp_dg + // v_up out
 
-        (batch_size_per_dp * input_len * hidden_dim) + // out proj out
+        (double)batch_size_per_dp * input_len * hidden_dim + // out proj out
 
         // MoE FFN
         (num_routed_expert_per_device + device->model_config.num_shared_expert) * // routed + shared
@@ -158,19 +162,20 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
         device->model_config.precision_byte;
     }
     else{ // base
+      // Same double-cast fix as the absorb branch above (BUGS_HIDDEN_BY_FLAGS #2).
       activation_size =
-        ((batch_size_per_dp * input_len * hidden_dim) + // input seqeunces (or tokens)
-        (batch_size_per_dp * input_len * q_lora_rank) + // c_q
-        (batch_size_per_dp * input_len * kv_lora_rank) + // c_kv
-        (batch_size_per_dp * input_len * qk_rope_head_dim) + // kr
+        ((double)batch_size_per_dp * input_len * hidden_dim + // input seqeunces (or tokens)
+        (double)batch_size_per_dp * input_len * q_lora_rank + // c_q
+        (double)batch_size_per_dp * input_len * kv_lora_rank + // c_kv
+        (double)batch_size_per_dp * input_len * qk_rope_head_dim + // kr
 
-        (batch_size_per_dp * input_len * (3.0 * qk_rope_head_dim + head_dim) * num_heads / ne_tp_dg) + // query + rope out + cos/sin
-        (batch_size_per_dp * input_len * 2.0 * (head_dim) * num_heads / ne_tp_dg) + // kv
+        (double)batch_size_per_dp * input_len * (3.0 * qk_rope_head_dim + head_dim) * num_heads / ne_tp_dg + // query + rope out + cos/sin
+        (double)batch_size_per_dp * input_len * 2.0 * (head_dim) * num_heads / ne_tp_dg + // kv
 
-        2.0 * (batch_size_per_dp * input_len * input_len * num_heads / ne_tp_dg) + // attn score out
-        (batch_size_per_dp * input_len * num_heads * head_dim / ne_tp_dg) + // attn context out
+        2.0 * ((double)batch_size_per_dp * input_len * input_len * num_heads / ne_tp_dg) + // attn score out
+        (double)batch_size_per_dp * input_len * num_heads * head_dim / ne_tp_dg + // attn context out
 
-        (batch_size_per_dp * input_len * hidden_dim) + // out proj out
+        (double)batch_size_per_dp * input_len * hidden_dim + // out proj out
 
         // MoE FFN
         (num_routed_expert_per_device + device->model_config.num_shared_expert) * // routed + shared
@@ -335,6 +340,13 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
   return false;
 }
 
+// AUDIT (BUGS.md #6): grep-confirmed zero call sites anywhere in this tree --
+// this function is dead code, not merely "unclear if used." Its capacity math
+// (hardcoded "3.3 GB Non MoE weight" magic-number subtraction, no activation
+// term in the `size` OOM check) diverges from checkMemorySize()'s scarce-tier
+// gate and should not be trusted if it's ever wired back up. Left in place
+// (not deleted) pending an explicit decision on whether it's still needed --
+// see BUGS_FIXES.md.
 bool Cluster::checkHeteroMemorySize() {
   Device::Ptr device = get_device(0);
   auto module = module_map.at(0).at("::LLM");
@@ -533,9 +545,20 @@ std::vector<Stat> Cluster::runIterationMixed(int iter, std::ofstream &csv) {
     // is safe ONLY because decode_mode=on (config.yaml) guarantees every sequence is
     // synthesized already fully prefilled (current_len == input_len at creation, see
     // scheduler.cpp's pushDummySeq), so hasSumSeq() is always false here and no
-    // prefill time is ever actually accumulated. If decode_mode were ever disabled,
-    // this function has no defensive check and would leak prefill compute time into
-    // the reported decode-only TPOT (INSTRUCTIONS.md Section 3).
+    // prefill time is ever actually accumulated. If decode_mode were ever disabled
+    // (without disagg_system=on), this leaks prefill compute time into the reported
+    // decode-only TPOT (BUGS.md #2) -- warn once so the contamination isn't silent.
+    if (!config.disagg_system && scheduler->hasSumSeq()) {
+      static bool warned_prefill_contamination = false;
+      if (!warned_prefill_contamination) {
+        std::cerr << "WARNING: runIterationMixed is accumulating a \"sum\" "
+                     "(prefill) iteration into the decode-only total_time -- "
+                     "decode_mode should be on unless disagg_system is also on "
+                     "(see BUGS.md #2)."
+                  << std::endl;
+        warned_prefill_contamination = true;
+      }
+    }
     total_time += time;
 
     Stat stat;
@@ -649,6 +672,25 @@ std::vector<Stat> Cluster::runIterationSumGenSplit(int iter,
       stat.type = "sum";
       stat.time = std::max(total_time, sum_machine_time) + time;
       stat.latency = time;
+
+      // Populate energy/batch/breakdown fields like the gen branch above --
+      // previously left zeroed for every prefill row (BUGS_HIDDEN_BY_FLAGS #4).
+      // setStat() leaves stat.latency untouched on the disagg+hasSumSeq() path
+      // (see its own branching), so this does not override the value set above.
+      std::vector<energy_nJ> total_energy = getTotalEnergy();
+      stat.act_energy = total_energy[0];
+      stat.read_energy = total_energy[1];
+      stat.write_energy = total_energy[2];
+      stat.all_act_energy = total_energy[3];
+      stat.all_read_energy = total_energy[4];
+      stat.all_write_energy = total_energy[5];
+      stat.mac_energy = total_energy[6];
+      stat.total_energy = total_energy[7];
+      stat.seq_queue_size = scheduler->sequence_queue.size();
+
+      setStat(stat);
+      setTimeBreakDown(stat);
+
       stat_list.push_back(stat);
 
       sum_machine_time = stat.time;
