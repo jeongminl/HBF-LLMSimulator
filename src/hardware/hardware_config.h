@@ -188,7 +188,31 @@ class SystemConfig {
   //        (a double-buffer cannot stage more KV than the SRAM holds).
   // Parsed from config.yaml: system.chunk_size.
   int chunk_size = 0;
+
+  // Compute-utilization (MFU, Model FLOPs Utilization) derating of GEMM compute time.
+  // The inherited roofline model (compute_duration = total_flops/compute_peak_flops) assumes
+  // every compute-bound op hits 100% of peak FLOPs, which no real GEMM does (tensor-core
+  // tile/wave quantization, epilogue/reduction overhead). This is modeled as a saturating
+  // curve in the GEMM row count M (batch*tokens for that specific op):
+  //   MFU(M) = mfu_max * M / (M + mfu_m_half)
+  //   compute_duration = total_flops / (compute_peak_flops * MFU(M)) * 1e9
+  // Defaults (mfu_max=1.0, mfu_m_half=0) make MFU(M) == 1.0 for all M > 0, i.e. an EXACT
+  // no-op matching the pre-existing behavior unless explicitly configured.
+  //   mfu_max    – asymptotic (large-M) achieved FLOPs fraction, in (0, 1].
+  //   mfu_m_half – GEMM row count at which MFU(M) == mfu_max/2 (curve's half-saturation
+  //                point); 0 disables the ramp so MFU(M) == mfu_max for every M > 0.
+  // Parsed from config.yaml: simulation.mfu_max / simulation.mfu_m_half.
+  double mfu_max = 1.0;
+  double mfu_m_half = 0.0;
 };
+
+// MFU(M) = mfu_max * M / (M + mfu_m_half) -- see SystemConfig::mfu_max/mfu_m_half above.
+// m <= 0 (degenerate/empty op) returns mfu_max rather than 0 to avoid a divide-by-zero
+// blow-up in callers that divide compute_peak_flops by this value.
+inline double effectiveMFU(const SystemConfig& config, double m) {
+  if (m <= 0.0 || config.mfu_m_half <= 0.0) return config.mfu_max;
+  return config.mfu_max * m / (m + config.mfu_m_half);
+}
 
 
 static SystemConfig A100 = SystemConfig(

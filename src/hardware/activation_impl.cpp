@@ -42,7 +42,8 @@ static ExecStatus activationCore(
   // Activation is elementwise: FLOPs ≈ memory bytes read (memory-bound); total_flops=total_memory_size.
   hw_metric total_flops = total_memory_size;
 
-  time_ns compute_duration = total_flops / desc.compute_peak_flops * 1000 * 1000 * 1000;
+  time_ns compute_duration = total_flops /
+      (desc.compute_peak_flops * effectiveMFU(config, input->shape[0])) * 1000 * 1000 * 1000;
   time_ns memory_duration;
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
     memory_duration = (config.hbf_config.num_hbm_stacks > 0)

@@ -5,10 +5,17 @@ import subprocess
 import glob
 import time
 
+# NOTE: this is a fast 8-GPU SMOKE CHECK, not the paper-comparison harness. It
+# uses the paper's canonical workload token lengths (matching run_experiments.py's
+# WORKLOADS, the single source of truth for any Son et al. IEEE CAL 2026
+# comparison), but only sweeps 8 GPUs / one SLO -- it cannot reproduce anchors
+# that need other GPU counts or the full SLO sweep (see PAPER_INCONSISTENCIES.md).
+# Use run_experiments.py for anything compared against the paper.
 models = ["llama3_405B", "llama4_maverick"]
 workloads = {
-    "short": (1024, 1024),
-    "long": (104600, 1660)
+    "SHORT": (1660, 373),
+    "MID": (5900, 499),
+    "LONG": (103500, 1100),
 }
 mem_types = ["HBF", "HBF+", "CONV", "CONV+"]
 gpus = [8]
@@ -51,12 +58,17 @@ def run_simulation(model, mem_type, num_device, batch_size, input_len, output_le
         if res.returncode != 0 or any(m in stdout for m in fail_markers):
             return {"success": False, "reason": "OOM/Crash", "stdout": stdout}
             
+        # cluster.cpp prints multiple "Total: " lines: two memory-report lines shaped
+        # "Total: <float>GB" (cluster.cpp:186,343) and the real total-time line shaped
+        # "Total: <int>" with no suffix (cluster.cpp:484, scheduler->total_time in ns).
+        # Explicitly exclude the "GB"-suffixed lines instead of relying on float()
+        # to throw on them, so a future format change can't silently mis-parse.
         total_time_ns = None
         for line in stdout.split("\n"):
-            if line.startswith("Total: "):
+            if line.startswith("Total: ") and not line.rstrip().endswith("GB"):
                 try:
-                    total_time_ns = float(line.split()[1])
-                except:
+                    total_time_ns = float(line[len("Total: "):].strip())
+                except ValueError:
                     pass
         if total_time_ns is None:
             return {"success": False, "reason": "No total time printed", "stdout": stdout}

@@ -77,7 +77,11 @@ def apply_mla_flags(cfg, model):
     cfg["system"]["optimization"]["use_absorb"] = is_mla
     cfg["system"]["optimization"]["use_flash_mla"] = is_mla
 
-def run_simulation(model, mem_type, num_device, batch_size, input_len, output_len, optimize_parallelism=True, tpot_slo=0.1, distribution=None):
+def run_simulation(model, mem_type, num_device, batch_size, input_len, output_len, optimize_parallelism=True, tpot_slo=0.1, distribution=None, mfu_max=None, mfu_m_half=None):
+    # mfu_max/mfu_m_half: optional compute-utilization (MFU) override, forwarded to
+    # config.yaml's simulation.mfu_max/mfu_m_half (see SystemConfig::mfu_max/mfu_m_half,
+    # hardware_config.h). None (default) omits the key entirely, so the C++ binary keeps
+    # its in-class defaults (mfu_max=1.0, mfu_m_half=0.0) -- an exact no-op.
     # distribution: optional {"tp":.., "pp":.., "ep":..} to force a SPECIFIC parallelism
     # config (skips the in-process Optimize() re-derivation the binary would otherwise do
     # -- used when the analytic sweep already discovered the config for this exact batch).
@@ -126,6 +130,11 @@ def run_simulation(model, mem_type, num_device, batch_size, input_len, output_le
     # just the SLO.  The optimizer already exits non-zero when no parallelism
     # config fits; this also catches any over-capacity the simulation itself sees.
     cfg["simulation"]["exit_out_of_memory"] = True
+
+    if mfu_max is not None:
+        cfg["simulation"]["mfu_max"] = mfu_max
+    if mfu_m_half is not None:
+        cfg["simulation"]["mfu_m_half"] = mfu_m_half
 
     # Save temp config inside build
     temp_cfg_path = os.path.join(BUILD_DIR, "config_temp.yaml")
@@ -306,7 +315,12 @@ def classify_failure(fail_info):
         return "slo"
     return "unknown"
 
-def find_max_batch_size(model, mem_type, num_device, input_len, output_len, tpot_slo=0.1):
+def find_max_batch_size(model, mem_type, num_device, input_len, output_len, tpot_slo=0.1, mfu_max=None, mfu_m_half=None):
+    # mfu_max/mfu_m_half: forwarded only to the simulator-verification calls (verify()
+    # below), not to run_analytic_sweep -- the analytic phase is a heuristic seed only
+    # (F1) and find_max_batch_size already reconciles analytic/simulator disagreement
+    # via its fallback search branches, so an MFU-unaware analytic seed just costs a
+    # few extra simulator calls to converge, never an incorrect result.
     # F1: the batch-size search is split into a cheap ANALYTIC phase (one fast
     # in-process sweep inside the C++ binary, no simulation spawned per probed
     # batch -- see run_analytic_sweep) that bounds the search, followed by a
@@ -344,7 +358,8 @@ def find_max_batch_size(model, mem_type, num_device, input_len, output_len, tpot
     last_fail = {"reason": None, "stdout": ""}
 
     def verify(b, distribution=None):
-        res = run_simulation(model, mem_type, num_device, b, input_len, output_len, True, tpot_slo, distribution=distribution)
+        res = run_simulation(model, mem_type, num_device, b, input_len, output_len, True, tpot_slo,
+                              distribution=distribution, mfu_max=mfu_max, mfu_m_half=mfu_m_half)
         if not res["success"]:
             last_fail["reason"] = res.get("reason")
             last_fail["stdout"] = res.get("stdout", "")
@@ -353,6 +368,34 @@ def find_max_batch_size(model, mem_type, num_device, input_len, output_len, tpot
     def unpack(b, res):
         dp = res.get("dp") or 1
         return b, res["tpot"], res.get("csv_file"), res.get("pec_kv_bytes"), res.get("pec_capacity"), dp
+
+    # BOUNDARY_WINDOW/probe_window: guards every search step below (exponential
+    # doubling, and both binary searches) against a NON-MONOTONICITY artifact where
+    # one probed batch happens to be the single integer in a divisibility cycle
+    # (batch_size % dp == 0, parallelism_optimizer.cpp) that routes the live
+    # optimizer to a WORSE parallelism config than its neighbors -- confirmed
+    # empirically while investigating PAPER_INCONSISTENCIES.md's U8 (llama4_
+    # maverick/HBF+/16-GPU/offline): b=9292 is divisible by 4 (TP=1/PP=4/DP=4
+    # selected, feasible up to ~10947); b=9293 is divisible by neither 4 nor 2, so
+    # only TP=4/PP=4/DP=1 (ceiling ~8192) remains divisibility-eligible and fails
+    # there, even though b=9296 (divisible by 4 again) succeeds with TP=1 same as
+    # b=9292. A single probe cannot distinguish this from a genuine ceiling, so
+    # every step scans a small window before concluding infeasibility -- bounded to
+    # a fixed few extra simulator calls, sized to the TP degrees (<=8) this
+    # codebase's model presets actually use (num_kv_heads caps TP; see
+    # parallelism_optimizer.cpp's tp loop).
+    BOUNDARY_WINDOW = 8
+
+    def probe_window(b_start):
+        """Scan [b_start, b_start+BOUNDARY_WINDOW] for the first successful verify().
+        Returns (b_found, res) on success, or (None, last res) if the whole window fails."""
+        res_local = None
+        for offset in range(0, BOUNDARY_WINDOW + 1):
+            b_try = b_start + offset
+            res_local = verify(b_try)
+            if res_local["success"]:
+                return b_try, res_local
+        return None, res_local
 
     def analytic_distribution():
         if analytic["tp"] is None or analytic["pp"] is None or analytic["ep"] is None:
@@ -382,29 +425,23 @@ def find_max_batch_size(model, mem_type, num_device, input_len, output_len, tpot
     if res["success"]:
         max_b, max_tpot, last_csv, last_pec_kv, last_pec_cap, dp = unpack(b_analytic, res)
 
-        # Boundary safety check: confirm b_analytic+1 truly fails too. This guards
-        # against the analytic model UNDER-estimating latency right at the
-        # boundary (the unhidden-KV-write term isn't proven monotonic in general
-        # -- see the plan's envelope-monotonicity note). If b_analytic+1
-        # unexpectedly PASSES, the analytic model overestimated there and the
-        # true max is higher; fall back to a simulator-driven exponential+binary
-        # search seeded at this known-good point (same shape as the original
-        # algorithm, just starting near the true boundary instead of at B=1).
-        # No pre-known config for b_analytic+1, so let the optimizer re-derive it.
-        boundary_res = verify(b_analytic + 1)
-        if not boundary_res["success"]:
+        # Boundary safety check: confirm batches just above b_analytic truly fail
+        # (both the analytic model under-estimating latency, and the divisibility-
+        # cycle non-monotonicity described above at probe_window's definition).
+        b_probe, boundary_res = probe_window(b_analytic + 1)
+        if b_probe is None:
             return max_b, max_tpot, last_csv, last_pec_kv, last_pec_cap, dp, classify_failure(last_fail)
 
-        b_success = b_analytic + 1
+        b_success = b_probe
         max_b, max_tpot, last_csv, last_pec_kv, last_pec_cap, dp = unpack(b_success, boundary_res)
 
         b = b_success * 2
         while True:
-            res2 = verify(b)
-            if res2["success"]:
-                b_success = b
-                max_b, max_tpot, last_csv, last_pec_kv, last_pec_cap, dp = unpack(b, res2)
-                b *= 2
+            b_next, res2 = probe_window(b)
+            if b_next is not None:
+                b_success = b_next
+                max_b, max_tpot, last_csv, last_pec_kv, last_pec_cap, dp = unpack(b_next, res2)
+                b = b_next * 2
             else:
                 b_fail = b
                 break
@@ -412,10 +449,10 @@ def find_max_batch_size(model, mem_type, num_device, input_len, output_len, tpot
         low, high = b_success + 1, b_fail - 1
         while low <= high:
             mid = (low + high) // 2
-            res2 = verify(mid)
-            if res2["success"]:
-                max_b, max_tpot, last_csv, last_pec_kv, last_pec_cap, dp = unpack(mid, res2)
-                low = mid + 1
+            mid_found, res2 = probe_window(mid)
+            if mid_found is not None:
+                max_b, max_tpot, last_csv, last_pec_kv, last_pec_cap, dp = unpack(mid_found, res2)
+                low = mid_found + 1
             else:
                 high = mid - 1
 
@@ -434,10 +471,10 @@ def find_max_batch_size(model, mem_type, num_device, input_len, output_len, tpot
     low, high = 2, b_analytic - 1
     while low <= high:
         mid = (low + high) // 2
-        res2 = verify(mid)
-        if res2["success"]:
-            max_b, max_tpot, last_csv, last_pec_kv, last_pec_cap, dp = unpack(mid, res2)
-            low = mid + 1
+        mid_found, res2 = probe_window(mid)
+        if mid_found is not None:
+            max_b, max_tpot, last_csv, last_pec_kv, last_pec_cap, dp = unpack(mid_found, res2)
+            low = mid_found + 1
         else:
             high = mid - 1
 

@@ -280,6 +280,16 @@ int main(int argc, char *argv[]) {
         config["simulation"]["latency_margin"].as<double>();
   }
 
+  // Compute-utilization (MFU) derating -- see SystemConfig::mfu_max/mfu_m_half
+  // (hardware_config.h) for the model. Both optional; defaults (1.0 / 0.0) are
+  // an exact no-op matching pre-existing (100%-peak) behavior.
+  if (config["simulation"]["mfu_max"]) {
+    system_config.mfu_max = config["simulation"]["mfu_max"].as<double>();
+  }
+  if (config["simulation"]["mfu_m_half"]) {
+    system_config.mfu_m_half = config["simulation"]["mfu_m_half"].as<double>();
+  }
+
   // ---- Analytic-only batch-size sweep (F1 fix) -----------------------------
   // Find the largest batch B for which SOME parallelism config satisfies
   // capacity/SRAM (checkCapacity, inside Optimize()) AND the analytic

@@ -71,7 +71,8 @@ static ExecStatus linearCore(
   ExecStatus exec_status;
   if (input->getSize() == 0) return exec_status;
 
-  time_ns compute_duration = total_flops / desc.compute_peak_flops * 1000 * 1000 * 1000;
+  time_ns compute_duration = total_flops /
+      (desc.compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
   time_ns memory_duration  = getLinearMemoryDuration(config, m, k, n, weight->precision_byte,
                                                       total_memory_size, desc.memory_bandwidth,
                                                       num_heads, duplicated_input);

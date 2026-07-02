@@ -353,7 +353,8 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
       double total_flops = layers_per_stage *
                            (2.0 * attn_weights_params + 2.0 * mlp_weights_params) *
                            batch_size_per_gpu / tp;
-      double compute_time = total_flops / system_config.compute_peak_flops * 1e9;
+      double compute_time = total_flops /
+          (system_config.compute_peak_flops * effectiveMFU(system_config, batch_size_per_gpu)) * 1e9;
 
       // KV read time (decode: reads full KV cache from flash/HBM)
       double kv_read_size = kv_cache_per_gpu;
@@ -410,7 +411,8 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
         // this overlap). Using total per-layer compute here would over-credit hiding and
         // under-count the write penalty relative to the simulator.
         double attn_flops_per_layer = 2.0 * attn_weights_params * batch_size_per_gpu / tp;
-        double single_layer_attn_compute = attn_flops_per_layer / system_config.compute_peak_flops * 1e9;
+        double single_layer_attn_compute = attn_flops_per_layer /
+            (system_config.compute_peak_flops * effectiveMFU(system_config, batch_size_per_gpu)) * 1e9;
         double unhidden_write = std::max(0.0, single_layer_kv_write - single_layer_attn_compute);
         kv_write_time = unhidden_write * layers_per_stage;
       }
@@ -442,8 +444,16 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
       // Communication latency
       // TP All-Reduce (2 per layer) and PP send/receive share the same message shape.
       double inter_stage_message_size = batch_size_per_gpu * hidden_dim * precision;
-      double tp_comm_time = 2.0 * layers_per_stage * (system_config.device_ict_latency + (inter_stage_message_size / system_config.device_ict_bandwidth * 1e9));
+      // Ring all-reduce, matching the live simulator's AllReduce::forward exactly
+      // (src/module/communication.cpp): for a group of size N, cost = 2*(N-1) hops,
+      // each hop paying one device_ict_latency plus 1/N of the message over
+      // device_ict_bandwidth. Two all-reduces per layer (attention + FFN).
+      double tp_comm_time = 0.0;
       if (tp > 1) {
+        double per_allreduce =
+            2.0 * (tp - 1) * system_config.device_ict_latency +
+            (2.0 * (tp - 1) / tp) * (inter_stage_message_size / system_config.device_ict_bandwidth * 1e9);
+        tp_comm_time = 2.0 * layers_per_stage * per_allreduce;
         total_latency_ns += tp_comm_time;
       }
 
