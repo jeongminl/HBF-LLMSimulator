@@ -338,8 +338,8 @@ def find_max_batch_size(model, mem_type, num_device, input_len, output_len, tpot
     # batch_size/dp) and what the TPS/PEC formulas in main() already correctly
     # treat as a total (dividing by GPU count). Callers computing a PER-GPU batch
     # size (Metric 1/4's "Max Per-GPU Batch Size") must divide by the TOTAL GPU
-    # COUNT used in the experiment, NOT the returned dp -- matches INSTRUCTIONS.md's
-    # explicit TPS definition ("... / Number of GPUs") and the paper's own published
+    # COUNT used in the experiment, NOT the returned dp -- matches this project's
+    # TPS definition ("... / Number of GPUs") and the paper's own published
     # anchors (e.g. 1555/8=194.4 vs. the paper's stated 194 for llama3
     # HBM4/8-GPU/SHORT). Dividing by dp instead penalizes a memory system for using DP
     # *more* effectively (more independent replicas = more total capacity from the same
@@ -380,11 +380,16 @@ def find_max_batch_size(model, mem_type, num_device, input_len, output_len, tpot
     # only TP=4/PP=4/DP=1 (ceiling ~8192) remains divisibility-eligible and fails
     # there, even though b=9296 (divisible by 4 again) succeeds with TP=1 same as
     # b=9292. A single probe cannot distinguish this from a genuine ceiling, so
-    # every step scans a small window before concluding infeasibility -- bounded to
-    # a fixed few extra simulator calls, sized to the TP degrees (<=8) this
-    # codebase's model presets actually use (num_kv_heads caps TP; see
-    # parallelism_optimizer.cpp's tp loop).
-    BOUNDARY_WINDOW = 8
+    # every step scans a window before concluding infeasibility.
+    # Window size: a fixed 8 (sized to the TP degrees (<=8) this codebase's model
+    # presets actually use) only guarantees catching the next value divisible by
+    # some dp <= 8. Now that the optimizer ranks by throughput rather than
+    # argmin(latency) (parallelism_optimizer.cpp), dp is no longer implicitly
+    # biased toward small dp/large pp by a latency-minimizing objective and can be
+    # chosen up to the full GPU count -- the worst-case gap between consecutive
+    # multiples of dp is dp-1, so the window must cover up to num_device-1 to
+    # guarantee catching a hit for ANY legal dp at this GPU count.
+    BOUNDARY_WINDOW = max(num_device, 8)
 
     def probe_window(b_start):
         """Scan [b_start, b_start+BOUNDARY_WINDOW] for the first successful verify().
@@ -409,8 +414,9 @@ def find_max_batch_size(model, mem_type, num_device, input_len, output_len, tpot
             # legitimate analytic rejection, unlike a pure-latency-estimate one).
             return 0, 0.0, None, None, None, 1, "unknown"
         # Audit F1 fix: capacity was fine at B=1, only the analytic LATENCY ESTIMATE
-        # rejected it. The estimate must never itself be the final word (INSTRUCTIONS.md
-        # Section 6) -- ask the real simulator before declaring this combo infeasible.
+        # rejected it. The estimate must never itself be the final word (the optimizer/
+        # simulator separation-of-concerns principle) -- ask the real simulator before
+        # declaring this combo infeasible.
         res1 = verify(1)
         if not res1["success"]:
             return 0, 0.0, None, None, None, 1, classify_failure(last_fail)
@@ -867,7 +873,7 @@ def main():
             max_b, tpot, csv_file, pec_kv, pec_cap, dp, bound_reason = find_max_batch_size(
                 model, "HBM4", 8, in_len, out_len, 0.1)
             # Per-GPU metrics divide by the TOTAL GPU count, not dp -- matches
-            # INSTRUCTIONS.md's explicit TPS definition ("... / Number of GPUs") and
+            # this project's TPS definition ("... / Number of GPUs") and
             # the paper's cross-GPU-count normalization (a DP replica still consumes
             # real GPU hardware; dividing by dp instead of GPU count penalizes a
             # config for using DP *more* effectively). See find_max_batch_size's

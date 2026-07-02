@@ -1,10 +1,12 @@
 # Changes — HBF-LLMSimulator fairness/correctness fixes and paper cross-reference
 
 This session fixed a series of correctness/fairness bugs surfaced by an external audit
-(`FAIRNESS_AUDIT.md`, independently vetted before acting on it) and by directly cross-
-referencing the codebase against the source paper ("Exploring High-Bandwidth Flash for
-Modern LLM Inference," Son et al.). It also corrected a model-precision assumption that closed
-a large chunk of an observed batch-size discrepancy against the paper's own reported numbers.
+(a cross-configuration fairness review, independently vetted before acting on it; its findings
+are tagged "audit F1"-"F8" throughout this doc) and by directly cross-referencing the codebase
+against the source paper ("Exploring High-Bandwidth Flash for Modern LLM Inference," Son et al.,
+IEEE CAL 2026 — the ground-truth spec for this simulator; see the PDF in this repo). It also
+corrected a model-precision assumption that closed a large chunk of an observed batch-size
+discrepancy against the paper's own reported numbers.
 
 ## Fixes applied and verified
 
@@ -15,9 +17,12 @@ a large chunk of an observed batch-size discrepancy against the paper's own repo
    rejected it" (must still ask the real simulator). `run_experiments.py`'s
    `find_max_batch_size` now falls through to a real `verify(1)` call in the latter case
    instead of silently returning batch=0 without ever consulting the simulator. This was a
-   direct violation of the "simulator is the sole SLO arbiter" principle (`INSTRUCTIONS.md`
-   §6) that this same session had written and enforced everywhere else — an ironic regression
-   in the very code implementing that principle.
+   direct violation of this codebase's own optimizer/simulator separation-of-concerns design
+   (derived from the paper's own methodology: the parallelism optimizer only "ranks and
+   proposes" candidate configurations analytically, while the discrete-event simulator is the
+   sole arbiter of actual SLO satisfaction and every reported metric) that this same session had
+   written and enforced everywhere else — an ironic regression in the very code implementing
+   that principle.
 
 2. **Analytic search direction fixed to match the approved design.** `eval/test.cpp`'s
    analytic sweep now computes the capacity/SRAM ceiling directly (exact and monotonic, no
@@ -132,9 +137,10 @@ a large chunk of an observed batch-size discrepancy against the paper's own repo
     llama3_405B/llama4_maverick (neither uses MLA-absorb); affects any future DeepSeek/MLA
     sweep.
 
-13. **`FAIRNESS_AUDIT.md` corrected.** Two of the external audit's claims were independently
-    re-verified and found factually incorrect (annotated in place in that file, not deleted, so
-    a future reader sees both the original claim and the correction):
+13. **Two of the external fairness audit's claims corrected.** (The audit document itself,
+    `FAIRNESS_AUDIT.md`, was deleted in a later documentation cleanup once every finding it
+    raised — F1-F8 — was confirmed addressed here; this item preserves the correction.)
+    Independently re-verified and found factually incorrect:
     - **F6** ("disagg path lost its only KV-write critical-path term"): refuted. Both
       execution-loop implementations (`runIterationMixed`, `runIterationSumGenSplit`) call the
       identical kernel-dispatch chain that contains the correct per-step KV-write overlap
@@ -159,22 +165,21 @@ a large chunk of an observed batch-size discrepancy against the paper's own repo
     freed sequentially (attention phase, then FFN phase), so the true resident set at any
     instant is `max(attention-phase, FFN-phase)`, never their sum. Worse, the summed formula's
     dominant term was the sequence-length-scaled Q·Kᵀ attention-score matrix
-    (`batch·2·total_len·num_heads/tp`) — per `INSTRUCTIONS.md`'s Read Prefetching policy, that
-    data is chunked through a *separate* 3.13-MB/stack double-buffer and is never resident in
-    the 320-MB intermediate-data pool at all. Because this term scaled with sequence length, the
-    320-MB gate bit hardest at *long* context — backwards from both the paper and
-    `INSTRUCTIONS.md`'s original "particularly in short-context workloads" framing — and because
-    HBF's 36-GB scarce tier never binds regardless, only HBF+/CONV+ were penalized, producing
-    the inversion. Fixed by adding a single shared `peakIntermediateBytes()` helper
+    (`batch·2·total_len·num_heads/tp`) — per the paper's Read Prefetching double-buffering
+    description (each flash stack's dedicated 3.13-MB SRAM staging buffer), that data is chunked
+    through a *separate* buffer and is never resident in the 320-MB intermediate-data pool at
+    all. Because this term scaled with sequence length, the 320-MB gate bit hardest at *long*
+    context — backwards from the paper's intent that this be primarily a short-context,
+    large-batch constraint — and because HBF's 36-GB scarce tier never binds regardless, only
+    HBF+/CONV+ were penalized, producing the inversion. Fixed by adding a single shared
+    `peakIntermediateBytes()` helper
     (`src/model/footprint.h`), used identically by the optimizer's `checkCapacity` call and the
     simulator's Part-C scarce-tier gate, that: (a) excludes the streamed attention-score/
     decompressed-KV terms entirely, (b) takes `max(attention-phase, FFN-phase)` instead of a
     sum, and (c) adds the dense-FFN transient term that the old formula omitted entirely for
     non-MoE layers (its `ffn_act` term was gated on `num_routed_expert > 0`, silently zeroing
-    for dense models like llama3_405B). `INSTRUCTIONS.md`'s Section 2 "Intermediate Data"
-    paragraph was rewritten to state the peak/short-lifetime model explicitly, per the paper
-    (trusted over the prior generic "map all intermediate data" wording where they conflicted).
-    Effect: HBF+ total batch at MID/8-GPU roughly doubled for both models (llama3: 756→1444,
+    for dense models like llama3_405B). Effect: HBF+ total batch at MID/8-GPU roughly doubled for
+    both models (llama3: 756→1444,
     llama4: 2336→4562), flipping the HBF+-vs-HBF total-batch inversion the right way round.
 
 15. **Per-GPU batch-size divisor corrected: total GPU count, not DP replica count (supersedes
@@ -184,16 +189,16 @@ a large chunk of an observed batch-size discrepancy against the paper's own repo
     replicas) where HBF stays at `dp=1`. Dividing by `dp` penalizes a config for splitting into
     *more* independent, hardware-efficient replicas — backwards, since a DP replica still
     consumes real GPU hardware whether or not it's counted in the denominator.
-    `INSTRUCTIONS.md`'s own explicit definition of the neighboring TPS metric — "(Total Output
-    Tokens) / (Total Simulation Time) / (**Number of GPUs**)" — already divides by total GPU
-    count, not DP, and `run_experiments.py`'s TPS formula (`max_b / (tpot * gpu)`) already
-    implemented it that way; only the batch-size divisor (4 call sites in `run_experiments.py`)
-    used `dp` instead, an internal inconsistency within the same file. Corrected all 4 sites to
-    `max_batch / gpu_count`. This is a reversal of a decision defended earlier in this same
-    session (originally argued that TP/PP GPUs "collaboratively serving the same sequences"
-    justified not dividing by them) — that reasoning describes a real quantity (batch size per
-    *replica*), but not the quantity `INSTRUCTIONS.md`/the paper mean by "per-GPU": a
-    hardware-normalized metric for comparing across GPU counts, which must divide by all GPUs
+    this project's own TPS metric definition — "(Total Output Tokens) / (Total Simulation Time) /
+    (**Number of GPUs**)," consistent with the paper's per-GPU-normalized throughput reporting
+    convention — already divides by total GPU count, not DP, and `run_experiments.py`'s TPS
+    formula (`max_b / (tpot * gpu)`) already implemented it that way; only the batch-size divisor
+    (4 call sites in `run_experiments.py`) used `dp` instead, an internal inconsistency within the
+    same file. Corrected all 4 sites to `max_batch / gpu_count`. This is a reversal of a decision
+    defended earlier in this same session (originally argued that TP/PP GPUs "collaboratively
+    serving the same sequences" justified not dividing by them) — that reasoning describes a real
+    quantity (batch size per *replica*), but not what "per-GPU" means for the paper's
+    cross-GPU-count comparisons: a hardware-normalized metric that must divide by all GPUs
     consumed regardless of whether they're organized via TP or DP. Confirmed by recomputing
     already-completed simulator runs with the corrected divisor (no re-run needed, since the
     totals aren't affected by this reporting-only change) — see "Residual gap resolved" below.
@@ -323,9 +328,7 @@ found:
     drops below the page latency. Mirrored identically in
     `parallelism_optimizer.cpp`'s `kv_read_time` (the analytic candidate proposer) so the two
     formulas stay in lock-step, matching this codebase's established pattern for shared formulas
-    (e.g. `peakIntermediateBytes`). Also reworded `INSTRUCTIONS.md`'s Read-Prefetching paragraph,
-    which previously said to "pay the page-read latency only once per chunk" — a literal
-    description of the bug — to state the corrected double-buffer model instead.
+    (e.g. `peakIntermediateBytes`).
     **Scope/safety:** only executes when `config.use_hbf && num_flash_stacks > 0`; verified HBM4
     and every dense/llama3-HBM4 anchor is byte-identical before/after (tpot matched to 15 decimal
     places). **Verified effect:** llama4_maverick LONG-workload HBF+ per-GPU TPS rose ~34-36%
@@ -451,3 +454,176 @@ found:
   for a much smaller per-device expert-weight footprint.
 - See `BUGS.md` for additional minor/dormant bugs and brittle code noticed but not fixed this
   session.
+
+22. **Pipeline-parallel decode latency was never propagated across stages — a ~pp× undercount of
+    every `PP>1` config's measured TPOT, and the root cause of `PAPER_INCONSISTENCIES.md`'s U1
+    and the inverted U3 conclusion.** `PipelineStage` (`src/module/communication.cpp`) is the only
+    cross-device module in the decode critical path constructed `sync=false` with a single-device
+    `device_list` — unlike `AllReduce`/`MoEScatter` (`sync=true`, reconciled via
+    `ModuleGraph::sync_devices()`'s max-and-broadcast), whose `device_list` only ever spans one
+    pipeline stage's TP/EP group, never a stage boundary. `PipelineStage::forward` only added
+    `comm_time` to the *source* device's own `status.device_time`, never touching the destination
+    stage's clock; `LLM::forward` (`llm.cpp`) carries no data dependency across stages either
+    (each stage starts from the original graph input, not the previous stage's output). So every
+    pipeline stage's device independently accumulated only its own local layer work from 0 every
+    iteration. `cluster.cpp` then read `get_device(0)->status.device_time` (stage 0 only) as "the"
+    per-iteration decode-step time at 3 call sites (`runIterationMixed`, `runIterationSumGenSplit`,
+    `setStat`) — for any `PP>1` config, this reports one stage's local time, not the true
+    sequentially-summed cross-stage critical path. **Fix:** `PipelineStage::forward` now propagates
+    `max(dst.device_time, src.device_time-after-comm)` to the destination device; `cluster.cpp`
+    gained `Cluster::maxDeviceTime()` (max `status.device_time` across all devices) and all 3 call
+    sites read this instead of `get_device(0)`. **Verified two ways:** (a) forced-distribution A/B
+    at llama3_405B/HBF+/8-GPU/LONG/batch=200 — `PP=1` (TP=8) is byte-identical before/after
+    (`0.1398461194712427` both, exact — no `PipelineStage` module is ever created when `pp_dg==1`);
+    `PP=8` (TP=1) jumps `0.1153667652361051`→`0.9693988488543821` (~8.4×, matching the predicted
+    `~pp×` undercount). (b) llama4_maverick/HBM4/8-GPU/SHORT, forced `TP=1/PP=8`: last stage's
+    `device_time` was ~21ms pre-fix vs. the true ~164ms post-fix (8 sequential ~20.5ms stages) —
+    at this exact operating point, 164ms **violates the 100ms SLO by 64%**, meaning the simulator
+    had been silently reporting SLO-violating PP-heavy configs as passing.
+
+23. **Optimizer's analytic latency estimate had the identical single-stage bug as item 22, and its
+    candidate-selection objective was argmin(latency) instead of the paper's stated
+    maximize-throughput.** `parallelism_optimizer.cpp`'s `total_latency_ns` only ever reflected one
+    pipeline stage's terms (compute/weight/KV + that stage's own TP all-reduce + MoE scatter/
+    gather), never multiplied by `pp`. **Fix:** restructured so the per-stage total is multiplied by
+    `pp` (all stages run sequentially; one simulator iteration is one full forward pass through
+    every stage) plus `(pp-1)` inter-stage hop costs, replacing the previous single-hop-only add.
+    Candidate selection changed from `argmin(estimated_latency_ms)` to
+    `argmax(batch_size_per_gpu / estimated_latency_ms)`, matching the paper's §III: "each evaluated
+    system selects the parallelism configuration that maximizes the achievable system throughput
+    subject to all constraints, including SLO requirements." **No SLO veto was added** —
+    `estimated_latency_ms` remains ranking-only; `checkCapacity()` (capacity/SRAM) remains the only
+    hard veto in `Optimize()`, and `run_experiments.py`'s live-simulator `verify()` remains the sole
+    SLO arbiter, preserving the "optimizer proposes, simulator decides" principle throughout.
+    Companion: `run_experiments.py`'s `BOUNDARY_WINDOW` widened from a fixed `8` to
+    `max(num_device, 8)` — with `dp` no longer implicitly biased toward small values by a
+    latency-minimizing objective, the divisibility-cycle window (item 21) must scale with GPU count
+    to still guarantee catching a hit. **Verified impact:**
+    - llama4_maverick/HBM4/8-GPU/SHORT (U1): batch/GPU 514.9→500.0 (paper: 460; miss shrank from
+      ×1.119 to ×1.087). MID: 164.8→158.9 (paper: 151.5; ×1.088→×1.049). Neither fully closed.
+    - U2 (HBF+/4-GPU vs. HBM4/8-GPU, LONG, TPS/GPU ratio): 0.722×→**1.001×** (paper: 1.15×) — HBF+
+      now genuinely matches/edges HBM4, crossing the paper's qualitative claim, though short of its
+      magnitude.
+    - U4/U8 (HBF+/16-GPU vs. HBM4/8-GPU, LONG, 4-SLO sweep): 0.05s 0.959×→1.076×, 0.1s
+      1.012×→1.171×. The 0.2s/offline cells surfaced a separate, confirmed-real finding — see the
+      new U4/U8 write-up in `PAPER_INCONSISTENCIES.md` for the capacity-cliff mechanism (HBM4's
+      best-latency config hits a hard capacity ceiling around batch 259 and must fall back to
+      `PP=8`, the only larger-capacity option, at a steep latency cost) rather than restating it
+      here.
+    - **U3 inverted, not just corrected.** Forced A/B re-check at the exact original operating
+      point (llama4/HBM4/8-GPU/SHORT, `PP=8/EP=1` vs. `PP=2/EP=4`, total batch=800): `PP=8/EP=1`
+      tpot=0.0862s, `PP=2/EP=4` tpot=0.0121s — **`PP=2/EP=4` is ~7.1× faster**, not 4.6% slower as
+      previously concluded. Decomposed via a batch-per-GPU-matched control (since `dp` is derived
+      as `total_gpus/(tp*pp)`, `PP=2` implies `dp=4` vs. `PP=8`'s `dp=1` at the same total batch):
+      holding per-GPU load constant (`PP=8` total=800/per_gpu=800 vs. `PP=2` total=3200/per_gpu=800)
+      isolates a **~3.64× pure pipeline-depth effect** (matches the naive `pp`-count hand-estimate,
+      ~3.8×, closely); the remaining **~1.96× is the DP-replica-parallelism effect** (4 concurrent
+      replicas of the batch vs. 1). Both multiply out to the observed ~7.1×
+      (3.64×1.96≈7.13). 2× batch stability check (`PP=8` @ total=1600): tpot scales sub-linearly
+      (1.36× for 2× batch, consistent with the fixed weight-reread cost dominating this regime) —
+      confirms the finding isn't a batch-800-specific artifact. Also directly force-tested all 4
+      valid `PP=4` combinations (`TP∈{1,2}, EP∈{1,2}`) at the original comparison's capacity-cliff
+      batch range (262, 264) — all 4 genuinely OOM in the live simulator, confirming `PP=8` really
+      is the only capacity-feasible fallback there, not a search gap. See
+      `PAPER_INCONSISTENCIES.md`'s U3 and `BUGS.md` item 8 for the corrected write-up.
+
+24. **KV-write charged the full `input_len` for every layer, including Llama-4 iRoPE local layers
+    whose retained KV is capped at `attn_chunk_size` — contradicting the already-windowed KV-read
+    and KV-capacity paths (item 16), and inflating U6's measured KV-write overhead well above the
+    paper's own stated range.** `getKVWriteDuration` (`src/hardware/layer_impl.h`) and the
+    optimizer's mirror (`parallelism_optimizer.cpp`) used `model_config.input_len` directly in
+    `kv_write_size` regardless of layer type. For Llama-4 (`attn_chunk_size=8192,
+    attn_global_interval=4`), 3 of every 4 layers are local — their true persisted KV never
+    exceeds `min(input_len, 8192)`, so charging the full `input_len` (103,500 at LONG) claimed to
+    write ~3.2× more KV than the capacity path says the cache is ever sized to hold. **Fix:**
+    `getKVWriteDuration` gained a `local_attention_window` parameter (default `0` = no-op), capping
+    `effective_input_len = min(input_len, window)`; the 4 simulator call sites
+    (`attention_gen_impl.cpp:211,871,1949`, `attention_mixed_impl.cpp:124`) now pass
+    `layer_info.local_attention_window` (already computed per-layer for the KV-read path). The
+    optimizer's version sums the (nonlinear — `unhidden = max(0, write - attn_compute)`) per-layer
+    write cost over all layers using `effectiveKvLen()` (the same shared helper item 16's KV-read
+    term uses) and divides by `pp`, mirroring `effectiveKvLenSumAllLayers()/pp`'s existing pattern.
+    Deliberately did **not** adopt an alternative fix considered (widening the hiding budget from
+    attention-compute-only to `max(compute, memory)`) — the paper's own footnote 2 (p. 3) states
+    verbatim *"[KV writes] can be overlapped with **computation** in the attention layer,"*
+    explicitly scoped to compute, not memory/KV-read time; widening it would contradict the paper's
+    stated methodology while happening to move numbers toward its target ratios, the "reverse-
+    engineer a fudge factor from the answer" pattern this investigation has repeatedly rejected.
+    **Backward-compat verified:** `attn_chunk_size==0` (every non-Llama-4 model) makes the cap a
+    no-op — `llama3_405B` and `deepseekV3` (MLA/compressed-KV call site) both byte-identical
+    before/after (`tpot` matched to full double precision). **Verified effect:** llama4_maverick/
+    HBF+/LONG measured KV-write share (U6) dropped from 19.7-26.6% (pre-fix, at the real near-SLO
+    batch anchors, 4/8/16-GPU) toward the paper's Fig. 5 range (~6.7-7.5%) once combined with items
+    22-23's fixes; MID (context below the 8192-token window, so windowing is a no-op there) stayed
+    close to its pre-fix value (~15%) both times, consistent with the mechanism being
+    windowing-specific rather than a general recalibration.
+
+**Trailing "Still open" notes above are superseded by items 22-24** (the HBM4/8-GPU/SHORT anchor,
+the degenerate-PP-config hypothesis, and the U3 reference are all addressed above with corrected,
+verified numbers) — left in place for historical record rather than deleted, per this doc's
+established practice of retaining superseded analysis with a pointer to the correction.
+
+25. **Linear weight-read charged page-read latency once per op with no reference to chunk
+    size/SRAM capacity at all** (audit F2), unlike the KV-read path, which does chunk/double-buffer.
+    The paper's methodology describes double-buffering generically for "read data," not scoped to
+    KV — leaning toward this being a real (if minor) inconsistency with the paper's stated model.
+    Fixed: `getLinearMemoryDuration` (`src/hardware/layer_impl.h`) now uses the same chunked
+    double-buffer formula as KV reads. **Verified numerically as a no-op on every current preset**
+    (chunk-transfer time at full SRAM capacity exceeds page latency for all 4 flash presets, so
+    exposed latency reduces to exactly one page latency either way) — confirmed empirically via
+    byte-identical before/after runs on both HBF (`0.0966962731654616s`) and CONV, the
+    highest-page-latency preset (`0.09089014626032631s`). Kept for structural correctness and
+    forward-safety if config constants ever change, even though it moves no current number.
+    (Originally documented only in `PAPER_INCONSISTENCIES.md`'s Resolved section, consolidated
+    here as part of the documentation cleanup that trimmed that doc to open/explained findings
+    only.)
+
+26. **Degenerate one-device-per-pipeline-stage optimizer choices were never actually optimal — a
+    prior "ranking validated, not a bug" conclusion was itself an artifact of item 22's bug**
+    (consolidates `BUGS.md`'s former item 8 and `PAPER_INCONSISTENCIES.md`'s former U3, both
+    removed as part of the same cleanup — this is now the single authoritative write-up). The
+    optimizer's ranking can select configs like llama4_maverick's 8-GPU choice (`PP=8/EP=1/TP=1`,
+    one device per pipeline stage) that trivially zero every communication term by construction.
+    An earlier A/B check (forcing `PP=8/EP=1` — the optimizer's actual choice — against
+    `PP=2/EP=4` — a rejected alternative — at llama4/HBM4/8-GPU/SHORT, comparing real
+    simulator-measured TPOT) concluded `PP=8/EP=1` genuinely won by ~4.6%, "validating" the
+    ranking. **That conclusion was wrong — not just imprecise, but backwards.** The live simulator
+    itself had item 22's bug (`PipelineStage::forward` never propagated elapsed time across
+    pipeline-stage boundaries), so the A/B was comparing stage-0's local time for both configs —
+    undercounted by roughly each config's own `pp` factor (~8× for `PP=8`, ~2× for `PP=2`). Since
+    the undercount differs between the two candidates, it does not cancel in the comparison; the
+    original near-tie (0.02449s vs. 0.02563s) was actually one stage's cost 8× smaller than reality
+    vs. one stage's cost only 2× smaller, making `PP=8` look artificially competitive.
+    **Re-running the identical forced A/B post-fix (item 23) gives the opposite answer:**
+    `PP=8/EP=1/TP=1` tpot=**0.0862s**, `PP=2/EP=4/TP=1` tpot=**0.0121s** at the same operating
+    point (total batch=800) — **`PP=2/EP=4` is ~7.1× faster**, not 4.6% slower. Decomposed into two
+    independent, multiplicative effects via a batch-per-GPU-matched control (since
+    `dp = total_gpus/(tp*pp)` is derived, not independently chosen, `PP=2` implies `dp=4` vs.
+    `PP=8`'s `dp=1` at the same *total* batch — so the unmatched comparison conflates pipeline
+    depth with DP-replica count):
+
+    | Comparison | PP=8/EP=1 tpot | PP=2/EP=4 tpot | Ratio |
+    |---|---|---|---|
+    | Unmatched (both at total batch=800; PP=2 → dp=4, per-GPU load=200) | 0.0862s | 0.0121s | 7.12× |
+    | **Matched per-GPU load** (PP=8 @ total=800/per_gpu=800; PP=2 @ total=3200/per_gpu=800) | 0.0862s | 0.0237s | **3.64×** |
+
+    The matched comparison isolates a **~3.64× pure pipeline-depth effect** (close to the naive
+    `pp`-count hand-estimate of ~3.8×, from 8 vs. 2 sequential stages' own weight-restream/compute
+    time plus the newly-modeled inter-stage hop costs) — the remaining **~1.96× is the
+    DP-replica-parallelism effect** (4 concurrent replicas each handling 1/4 the batch, vs. 1
+    replica handling all of it). `3.64 × 1.96 ≈ 7.13`, consistent with the unmatched ratio.
+    **Verified this isn't a batch-800-specific artifact:** a 2× batch stability check (`PP=8` @
+    total=1600) shows tpot scaling sub-linearly (1.36× for 2× batch — consistent with the fixed
+    weight-reread cost dominating this regime, not a coincidence). **Verified this isn't a
+    missed-config search gap:** all 4 valid `PP=4` combinations (`TP∈{1,2}, EP∈{1,2}` — the only
+    intermediate discrete option between `PP=2` and `PP=8` at 8 GPUs) were force-tested directly
+    against the live simulator at the original comparison's capacity-cliff batch range (262, 264)
+    — all 4 genuinely `Out of Memory`, confirming `PP=8` really was the only capacity-feasible
+    fallback there, not an artifact of the optimizer's own candidate ranking skipping a better
+    option. **The degenerate configs the optimizer used to favor were never actually optimal —
+    they only looked cheap because their true multi-stage latency was hidden by item 22's bug**,
+    which also explains, mechanistically, why the pre-fix optimizer kept selecting them (their
+    `estimated_latency_ms` was artificially divided by `pp`). With both the propagation bug (item
+    22) and the ranking objective (item 23: `argmin(latency)`→`argmax(throughput)`) now fixed, the
+    optimizer's config selection is grounded in a real, correctly-computed comparison going
+    forward.

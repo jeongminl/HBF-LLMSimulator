@@ -31,10 +31,10 @@ Data placement rules:
 
 ## Key Features
 
-- **Parallelism optimizer**: sweeps TP × PP × DP × EP to maximize throughput subject to memory capacity, SRAM limits, and TPOT SLO.
+- **Parallelism optimizer**: sweeps TP × PP × DP × EP, hard-gated on memory capacity and SRAM limits, ranking capacity-feasible candidates by estimated throughput; the live discrete-event simulator's measured TPOT remains the sole arbiter of TPOT-SLO pass/fail.
 - **Disaggregated prefill-decode**: decode-focused simulation with KV-cache write penalty modeling (write time minus overlap with attention computation).
-- **Continuous batching**: binary-search (exponential probe + bisect) for maximum batch size under each SLO.
-- **Pipeline parallelism** and **chunked attention** with configurable chunk size.
+- **Continuous batching**: two-phase batch-size search (analytic capacity/SLO estimate, then simulator-verified exponential probe + bisect) for maximum batch size under each SLO.
+- **Pipeline parallelism** (with cross-stage latency correctly propagated to the true per-token critical path) and **chunked attention** with configurable chunk size.
 - **Expert parallelism** (EP) independent of tensor parallelism; valid EP degrees verified against `expert.cpp` constraints.
 
 ## Workloads and SLOs
@@ -95,33 +95,28 @@ Key `config.yaml` fields:
 
 ```yaml
 system:
-  memory_type: HBF          # HBM4 | HBF | HBF+ | CONV | CONV+
+  memory_type: HBF          # HBM (plain, upstream-compatible) | HBM4 | HBF | HBF+ | CONV | CONV+
   num_device: 8             # GPUs per node
   num_node: 1
   chunk_size: 0             # 0 = auto (full SRAM staging capacity per chunk)
-  tpot_slo_ms: 100          # target TPOT in ms; 0 = offline (86400 s)
+  tpot_slo: 0.1             # target TPOT in seconds; large value (e.g. 86400) = offline
 
 model:
-  name: llama3_405B         # model preset key
+  model_name: llama3_405B   # model preset key
 ```
 
 Exit code 0 = success; 1 = OOM (capacity or SRAM limit exceeded).
 
 ## Running Sweeps
 
-**Flash-only fast check** — 8 GPU, HBF/HBF+/CONV/CONV+, llama3/llama4, short/long:
-```bash
-python3 run_flash_only.py
-```
-
 **Full experiment sweep** — all GPU counts (1/2/4/8/16), all presets, all workloads and SLOs:
 ```bash
 python3 run_experiments.py
 ```
 
-Simulation CSV outputs go to `data/`. The sweep scripts invoke the optimizer, binary-search for max batch, then run the final simulation and extract metrics.
+Simulation CSV outputs go to `data/`. The sweep script invokes the optimizer, binary-searches for max batch, then runs the final simulation and extracts metrics.
 
-See `INSTRUCTIONS.md` for the complete hardware and simulation specification.
+See the source paper (`Exploring_High-Bandwidth_Flash_for_Modern_LLM_Inference_Opportunities_and_Challenges.pdf`, in this repo) for the complete hardware and simulation specification — the ground truth this simulator implements.
 
 ## Contact
 Of the original (LLMSimulator)[https://github.com/scale-snu/LLMSimulator]:

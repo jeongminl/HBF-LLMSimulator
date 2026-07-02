@@ -386,35 +386,58 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
         kv_read_time = kv_read_size / system_config.memory_bandwidth * 1e9;
       }
 
-      // KV write time: hidden behind attention compute (unhidden portion only)
+      // KV write time: hidden behind attention compute (unhidden portion only).
+      // Window-aware for Llama-4 iRoPE (attn_chunk_size>0): a local layer only ever
+      // retains/writes a bounded KV window (effectiveKvLen caps input_len at
+      // attn_chunk_size), matching the KV-READ term above (effectiveKvLenSumAllLayers,
+      // line ~246) and the simulator's write cap (hardware/layer_impl.h's
+      // getKVWriteDuration, capped via LayerInfo::local_attention_window). Without this,
+      // the write term contradicted the capacity/read terms (claiming to write more KV
+      // than the cache is ever sized to hold/read back).
+      // unhidden_write = max(0, write - attn_compute) is NONLINEAR in the write size, and
+      // attn_compute is identical for every layer (depends on attn_weights_params, not the
+      // write length) -- so the nonlinear clamp must be evaluated PER LAYER and summed, not
+      // approximated by scaling a single representative layer's write by an average length.
+      // Reduces EXACTLY to the old `unhidden_write * layers_per_stage` when attn_chunk_size==0
+      // (every layer global => effectiveKvLen==input_len for all layers => sum/pp ==
+      // num_layers*unhidden_write/pp == layers_per_stage*unhidden_write).
       double kv_write_time = 0.0;
       if (use_flash) {
         const auto& hbf = system_config.hbf_config;
         double num_new_queries = batch_size_per_gpu /
                                  (model_config.output_len > 0 ? model_config.output_len : 1);
-        double kv_write_size = 0.0;
-        if (model_config.compressed_kv) {
-          kv_write_size = num_new_queries *
-                          (model_config.kv_lora_rank + model_config.qk_rope_head_dim) *
-                          model_config.input_len * precision;
-        } else {
-          kv_write_size = 2.0 * num_new_queries *
-                          (model_config.num_kv_heads / (double)tp) *
-                          model_config.head_dim * model_config.input_len * precision;
-        }
-        double single_layer_kv_write = (kv_write_size / hbf.flash_write_bandwidth * 1e9) +
-                                       (double)hbf.flash_page_program_latency_ns;
+
+        // Attention-only compute per layer (the hiding budget). Basis matches the
+        // simulator exactly: attention_gen_impl.cpp's unhidden_write overlaps only the
+        // attention kernel's own compute (FFN is a separate kernel) -- see the original
+        // comment below. Identical for every layer, so computed once.
+        double attn_flops_per_layer = 2.0 * attn_weights_params * batch_size_per_gpu / tp;
+        double single_layer_attn_compute = attn_flops_per_layer /
+            (system_config.compute_peak_flops * effectiveMFU(system_config, batch_size_per_gpu)) * 1e9;
         // Hiding budget is ATTENTION-ONLY compute (not attn+FFN), matching the simulator's
         // basis exactly: attention_gen_impl.cpp's unhidden_write = max(0, kv_write -
         // exec_status.compute_duration) only accumulates the attention kernel's own
         // compute time (FFN runs as a separate module/kernel and never contributes to
         // this overlap). Using total per-layer compute here would over-credit hiding and
         // under-count the write penalty relative to the simulator.
-        double attn_flops_per_layer = 2.0 * attn_weights_params * batch_size_per_gpu / tp;
-        double single_layer_attn_compute = attn_flops_per_layer /
-            (system_config.compute_peak_flops * effectiveMFU(system_config, batch_size_per_gpu)) * 1e9;
-        double unhidden_write = std::max(0.0, single_layer_kv_write - single_layer_attn_compute);
-        kv_write_time = unhidden_write * layers_per_stage;
+
+        auto unhidden_write_for = [&](double write_len) {
+          double kv_write_size = model_config.compressed_kv
+              ? num_new_queries * (model_config.kv_lora_rank + model_config.qk_rope_head_dim) *
+                    write_len * precision
+              : 2.0 * num_new_queries * (model_config.num_kv_heads / (double)tp) *
+                    model_config.head_dim * write_len * precision;
+          double single_layer_kv_write = (kv_write_size / hbf.flash_write_bandwidth * 1e9) +
+                                         (double)hbf.flash_page_program_latency_ns;
+          return std::max(0.0, single_layer_kv_write - single_layer_attn_compute);
+        };
+
+        double kv_write_all_layers = 0.0;
+        for (int layer = 0; layer < model_config.num_layers; ++layer) {
+          double write_len = effectiveKvLen(model_config, layer, (double)model_config.input_len);
+          kv_write_all_layers += unhidden_write_for(write_len);
+        }
+        kv_write_time = kv_write_all_layers / pp;
       }
 
       if (system_config.optimizer_latency_model == "max") {
@@ -447,27 +470,16 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
       // Ring all-reduce, matching the live simulator's AllReduce::forward exactly
       // (src/module/communication.cpp): for a group of size N, cost = 2*(N-1) hops,
       // each hop paying one device_ict_latency plus 1/N of the message over
-      // device_ict_bandwidth. Two all-reduces per layer (attention + FFN).
+      // device_ict_bandwidth. Two all-reduces per layer (attention + FFN). This
+      // recurs identically on EVERY pp stage (each stage does its own TP all-reduce
+      // over its own layers), so it stays a PER-STAGE term below (added into
+      // stage_latency_ns, not total_latency_ns directly).
       double tp_comm_time = 0.0;
       if (tp > 1) {
         double per_allreduce =
             2.0 * (tp - 1) * system_config.device_ict_latency +
             (2.0 * (tp - 1) / tp) * (inter_stage_message_size / system_config.device_ict_bandwidth * 1e9);
         tp_comm_time = 2.0 * layers_per_stage * per_allreduce;
-        total_latency_ns += tp_comm_time;
-      }
-
-      // PP stage communication (1 send/receive per PP transition)
-      if (pp > 1) {
-        int src_node = 0;
-        int dst_node = (total_gpus / pp) / system_config.num_device; // approximate next stage node
-        double pp_comm_time = 0.0;
-        if (src_node == dst_node) {
-          pp_comm_time = system_config.device_ict_latency + (inter_stage_message_size / system_config.device_ict_bandwidth * 1e9);
-        } else {
-          pp_comm_time = system_config.node_ict_latency + (inter_stage_message_size / system_config.node_ict_bandwidth * 1e9);
-        }
-        total_latency_ns += pp_comm_time;
       }
 
       // MoE scatter/gather overhead: when e_tp_dg < devices_per_stage, each MoE layer
@@ -475,25 +487,56 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
       // results back (NVLink hop).  When e_tp_dg == devices_per_stage, all experts are
       // local to each device (EP-TP group) so scatter is eliminated.
       // This term correctly makes EP=devices_per_stage strictly better than EP < devices_per_stage
-      // when bandwidth and page-latency are otherwise equivalent (as on HBM).
+      // when bandwidth and page-latency are otherwise equivalent (as on HBM). Also a
+      // PER-STAGE term (each stage's own MoE layers), same reasoning as TP above.
+      double scatter_time = 0.0;
       if (model_config.num_routed_expert > 0 && e_tp_dg < devices_per_stage) {
         double scatter_frac = 1.0 - (double)e_tp_dg / devices_per_stage;
         // Tokens that need to cross a device boundary (scatter + gather = 2×)
         double scatter_msg = scatter_frac * batch_size_per_gpu * model_config.top_k *
                              hidden_dim * precision;
         // 2 (scatter + gather) × moe_layers_in_stage intra-node NVLink round-trips
-        double scatter_time = 2.0 * moe_layers_in_stage *
-                              (system_config.device_ict_latency +
-                               scatter_msg / system_config.device_ict_bandwidth * 1e9);
-        total_latency_ns += scatter_time;
+        scatter_time = 2.0 * moe_layers_in_stage *
+                       (system_config.device_ict_latency +
+                        scatter_msg / system_config.device_ict_bandwidth * 1e9);
+      }
+
+      // total_latency_ns above (compute/weight/kv terms, "max" or "sum" model) plus
+      // tp_comm_time and scatter_time together are ONE PIPELINE STAGE's decode-step
+      // time. A decode token must traverse all `pp` stages SEQUENTIALLY before the
+      // next token can begin (no micro-batch-level pipeline overlap is modeled -- one
+      // simulator iteration is one full forward pass of the whole batch through every
+      // stage; see PipelineStage::forward's time-propagation fix in communication.cpp
+      // for the live-simulator side of this same correction, and Cluster::
+      // maxDeviceTime() in cluster.cpp for how the live sim now reads the true,
+      // fully-propagated per-token latency instead of stage 0's local time alone).
+      // So the true per-token latency is `pp` stages' worth of this per-stage total,
+      // plus (pp-1) inter-stage send/receive hops -- not one stage's total alone,
+      // which is what this estimate computed before this fix (an ~pp x under-count
+      // for pp>1, matching the live simulator's pre-fix bug).
+      double stage_latency_ns = total_latency_ns + tp_comm_time + scatter_time;
+      double full_pipeline_latency_ns = stage_latency_ns * pp;
+
+      if (pp > 1) {
+        int src_node = 0;
+        int dst_node = (total_gpus / pp) / system_config.num_device; // approximate next stage node
+        double pp_hop_comm_time = 0.0;
+        if (src_node == dst_node) {
+          pp_hop_comm_time = system_config.device_ict_latency + (inter_stage_message_size / system_config.device_ict_bandwidth * 1e9);
+        } else {
+          pp_hop_comm_time = system_config.node_ict_latency + (inter_stage_message_size / system_config.node_ict_bandwidth * 1e9);
+        }
+        full_pipeline_latency_ns += (double)(pp - 1) * pp_hop_comm_time;
       }
 
       // NOTE: estimated_latency_ms is used only to RANK capacity-feasible candidates
-      // (see selection below) — it must never set config.oom. The simulator's
-      // measured tpot is the sole SLO arbiter (see run_experiments.py's
-      // analytic-search-then-simulator-verify batch search). Capacity/SRAM (checked
-      // above via checkCapacity) remain the only hard feasibility constraints here.
-      config.estimated_latency_ms = total_latency_ns / 1e6 * system_config.latency_margin;
+      // (see selection below) — it must never set config.oom, and no SLO check is
+      // performed against it here. The simulator's measured tpot remains the sole SLO
+      // arbiter (see run_experiments.py's analytic-search-then-simulator-verify batch
+      // search, which always falls through to a real verify() call regardless of what
+      // this estimate says). Capacity/SRAM (checked above via checkCapacity) remain
+      // the only hard feasibility constraints in this function.
+      config.estimated_latency_ms = full_pipeline_latency_ns / 1e6 * system_config.latency_margin;
 
       // Part E: store predicted footprint for the drift harness
       config.pred_weight_bytes = weight_per_gpu;
@@ -506,15 +549,28 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
     }
   }
 
-  // Find the optimal non-OOM config
+  // Find the optimal non-OOM config: rank by THROUGHPUT (batch_size_per_gpu /
+  // estimated_latency_ms), not argmin(latency). Matches the paper's own stated
+  // objective (§III: "selects the parallelism configuration that maximizes the
+  // achievable system throughput subject to ... SLO requirements") rather than
+  // minimizing latency for its own sake once a config is already capacity-feasible.
+  // Deliberately NO added SLO veto here based on estimated_latency_ms: this estimate
+  // is a heuristic that can diverge from the live simulator (this file's own
+  // pp-latency fix above is proof it was systematically wrong until now) -- hard-
+  // gating on it risks discarding a candidate the real simulator would actually
+  // accept. Capacity/SRAM (checked above via checkCapacity) remain the ONLY hard
+  // vetoes; run_experiments.py's verify() against the live simulator remains the
+  // sole SLO arbiter.
   ParallelConfig optimal_config;
-  double min_latency = 1e18;
+  double max_throughput = -1.0;
   bool found_valid = false;
 
   for (const auto& cand : candidates) {
     if (!cand.oom) {
-      if (cand.estimated_latency_ms < min_latency) {
-        min_latency = cand.estimated_latency_ms;
+      double cand_batch_size_per_gpu = (double)batch_size / cand.dp;
+      double cand_throughput = cand_batch_size_per_gpu / cand.estimated_latency_ms;
+      if (cand_throughput > max_throughput) {
+        max_throughput = cand_throughput;
         optimal_config = cand;
         found_valid = true;
       }

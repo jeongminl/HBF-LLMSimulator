@@ -1,85 +1,86 @@
 # HBF-LLMSimulator Structure & Functionality Guide
 
-> This document is a structure/behavior guide written after directly reading and verifying the
-> code of the `HBF-LLMSimulator` repository — a fork of `LLMSimulator` (the cycle-approximate
-> simulator from MICRO 2024's *"Duplex"* paper) extended with **High-Bandwidth Flash (HBF)**
-> memory modeling and a constraint-aware **parallelism optimizer**, implementing the evaluation
-> methodology of Son et al., *"Exploring High-Bandwidth Flash for Modern LLM Inference: Opportunities
-> and Challenges"* (IEEE CAL 2026). Every core claim is backed by a `file:line` reference against
-> the current working tree (including its substantial **uncommitted** fairness/correctness fix
-> sprint — see `CHANGES.md`/`BUGS.md`), so it can be read alongside the code.
+> This document describes the **current** structure and behavior of the `HBF-LLMSimulator`
+> codebase — a fork of `LLMSimulator` (the cycle-approximate simulator from MICRO 2024's
+> *"Duplex"* paper) extended with **High-Bandwidth Flash (HBF)** memory modeling and a
+> constraint-aware **parallelism optimizer**, implementing the evaluation methodology of Son et
+> al., *"Exploring High-Bandwidth Flash for Modern LLM Inference: Opportunities and Challenges"*
+> (IEEE CAL 2026; the PDF is in this repo and is the ground-truth spec). This guide describes
+> what the simulator does today, not how it got there — for the history of bugs found and fixed,
+> see `CHANGES.md`; for currently-known bugs and open paper-comparison gaps, see `BUGS.md`,
+> `BUGS_HIDDEN_BY_FLAGS.md`, and `PAPER_INCONSISTENCIES.md`.
 >
 > This guide is a companion to `LLMSimulator_Guide_EN.md` (the upstream guide, still accurate for
-> the base simulator). Section 16 explicitly re-verifies every quirk from that document's §13
-> against this fork and records which are fixed vs. still present. Sections 7–8 and the HBF/
-> optimizer content woven through the others are new relative to the upstream guide.
+> the base simulator's unmodified subsystems). Sections 6–7 (HBF memory model, parallelism
+> optimizer) are entirely new relative to the upstream guide; the rest of this document notes
+> where behavior has changed from upstream and where it hasn't.
 
 ---
 
 ## Table of Contents
 
 1. [At a Glance](#1-at-a-glance)
-2. [Background: Two Problems Layered Together](#2-background-two-problems-layered-together)
+2. [Background](#2-background)
 3. [Top-Level Architecture and Object Graph](#3-top-level-architecture-and-object-graph)
 4. [End-to-End Execution Flow](#4-end-to-end-execution-flow)
-5. [Core Timing Model (Roofline, Inherited)](#5-core-timing-model-roofline-inherited)
-6. [The HBF Memory Model (NEW)](#6-the-hbf-memory-model-new)
-7. [The Parallelism Optimizer (NEW)](#7-the-parallelism-optimizer-new)
+5. [Core Timing Model (Roofline)](#5-core-timing-model-roofline)
+6. [The HBF Memory Model](#6-the-hbf-memory-model)
+7. [The Parallelism Optimizer](#7-the-parallelism-optimizer)
 8. [Hardware / Cluster Layer](#8-hardware--cluster-layer)
 9. [Model / Module Layer](#9-model--module-layer)
 10. [Scheduler Layer (Continuous Batching)](#10-scheduler-layer-continuous-batching)
 11. [DRAM / Ramulator / PIM Layer](#11-dram--ramulator--pim-layer)
 12. [Configuration Reference (config.yaml)](#12-configuration-reference-configyaml)
-13. [Outputs: CSV · stdout markers · experiment_results.md](#13-outputs-csv--stdout-markers--experiment_resultsmd)
+13. [Outputs: CSV, stdout markers, experiment_results.md](#13-outputs-csv-stdout-markers-experiment_resultsmd)
 14. [Build & Run](#14-build--run)
-15. [File Map (Quick Reference)](#15-file-map-quick-reference)
-16. [Modeling Simplifications · Known Quirks — Re-Verified Against the Fork](#16-modeling-simplifications--known-quirks--re-verified-against-the-fork)
-17. [Appendix: Verification Method](#17-appendix-verification-method)
+15. [File Map](#15-file-map)
+16. [Known Modeling Simplifications](#16-known-modeling-simplifications)
 
 ---
 
 ## 1. At a Glance
 
-`HBF-LLMSimulator` still predicts LLM inference latency/energy via the same **roofline
-accumulation model** as upstream (§5), but adds an entire hierarchy of flash-timing and
-capacity logic (§6) plus an analytic parallelism optimizer that proposes and bounds
-configurations before the discrete-event simulator verifies them (§7).
+The simulator predicts LLM inference latency via a **roofline accumulation model**
+(`total_duration = max(compute, memory)`, accumulated serially into each device's `device_time`),
+inherited from upstream, plus a hierarchy of flash-timing and capacity logic, plus an analytic
+parallelism optimizer that proposes and bounds configurations before the discrete-event simulator
+verifies them.
 
 The central research question: **can flash-backed memory (NAND stacks colocated with the HBM
 die) substitute for HBM to serve very large LLMs at scale, and under what SLO constraints does it
 remain competitive?**
 
-Three things now define the codebase (extending the upstream three):
-
-| Concept | One-line summary | Evidence |
+| Concept | Summary | Where |
 |---|---|---|
-| **Roofline + time accumulation** (inherited) | `total_duration = max(compute, memory)`, serially accumulated into `device_time`; sync points reconcile via `max`. | `linear_impl.cpp:74,107`, `module_graph.cpp:231,73-96` |
-| **Flash is a 2-tier memory** (new) | Weights + KV-cache live on flash (page-latency + bandwidth); "scarce" activation/staging tiers (1 HBM stack, or 320 MB logic-die SRAM) are separately capacity-gated and separately timed. | `src/dram/hbf_memory_config.h`, `src/hardware/layer_impl.h`, `src/model/footprint.h` |
-| **Optimizer proposes, simulator decides** (new) | The analytic optimizer sweeps TP×PP×DP×EP and ranks candidates by an estimated latency; only *capacity/SRAM* infeasibility is a hard veto. SLO pass/fail is decided **exclusively** by the real simulator's measured TPOT. | `src/optimizer/parallelism_optimizer.cpp:440-445`, `INSTRUCTIONS.md` §6 |
+| **Roofline + time accumulation** | `total_duration = max(compute, memory)`, serially accumulated into `device_time`; cross-device sync points reconcile via `max`. | `linear_impl.cpp`, `module_graph.cpp` |
+| **Flash is a 2-tier memory** | Weights + KV-cache live on flash (page-latency + bandwidth); "scarce" activation/staging tiers (1 HBM stack, or 320 MB logic-die SRAM) are separately capacity-gated and separately timed. | `src/dram/hbf_memory_config.h`, `src/hardware/layer_impl.h`, `src/model/footprint.h` |
+| **Optimizer proposes, simulator decides** | The analytic optimizer sweeps TP×PP×DP×EP and ranks capacity-feasible candidates by estimated throughput. Only capacity/SRAM infeasibility is a hard veto. SLO pass/fail is decided **exclusively** by the real simulator's measured TPOT. | `src/optimizer/parallelism_optimizer.cpp` |
+| **Pipeline-latency propagation** | A decode token's true per-step latency is the full sequential traversal of all `PP` pipeline stages; the cluster reads the slowest-finishing device's clock (`Cluster::maxDeviceTime()`), not any single stage's local time. | `src/hardware/cluster.{h,cpp}`, `src/module/communication.cpp` |
+| **Compute-utilization (MFU) derating** | Every `compute_duration = flops/compute_peak_flops` site is divided by an additional saturating-curve factor `effectiveMFU(config, m)`. Defaults to an exact no-op; only active if `config.yaml` sets `simulation.mfu_max`/`mfu_m_half`. | `src/hardware/hardware_config.h` |
 
 Processor-type mapping (unchanged from upstream): `GPU` = xPU, `LOGIC` = Logic-PIM (4× BW, Op/B
 8), `PIM` = bank-PIM (16× BW, Op/B 1).
 
 ---
 
-## 2. Background: Two Problems Layered Together
+## 2. Background
 
 **Problem 1 (inherited, Duplex/MICRO'24)**: LLM inference alternates compute-bound prefill
 ("sum") and memory-bound decode ("gen"); MoE/Attention decode has low Op/B, so routing it to a
 Logic-PIM/bank-PIM unit (higher bandwidth, lower peak flops) can beat a GPU.
 
-**Problem 2 (new, HBF/CAL'26)**: Large MoE/dense models increasingly cannot fit in HBM capacity at
-low GPU counts. This fork asks whether replacing some/all HBM stacks with flash (NAND on the same
-package) can serve these models at acceptable latency, given that flash has:
+**Problem 2 (HBF/CAL'26)**: Large MoE/dense models increasingly cannot fit in HBM capacity at low
+GPU counts. This simulator evaluates whether replacing some/all HBM stacks with flash (NAND on
+the same package) can serve these models at acceptable latency, given that flash has:
 - **Asymmetric read/write bandwidth** (fast reads, much slower writes — flash wear).
 - **A page-read latency floor** (µs-scale, amortized by chunked double-buffering).
 - **No safe place for short-lived intermediate data** (writing activations to flash would wear it
-  out fast), so activations are diverted to whatever scarce fast tier exists (1 reserved HBM stack,
-  or a small logic-die SRAM if there's no HBM at all).
+  out fast), so activations are diverted to whatever scarce fast tier exists (1 reserved HBM
+  stack, or a small logic-die SRAM if there's no HBM at all).
 
-`INSTRUCTIONS.md` is the literal spec this fork implements (5 memory presets, data-placement
+The source paper is the literal spec this simulator implements (5 memory presets, data-placement
 policy, disaggregated prefill/decode semantics, KV-write penalty, and the optimizer/simulator
-separation of concerns). Everything in §6–§7 below traces back to it.
+separation of concerns). §6–§7 below trace back to it directly.
 
 ---
 
@@ -98,19 +99,20 @@ Two subsystems are new relative to upstream's five (`scheduler`, `hardware`, `mo
         ▼              ▼              ▼               ▼               ▼               ▼
   ┌───────────┐  ┌──────────────┐┌──────────────┐┌──────────────┐┌──────────────┐┌──────────────────┐
   │ scheduler │  │   hardware   ││    model     ││    module    ││  optimizer   ││       dram       │
-  │           │  │ + layer_impl ││+ footprint.h ││              ││  (NEW)       ││+ hbf_memory_cfg  │
-  │           │  │  flash timing││ scarce-tier  ││              ││ TP×PP×DP×EP  ││  (NEW) 5 presets │
+  │           │  │ + layer_impl ││+ footprint.h ││              ││              ││+ hbf_memory_cfg  │
+  │           │  │  flash timing││ scarce-tier  ││              ││ TP×PP×DP×EP  ││  5 presets       │
   └───────────┘  └──────────────┘└──────────────┘└──────────────┘└──────────────┘└──────────────────┘
 ```
 
-`SystemConfig` (`hardware_config.h:17-191`) now embeds an `HBFMemoryConfig hbf_config` and a
-`bool use_hbf` (`:161-163`); `ParallelConfig` (`parallelism_optimizer.h:10-26`) is the optimizer's
-output struct, carrying not just `tp/pp/dp/ep` but predicted footprint fields
-(`pred_weight/kv/act/total_bytes`) consumed by a drift harness in `cluster.cpp`/`eval/test.cpp`.
+`SystemConfig` (`src/hardware/hardware_config.h`) embeds an `HBFMemoryConfig hbf_config` and a
+`bool use_hbf`. `ParallelConfig` (`src/optimizer/parallelism_optimizer.h`) is the optimizer's
+output struct, carrying `tp/pp/dp/ep` plus predicted footprint fields
+(`pred_weight/kv/act/total_bytes`) consumed by a drift-detection harness (`validate_optimizer` in
+`config.yaml`, cross-checking the optimizer's prediction against the live simulator's footprint).
 
-The **two-layer mental model from upstream is unchanged**: the module graph is built once
-(symbolic forward pass with worst-case metadata) and re-walked every iteration with the real
-batch/seqlen substituted in.
+The two-layer mental model from upstream is unchanged: the module graph is built once (symbolic
+forward pass with worst-case metadata) and re-walked every iteration with the real batch/seqlen
+substituted in.
 
 ---
 
@@ -120,31 +122,33 @@ batch/seqlen substituted in.
 
 ```
 Load config.yaml
- ├─ gpu_gen: A100/H100/B100/B200/Rubin → SystemConfig preset               (hardware_config.h:194-395)
+ ├─ gpu_gen: A100/H100/B100/B200/Rubin → SystemConfig preset
  ├─ nvlink_gen/infiniband_gen → override device_ict_*/node_ict_*
- ├─ injection_rate > 0 → use_inject_rate=true, request_per_second=rate     (eval/test.cpp:39,102-104)
- ├─ system.memory_type: HBM|HBM4|HBF|HBF+|CONV|CONV+                       (eval/test.cpp:107-131)
+ ├─ injection_rate > 0 → use_inject_rate=true, request_per_second=rate (open-loop Poisson arrivals)
+ ├─ system.memory_type: HBM|HBM4|HBF|HBF+|CONV|CONV+
  │   ├─ "HBM" → use_hbf=false (plain lumped-capacity model, upstream behavior)
- │   └─ else  → use_hbf=true; hbf_config = {hbm4,hbf,hbf_plus,conv,conv_plus}_preset
- │              memory_capacity  = hbf_config.total_capacity_bytes         (:127)
- │              memory_bandwidth = flash_read_bandwidth (or hbm_read_bandwidth if no flash stacks) (:128-129)
- ├─ system.chunk_size (bytes; 0=auto) → unit-mistake guard: reject 0<chunk_size<4096  (eval/test.cpp:134-147)
- ├─ [optional] system.analytic_sweep_only: true → run the analytic batch-search and exit (§7.3, :294-398)
+ │   └─ else  → use_hbf=true; hbf_config = one of the five presets (§6.1)
+ │              memory_capacity  = hbf_config.total_capacity_bytes
+ │              memory_bandwidth = flash_read_bandwidth (or hbm_read_bandwidth if no flash stacks)
+ ├─ system.chunk_size (bytes; 0=auto) → unit-mistake guard: reject 0<chunk_size<4096
+ ├─ [optional] system.analytic_sweep_only: true → run the analytic batch-search and exit (§7.3)
  ├─ [optional] optimize_parallelism: true → ParallelismOptimizer::Optimize(...) picks TP/PP/DP/EP
  ├─ Scheduler::Create / Cluster::Create / Model(...) — same as upstream
- ├─ cluster->checkMemorySize() — now routes through footprint.h's scarce-tier logic when use_hbf (§6.3)
+ ├─ cluster->checkMemorySize() — routes through footprint.h's scarce-tier logic when use_hbf (§6.3)
  └─ cluster->set_dependency()
 ```
 
-### 4.2 Simulation Loop — unchanged shape, new content inside kernels
+### 4.2 Simulation Loop
 
-`Cluster::runIteration` still dispatches `runIterationMixed` (colocated) vs.
-`runIterationSumGenSplit` (disagg) based on `config.disagg_system` (`cluster.cpp:470-474`), and
-still accumulates `total_time += time` each step (`:519`, `:593`). What's new is *what happens
-inside* each device's forward pass: linear/attention/activation kernels now consult
+`Cluster::runIteration` dispatches `runIterationMixed` (colocated) vs. `runIterationSumGenSplit`
+(disagg) based on `config.disagg_system`, and accumulates each step's per-token latency into
+`total_time`. Inside each device's forward pass: linear/attention/activation kernels consult
 `config.hbf_config` via `layer_impl.h` helpers (§6.2) to add flash page-latency and split
-weight-vs-activation timing across tiers, and attention kernels additionally accumulate a
-**KV-write penalty** (§6.2, "flash writes") that gets folded into the per-step latency.
+weight-vs-activation timing across tiers; attention kernels additionally accumulate a **KV-write
+penalty** (§6.2) that gets folded into the per-step latency. For pipeline-parallel configs
+(`PP>1`), each stage's elapsed time is propagated forward to the next stage's device before the
+step's true latency is read back out (§8.3) — a decode token's real per-step latency is the full
+sequential traversal of all `PP` stages, not any one stage's local compute alone.
 
 ### 4.3 Wrap-up
 
@@ -153,48 +157,49 @@ Same CSV/gantt export as upstream, plus (when `analytic_sweep_only` is set) a se
 
 ---
 
-## 5. Core Timing Model (Roofline, Inherited)
+## 5. Core Timing Model (Roofline)
 
-The roofline core is **byte-for-byte unchanged**:
+The roofline core is inherited unchanged:
 
 ```cpp
-// linear_impl.cpp:74  (linearCore, shared by GPU/LOGIC/PIM via LinearExecutionGPU etc.)
-time_ns compute_duration = total_flops / desc.compute_peak_flops * 1000*1000*1000;
-// linear_impl.cpp:107
+// linear_impl.cpp (linearCore, shared by GPU/LOGIC/PIM via LinearExecutionGPU etc.)
+time_ns compute_duration = total_flops / (desc.compute_peak_flops * effectiveMFU(config, m)) * 1e9;
 exec_status.total_duration = std::max(exec_status.compute_duration, exec_status.memory_duration);
 ```
 
-The only change is **where `memory_duration` comes from**. Previously `bytes/bandwidth`
-everywhere; now (`linear_impl.cpp:75-77`):
-
-```cpp
-time_ns memory_duration = getLinearMemoryDuration(config, m, k, n, weight->precision_byte,
-                                                   total_memory_size, desc.memory_bandwidth,
-                                                   num_heads, duplicated_input);
-```
-
-`getLinearMemoryDuration` (`layer_impl.h:17-42`) only takes the flash-aware branch when
+The only structural change is **where `memory_duration` comes from**. It's computed by
+`getLinearMemoryDuration` (`layer_impl.h`), which only takes the flash-aware branch when
 `config.use_hbf && hbf_config.num_flash_stacks > 0`; otherwise it falls through to the original
-`total_memory_size / memory_bandwidth` (`:39-40`) — so plain-`HBM4`/A100-H100-B100-B200 runs are
-numerically identical to upstream's model. Full flash-timing details in §6.
+`total_memory_size / memory_bandwidth` — so plain-`HBM4`/A100-H100-B100-B200 runs are numerically
+identical to upstream's model. Full flash-timing details in §6.
 
 Time accumulation (`module_graph.cpp`), the high/low parallel tracks, `sync_devices()`'s
-max-barrier, and the executor's try-both-pick-min processor selection (`executor.cpp:135-155`) are
-all unchanged from upstream — see the base guide §5.3–§5.4 for full detail. One addition: a
-`kv_write_time` accumulator tracks the new KV-write penalty separately from other timing
-(`module_graph.cpp:219`).
+max-barrier, and the executor's try-both-pick-min processor selection are unchanged from
+upstream — see the base guide for full detail. One addition: a `kv_write_time` accumulator tracks
+the KV-write penalty separately from other timing (`module_graph.cpp`).
+
+**Compute-utilization (MFU) derating.** The roofline `compute_duration` formula assumes every
+compute-bound op hits 100% of `compute_peak_flops`, which no real GEMM does (tensor-core
+tile/wave quantization, epilogue/reduction overhead). `SystemConfig` carries two fields, `mfu_max`
+(default `1.0`) and `mfu_m_half` (default `0.0`), plus a free function `effectiveMFU(config, m)`
+(`hardware_config.h`) implementing a saturating curve in the GEMM row count `m` (batch×tokens for
+that specific op): `MFU(M) = mfu_max * M / (M + mfu_m_half)`. Every `compute_duration` call site
+divides `compute_peak_flops` by this factor: linear, activation, all attention-kernel compute
+sites, and the optimizer's mirror (§7.2). The defaults make `MFU(M) ≡ 1.0` for every `M > 0`, so
+this is an exact no-op unless `config.yaml` explicitly sets `simulation.mfu_max`/`mfu_m_half`
+(unset by default — see §12).
 
 ---
 
-## 6. The HBF Memory Model (NEW)
+## 6. The HBF Memory Model
 
 ### 6.1 The Five Presets — `src/dram/hbf_memory_config.h`
 
-`HBFMemoryConfig` (`:5-52`) fields: `num_hbm_stacks`, `num_flash_stacks`, `total_capacity_bytes`
-(flash pool), `hbm_read/write_bandwidth`, `flash_read/write_bandwidth`,
+`HBFMemoryConfig` fields: `num_hbm_stacks`, `num_flash_stacks`, `total_capacity_bytes` (flash
+pool), `hbm_read/write_bandwidth`, `flash_read/write_bandwidth`,
 `flash_page_read/program_latency_ns`, `sram_per_stack_bytes` (3.13 MB double-buffer staging, all
-flash presets), `logic_sram_bytes` (320 MB, "+" presets only), `page_size_bytes` (4096, now mostly
-vestigial — see §16 item 13), `hbm_per_stack_bytes`.
+flash presets), `logic_sram_bytes` (320 MB, "+" presets only), `page_size_bytes` (4096 — hardware
+geometry documentation only; no timing formula currently computes with it), `hbm_per_stack_bytes`.
 
 | Preset | HBM stacks | Flash stacks | Total capacity | Flash read BW | Page-read latency | Staging/stack | Logic SRAM | HBM/stack |
 |---|---|---|---|---|---|---|---|---|
@@ -204,143 +209,154 @@ vestigial — see §16 item 13), `hbm_per_stack_bytes`.
 | `conv_preset` | 1 | 7 | 3,620 GB | 2.45 TB/s | 3 µs | 3.13 MB | 0 | 36 GB |
 | `conv_plus_preset` | 0 | 8 | 4,096 GB | 2.80 TB/s | 3 µs | 3.13 MB | 320 MB | 0 |
 
-(`hbf_memory_config.h:55-137`.) All flash writes are asymmetric and much slower than reads (e.g.
-HBF+: 128 GB/s write vs. 12.8 TB/s read); all presets share a 100 µs page-program latency.
-Selected from `config.yaml: system.memory_type` in `eval/test.cpp:107-129` (§4.1).
+All flash writes are asymmetric and much slower than reads (e.g. HBF+: 128 GB/s write vs. 12.8
+TB/s read); all presets share a 100 µs page-program latency. Selected from `config.yaml:
+system.memory_type` in `eval/test.cpp`.
 
 ### 6.2 Flash Timing Kernels — `src/hardware/layer_impl.h`
 
 Three inline helpers, all gated on `config.use_hbf && hbf_config.num_flash_stacks > 0`:
 
-- **`getLinearMemoryDuration`** (`:17-42`) — weight (k×n, possibly ×`num_heads` for batched
-  linear) is charged flash-read bandwidth **plus one page-read latency per call**
-  (`:26`); activations are charged HBM bandwidth **only if `num_hbm_stacks > 0`** — on HBF+/CONV+
-  (`num_hbm_stacks==0`) activation time is **0 (modeled as infinite-bandwidth logic-die SRAM)**
-  (`:34-37`). Returns `max(weight_read_time, act_time)` (`:38`). Called from
-  `linear_impl.cpp:75-77`.
-- **`getAttentionMemoryDuration`** (`:48-89`) — models **double-buffered chunked KV prefetch**:
-  when `use_chunked_attention`, the KV read is split into chunks sized by
-  `min(chunk_size_override or config.chunk_size, sram_per_stack_bytes × num_flash_stacks)`
-  (`:56-64`), and **one page-read latency is paid per chunk, not per byte or per 4 KiB page**
-  (`:65-69`) — this is what makes flash's µs-scale latency tolerable at scale. The non-chunked
-  fallback branch still double-buffers by SRAM-sized chunks when the read fits in SRAM, and
-  degrades to per-page latency only when it doesn't (`:70-80`). Same SRAM-infinite-bandwidth rule
-  for activations (`:83-86`). Called from all three `attention_*_impl.cpp` kernels.
-- **`getKVWriteDuration`** (`:91-105`) — models the "**Critical Fix**" from `INSTRUCTIONS.md`:
-  writing a newly-admitted query's *entire* prefill KV-cache (sized by `input_len`, not the 1
-  decode token) to flash, at flash-write bandwidth plus one page-program latency (`:102`).
-  Compressed-KV (MLA) and standard-GQA branches both handled (`:97-101`).
+- **`getLinearMemoryDuration`** — weight (k×n, possibly ×`num_heads` for batched linear) reads
+  stage through the same per-stack SRAM double-buffer as KV reads (below). Activations are
+  charged HBM bandwidth **only if `num_hbm_stacks > 0`** — on HBF+/CONV+ (`num_hbm_stacks==0`)
+  activation time is **0** (modeled as effectively-infinite-bandwidth logic-die SRAM — see the
+  note at the end of this section). Returns `max(weight_read_time, act_time)`. Called from
+  `linear_impl.cpp`.
+- **`getAttentionMemoryDuration`** — models double-buffered chunked KV prefetch: the KV read is
+  split into chunks sized by `min(chunk_size_override or config.chunk_size, sram_per_stack_bytes ×
+  num_flash_stacks)`. Double-buffering hides all but one page-read latency: while chunk *N*
+  streams out of one SRAM buffer, chunk *N+1*'s page read is issued into the other buffer and its
+  latency overlaps chunk *N*'s transfer — hidden for every chunk except the first (pipeline
+  fill), which always exposes one full page latency; if a chunk's transfer time is shorter than
+  the page latency, the residual `(latency − transfer)` per chunk is still exposed on top. Net:
+  `kv_read_time = kv_read_size/flash_bandwidth + page_latency + (num_chunks-1)·max(0, page_latency
+  − chunk_transfer_time)` — under every currently-shipped preset this reduces to one exposed page
+  latency total, not one per chunk. The non-chunked fallback branch double-buffers by SRAM-sized
+  chunks identically. Same SRAM-infinite-bandwidth rule for activations. Called from all three
+  `attention_*_impl.cpp` kernels; the identical exposed-latency formula is mirrored in the
+  optimizer's `kv_read_time` (§7.2) so the two stay in lock-step.
+- **`getKVWriteDuration`** — models writing a newly-admitted query's prefill KV-cache to flash, at
+  flash-write bandwidth plus one page-program latency. Compressed-KV (MLA) and standard-GQA
+  branches both handled. **Window-aware for Llama-4's interleaved local/global ("iRoPE")
+  attention** (§9.1): takes an optional `local_attention_window` parameter — for a local
+  (non-global) attention layer, the write length is capped at `min(input_len, window)`, matching
+  the fact that a local layer never retains more KV than its window regardless of how long the
+  original prompt was. This keeps the write path consistent with the KV-read and KV-capacity
+  paths, which already cap at the same window. A window of `0` (every non-iRoPE model, and global
+  layers) is a no-op — the full `input_len` is charged, matching the pre-windowing behavior
+  exactly.
 
-**KV-write overlap**: the call site (`attention_gen_impl.cpp:864-865`,
-`unhidden_write = std::max(0, kv_write - exec_status.compute_duration)`) only subtracts time
-already hidden behind the *attention* kernel's own compute — never FFN — matching
-`INSTRUCTIONS.md`'s "subtract any write time overlapped with the attention layer" requirement.
-The optimizer's analytic model mirrors this exactly (§7.2).
+**KV-write overlap.** Each attention kernel's call site computes
+`unhidden_write = max(0, kv_write - exec_status.compute_duration)` — only time already hidden
+behind the *attention* kernel's own compute counts as overlapped, never FFN. The optimizer's
+analytic model mirrors this exactly (§7.2).
 
-The **SRAM-infinite-bandwidth assumption is intentional, not a bug**: `activation_impl.cpp:47-50`
+**The SRAM-infinite-bandwidth assumption is intentional, not a bug**: `activation_impl.cpp`
 implements the identical rule directly (`memory_duration = num_hbm_stacks>0 ? bytes/hbm_bw : 0`).
 It reflects that HBF+/CONV+'s 320 MB logic-die SRAM buffer is fast enough, relative to the
-per-decode-step activation volume, that its bandwidth is not the bottleneck being modeled — but
-(critically) it is still **capacity**-gated, separately, in §6.3.
+per-decode-step activation volume, that its bandwidth is not the bottleneck being modeled — but it
+is still **capacity**-gated, separately, in §6.3.
 
 ### 6.3 Scarce-Tier Capacity Model — `src/model/footprint.h`
 
-Shared by the optimizer and `Cluster::checkMemorySize()` (dependency policy: only includes
-`hardware_config.h`, to avoid an include cycle with `cluster.h`, `:1-7`).
+Shared by the optimizer and `Cluster::checkMemorySize()`.
 
-- **`scarceTierActivationLimit`** (`:37-47`) returns: HBM-stack capacity
-  (`num_hbm_stacks × hbm_per_stack_bytes`) if any exist, else `logic_sram_bytes` (HBF+/CONV+), else
-  (plain HBM) the full `memory_capacity`.
-- **`hasScarceTier`** (`:51-53`): true whenever flash stacks exist.
-- **`checkCapacity`** (`:59-97`) — the actual gate: weights + KV vs. `total_capacity_bytes` (flash
-  pool, `:66-72`); activations vs. `scarceTierActivationLimit` (`:75-82`, error message names the
-  tier — `"HBM"` or `"Logic SRAM"`, `:77`); plain-HBM path uses the old lumped
-  `act+weight+kv > memory_capacity` check (`:85-94`).
-- **`peakIntermediateBytes`** (`:144-205`) — this is the **peak concurrently-live** intermediate
-  footprint, not a sum of every tensor a layer touches. Per `INSTRUCTIONS.md` §2: attention and
-  FFN phases execute sequentially within a layer, so the resident set at any instant is
-  `max(attention-phase, FFN-phase)`, and this **scales with batch size, not sequence length** —
-  the seq-length-scaled Q·Kᵀ score matrix and any decompressed KV are explicitly excluded (they
-  stream through the separate 3.13 MB/stack double-buffer of §6.2, never resident in this pool).
-  Handles MLA-absorb, compressed-KV, and GQA-base attention variants (`:155-188`) plus MoE/dense
-  FFN (`:190-202`).
+- **`scarceTierActivationLimit`** returns: HBM-stack capacity (`num_hbm_stacks ×
+  hbm_per_stack_bytes`) if any exist, else `logic_sram_bytes` (HBF+/CONV+), else (plain HBM) the
+  full `memory_capacity`.
+- **`hasScarceTier`**: true whenever flash stacks exist.
+- **`checkCapacity`** — the actual gate: weights + KV vs. `total_capacity_bytes` (flash pool);
+  activations vs. `scarceTierActivationLimit` (error message names the tier — `"HBM"` or `"Logic
+  SRAM"`); plain-HBM path uses the old lumped `act+weight+kv > memory_capacity` check.
+- **`peakIntermediateBytes`** — the **peak concurrently-live** intermediate footprint, not a sum
+  of every tensor a layer touches. The paper is explicit that attention and FFN phases execute
+  sequentially within a layer, so the resident set at any instant is `max(attention-phase,
+  FFN-phase)`, and this scales with batch size, not sequence length — the seq-length-scaled Q·Kᵀ
+  score matrix and any decompressed KV are explicitly excluded (they stream through the separate
+  3.13 MB/stack double-buffer of §6.2, never resident in this pool). Handles MLA-absorb,
+  compressed-KV, and GQA-base attention variants, plus MoE/dense FFN.
 
-This gate is why **HBF+/CONV+'s 320 MB logic SRAM can bind batch size much harder than HBF's 36 GB
-HBM stack**, even though HBF+ has *more* raw flash capacity and higher bandwidth on every other
-axis. This was previously an observed HBF+-worse-than-HBF batch-size inversion (paper claims
-HBF+ should be *larger*) — **root-caused and fixed** (`CHANGES.md` item 14): the gate previously
-summed every intermediate tensor a layer touches (as if all simultaneously resident) instead of
-taking `peakIntermediateBytes`'s `max(attention-phase, FFN-phase)`, and the summed formula's
-dominant term was the seq-length-scaled Q·Kᵀ score matrix, which streams through the separate
-double-buffer and should never have counted against this pool at all. After the fix, HBF+
-correctly exceeds HBF on total batch (see §16 "Open HBF-specific items" for what remains open).
+This gate is why HBF+/CONV+'s 320 MB logic SRAM can bind batch size much harder than HBF's 36 GB
+HBM stack, even though HBF+ has more raw flash capacity and higher bandwidth on every other axis.
 
 ---
 
-## 7. The Parallelism Optimizer (NEW)
+## 7. The Parallelism Optimizer
 
-### 7.1 What It Sweeps — `src/optimizer/parallelism_optimizer.cpp:Optimize()` (`:8-480`)
+### 7.1 What It Sweeps — `src/optimizer/parallelism_optimizer.cpp::Optimize()`
 
-Nested nested loop over **TP × PP × DP × EP**:
+Nested loop over **TP × PP × DP × EP**:
 
-- **TP** (`:17-26`) doubles from 1; **hard-capped at `num_kv_heads`** — `parallel.cpp` asserts
-  `num_kv_heads % parallel_num == 0` and crashes otherwise, so the optimizer unconditionally skips
-  `tp` values that don't divide `num_kv_heads` (this guard is itself a fix — see §16 quirk-check
-  addendum below and `CHANGES.md` item 3).
-- **PP** (`:27-30`): `tp*pp ≤ total_gpus`, evenly divides `total_gpus` and `num_layers`.
-- **DP** = `total_gpus/(tp*pp)` (`:32`); requires `batch_size % dp == 0` (`:40`).
-- **EP** (`e_tp_dg`, `:42-61`) — an **independent** degree from TP: routed-expert weight can be
-  tensor-split across a different device count than attention/dense weight, bounded by
-  `devices_per_stage = total_gpus/pp` and mirroring `expert.cpp`'s own validity asserts
-  (`:57-60`) so the optimizer never proposes a config the simulator would reject.
+- **TP** doubles from 1; **hard-capped at `num_kv_heads`** — `parallel.cpp` asserts `num_kv_heads
+  % parallel_num == 0` and crashes otherwise, so the optimizer unconditionally skips `tp` values
+  that don't divide `num_kv_heads`.
+- **PP**: `tp*pp ≤ total_gpus`, evenly divides `total_gpus` and `num_layers`.
+- **DP** = `total_gpus/(tp*pp)`; requires `batch_size % dp == 0`.
+- **EP** (`e_tp_dg`) — an independent degree from TP: routed-expert weight can be tensor-split
+  across a different device count than attention/dense weight, bounded by `devices_per_stage =
+  total_gpus/pp` and mirroring `expert.cpp`'s own validity asserts so the optimizer never
+  proposes a config the simulator would reject.
 
-Per candidate, it computes: TP-aware attention/MLP weight bytes (`:79-139`, MLA vs. GQA branches),
-MoE/dense layer-mix handling for `first_k_dense`/`expert_freq` patterns (`:143-175`), an
-`E_active` estimate of concurrently-hot experts per device (`:180-196`), KV-cache bytes
-(compressed vs. GQA, `:234-237`), and `peakIntermediateBytes`-based activation size (`:249-259`).
+Per candidate, it computes: TP-aware attention/MLP weight bytes (MLA vs. GQA branches,
+routed-expert weight divided by `devices_per_stage`, not total device count), MoE/dense
+layer-mix handling for `first_k_dense`/`expert_freq` patterns via the shared `isMoELayer()`
+helper (§9), an `E_active` estimate of concurrently-hot experts per device (also
+`devices_per_stage`-based), KV-cache bytes (compressed vs. GQA, iRoPE-window-aware via
+`effectiveKvLenSumAllLayers()`, §9.1), and `peakIntermediateBytes`-based activation size.
 
-### 7.2 Capacity Gate vs. Analytic Latency — the Separation of Concerns
+### 7.2 Capacity Gate vs. Analytic Latency Estimate
 
-- **Hard gate**: `checkCapacity(...)` (`:264-269`) — capacity/SRAM is exact and monotonic; it's
-  the *only* thing that sets `config.oom`.
-- **Ranking-only estimate**: `estimated_latency_ms` (`:271-445`) — weight-read time (flash or HBM
-  bandwidth + per-op page-read latency, counting distinct linear-op calls per layer to match the
-  live kernel, `:281-315`), compute time from FLOPs (`:317-323`), chunked KV-read time mirroring
-  `getAttentionMemoryDuration` (`:325-345`), and KV-write time **hidden behind attention-only
-  compute** (`:347-374`, matching `attention_gen_impl.cpp`'s basis exactly — using total per-layer
-  compute here would over-credit hiding). Two selectable models via
-  `system_config.optimizer_latency_model` (`:377-399`): `"max"` (tighter, `max(compute,
-  weight_mem)+kv` per layer) vs. `"sum"` (conservative, additive, with a flash-only DMA/compute
-  overlap credit). Communication terms — TP all-reduce (`:401-407`), PP send/receive
-  (`:409-420`), MoE scatter/gather (`:422-438`, only when `e_tp_dg < devices_per_stage`) — are
-  added on top. The comment at `:440-444` is explicit: *this must never set `config.oom`* — the
-  simulator's measured TPOT is the sole SLO arbiter (`INSTRUCTIONS.md` §6).
-- Selection (`:458-479`): among non-OOM candidates, pick minimum `estimated_latency_ms`.
+- **Hard gate**: `checkCapacity(...)` — capacity/SRAM is exact and monotonic; it's the *only*
+  thing that sets `config.oom`.
+- **Ranking-only estimate**: `estimated_latency_ms`, built from weight-read time (flash or HBM
+  bandwidth + exposed page-read latency), compute time from FLOPs divided by `effectiveMFU(...)`
+  (a no-op under shipped defaults), chunked KV-read time mirroring `getAttentionMemoryDuration`'s
+  double-buffer exposed-latency formula (§6.2), and KV-write time hidden behind attention-only
+  compute — that attention-only compute term is itself also divided by `effectiveMFU(...)`,
+  matching the live kernel's basis exactly. Two selectable per-layer aggregation models via
+  `system_config.optimizer_latency_model`: `"max"` (tighter, `max(compute, weight_mem)+kv` per
+  layer) vs. `"sum"` (conservative, additive, with a flash-only DMA/compute overlap credit).
+  **TP all-reduce** is a ring all-reduce model matching the live simulator's `AllReduce::forward`
+  exactly: for a TP group of size `N`, cost = `2*(N-1)` hops, each hop paying one
+  `device_ict_latency` plus `1/N` of the message size over `device_ict_bandwidth`; two all-reduces
+  per layer (attention + FFN). PP send/receive and MoE scatter/gather (only when `e_tp_dg <
+  devices_per_stage`) are added on top.
+  **Per-stage total is multiplied by `pp`**, matching the live simulator: a decode token traverses
+  all `pp` pipeline stages sequentially (no micro-batch-level pipeline overlap is modeled), so the
+  true per-token estimate is `pp` stages' worth of the per-stage total (compute/weight/KV +
+  that stage's own TP all-reduce + MoE scatter/gather) plus `(pp-1)` inter-stage send/receive
+  hops — mirroring `Cluster::maxDeviceTime()`'s live-simulator accounting (§8.3).
+  `estimated_latency_ms` is used only for ranking; it never sets `config.oom`, and the live
+  simulator's measured TPOT remains the sole SLO arbiter (§7.3, §12).
+- **Candidate selection**: among capacity-feasible (non-OOM) candidates, pick the one maximizing
+  `batch_size_per_gpu / estimated_latency_ms` — i.e. **estimated throughput**, matching the
+  paper's own stated objective ("selects the parallelism configuration that maximizes the
+  achievable system throughput subject to all constraints"). No latency-based veto is applied at
+  any point in `Optimize()`.
 
-Note `tpot_slo_ms` is a parameter of `Optimize()` but **not used inside it** for filtering — SLO
-comparison happens in the *caller* (`eval/test.cpp`, §7.3).
+Note `tpot_slo_ms` is a parameter of `Optimize()` but not used inside it for filtering — SLO
+comparison happens in the caller (`eval/test.cpp`, §7.3).
 
-### 7.3 Two-Phase Batch-Size Search — `eval/test.cpp: analytic_sweep_only` (`:294-398`)
+### 7.3 Two-Phase Batch-Size Search — `eval/test.cpp: analytic_sweep_only`
 
-Implements `INSTRUCTIONS.md` §6's two-phase design:
-
-1. **`ANALYTIC_CAP_FEASIBLE_AT_1`** (`:323-331`) — if batch=1 is capacity-infeasible, the whole
-   GPU count is infeasible; print `0` and stop (no simulator call needed — capacity is exact).
+1. If batch=1 is capacity-infeasible, the whole GPU count is infeasible — no simulator call
+   needed, since capacity is exact.
 2. **Phase 0 (capacity ceiling)**: since capacity is exact and monotonic in batch size, compute
-   `b_cap` directly via exponential-then-binary search (`:340-365`) with no per-batch simulator
+   the capacity ceiling directly via exponential-then-binary search with no per-batch simulator
    calls.
-3. **Phase 1 (SLO-guided binary search)**: binary-search *downward* from `b_cap` using the
-   analytic latency estimate against `tpot_slo_ms` (`:367-387`) to propose a candidate batch and
-   its TP/PP/EP/DP.
-4. Emits `ANALYTIC_MAX_BATCH`, `ANALYTIC_TP/PP/EP/DP`, `ANALYTIC_ESTIMATED_LATENCY_MS` (`:389-398`).
+3. **Phase 1 (SLO-guided binary search)**: binary-search downward from the capacity ceiling using
+   the analytic latency estimate against `tpot_slo_ms` to propose a candidate batch and its
+   TP/PP/EP/DP.
+4. Emits `ANALYTIC_MAX_BATCH`, `ANALYTIC_TP/PP/EP/DP`, `ANALYTIC_ESTIMATED_LATENCY_MS` on stdout.
 
 `run_experiments.py`'s `find_max_batch_size` then does **Phase 2 (simulator verification)**:
-confirms the candidate and the batch immediately above it (boundary safety check) with the real
-simulator; if the simulator disagrees with the analytic estimate in either direction, it falls
-back to a simulator-driven binary search over the narrowed range. This closes a historical bug
-(audit F1, `CHANGES.md` item 1) where a pure analytic-latency rejection at batch=1 was
-indistinguishable from genuine capacity infeasibility and could silently return batch=0 without
-ever consulting the simulator.
+confirms the candidate and a window of batches immediately above it (a boundary safety check —
+sized to cover the DP-divisibility cycle at the current GPU count, since feasibility is
+non-monotonic at the integer level) with the real simulator; if the simulator disagrees with the
+analytic estimate in either direction, it falls back to a simulator-driven binary search over the
+narrowed range. The analytic phase never itself declares a batch infeasible purely on the latency
+estimate — a real simulator call is always the final word.
 
 ---
 
@@ -349,57 +365,69 @@ ever consulting the simulator.
 ### 8.1 Topology & GPU Presets
 
 Topology (`Cluster`/`Node`/`Device`, `get_device`, NVLink=intra-node/`device_ict_*`,
-InfiniBand=inter-node/`node_ict_*`) is unchanged from upstream. `hardware_config.h` now has
-**five** `SystemConfig` presets instead of four: **A100, H100, B100, B200** (unchanged,
-`:194-344`) plus **Rubin** (`:359-395`, added this fork to match the HBF paper's cited reference
-GPU, NVIDIA DGX Rubin NVL8). Rubin's `compute_peak_flops` is explicitly commented as an
-**estimate** (`:346-358`): the datasheet gives only an aggregate FP8/FP6 training figure (140
+InfiniBand=inter-node/`node_ict_*`) is unchanged from upstream. `hardware_config.h` has five
+`SystemConfig` presets: **A100, H100, B100, B200** (upstream) plus **Rubin** (matching the HBF
+paper's cited reference GPU, NVIDIA DGX Rubin NVL8). Rubin's `compute_peak_flops` is explicitly
+commented as an estimate: the datasheet gives only an aggregate FP8/FP6 training figure (140
 PFLOPS/8 GPUs), halved per this file's FP16-base convention. Its `memory_bandwidth`/
-`memory_capacity` fields are placeholders and **not load-bearing** — `eval/test.cpp:127-129`
-always overwrites them from the selected `hbf_config` preset whenever `memory_type` is set (true
-in every sweep this project runs).
+`memory_capacity` fields are placeholders and not load-bearing — `eval/test.cpp` always overwrites
+them from the selected `hbf_config` preset whenever `memory_type` is set (true in every sweep this
+project runs).
 
-`Device`'s constructor (`device.cpp:21-75`) applies the same override at construction time
-(`:29-34`, `use_hbf && num_flash_stacks>0 → memory_capacity/bandwidth = hbf_config.*`).
+`Device`'s constructor applies the same override at construction time
+(`use_hbf && num_flash_stacks>0 → memory_capacity/bandwidth = hbf_config.*`).
 
-**A100 crash still latent** (see §16 item 12): `device.cpp:39-52`'s Ramulator DRAM-config-path
-switch has branches for `H100` and `B100/B200/Rubin` only; `A100` falls through to an empty path
-and `YAML::LoadFile("")` throws. Dormant because no sweep in this project uses `gpu_gen: A100`.
+`gpu_gen: A100` has no Ramulator DRAM-config-path branch in `device.cpp` — H100/B100/B200/Rubin
+branches exist, A100 does not, and setting it would crash on `YAML::LoadFile("")` (see `BUGS.md`
+item 1 — dormant, no sweep in this project uses it).
 
 ### 8.2 Communication
 
-AllReduce ring and All-to-All expert scatter/gather (`communication.cpp:30-37,61-428`) are
-structurally unchanged from upstream. One correctness fix: every node-index derivation
-(`src_node`/`dst_node`) previously hardcoded `/8`; now uses `device->config.num_device`
-(`communication.cpp:83,97,104,159,171,269,283,290,352,364,499-500`) — so runs with `num_device !=
-8` (e.g. the 16-GPU / 2-node sweep points) compute node membership correctly. NVLink/InfiniBand
-bandwidths are set via `nvlink_gen`/`infiniband_gen` in `eval/test.cpp:72-73,84-85`
-(`nvlink_gen: 5 → 900 GB/s` unidirectional per-link, matching `INSTRUCTIONS.md`'s 1,800 GB/s
-bidirectional-total figure; `infiniband_gen: 800 → 100 GB/s`).
+AllReduce ring and All-to-All expert scatter/gather (`communication.cpp`) are structurally
+unchanged from upstream. Every node-index derivation (`src_node`/`dst_node`) uses
+`device->config.num_device` (not a hardcoded constant), so runs with `num_device != 8` (e.g. the
+16-GPU / 2-node sweep points) compute node membership correctly. NVLink/InfiniBand bandwidths are
+set via `nvlink_gen`/`infiniband_gen` in `eval/test.cpp` (`nvlink_gen: 5 → 900 GB/s` unidirectional
+per-link; `infiniband_gen: 800 → 100 GB/s`).
+
+**Pipeline-stage time propagation.** `PipelineStage` (`communication.cpp`) is the module
+representing a pipeline-parallel stage transition. Unlike `AllReduce`/`MoEScatter` (which
+reconcile time across their device group via `ModuleGraph::sync_devices()`'s max-and-broadcast,
+since they operate within one pipeline stage's TP/EP group), `PipelineStage` is the *only*
+cross-stage-boundary module in the decode critical path, and its `forward()` explicitly
+propagates elapsed time to the destination device: after computing the inter-stage transfer
+`comm_time` and adding it to the source device's own `status.device_time`, it sets
+`dst_device->status.device_time = max(dst_device->status.device_time, device->status.device_time)`
+— a token cannot begin the next stage's compute before the current stage's output has physically
+arrived. This makes the *last* stage of whichever pipeline finishes last hold the true cumulative
+per-token latency across the entire pipeline traversal.
 
 ### 8.3 Cluster Execution Loop
 
 `runIteration` dispatches `runIterationMixed` vs. `runIterationSumGenSplit` on
-`config.disagg_system` (`cluster.cpp:470-474`); both still accumulate `total_time` unconditionally
-per step (`:519`, `:593`, gated on `!hasSumSeq()` for the disagg gen-only timeline). Two capacity
-checks:
+`config.disagg_system`; both read the per-iteration decode-step time via
+`Cluster::maxDeviceTime()` — the maximum `status.device_time` across every device in the cluster,
+not any single device's own time. This is what correctly captures the propagated pipeline-stage
+latency from §8.2 (for `PP==1`, no `PipelineStage` module is ever created, so this reduces
+identically to reading the one device's own time — a no-op there). `setStat` reads the same value.
 
-- **`checkMemorySize`** (F8 fix, `cluster.cpp:262`): `size_for_capacity_gate = hasScarceTier(config)
-  ? (size - activation_size) : size` — activation is excluded from the lumped weight+KV pool gate
-  whenever a scarce tier exists (it already has its own, correct, separate gate via
-  `scarceTierActivationLimit`/§6.3), removing a small double-charge that existed before this fix.
-- **`checkHeteroMemorySize`** (`cluster.cpp:333-334`) — a *separate*, unaudited capacity check with
-  a hardcoded `3.3 GB` "Non MoE weight" magic-number subtraction and no activation term at all;
-  flagged in `BUGS.md` #7 as not confirmed broken but inconsistent with the F8 fix.
+Two capacity checks exist:
+
+- **`checkMemorySize`**: `size_for_capacity_gate = hasScarceTier(config) ? (size -
+  activation_size) : size` — activation is excluded from the lumped weight+KV pool gate whenever a
+  scarce tier exists, since it already has its own, separate gate via
+  `scarceTierActivationLimit`/§6.3.
+- **`checkHeteroMemorySize`** — a separate, unaudited capacity check with a hardcoded `3.3 GB`
+  "Non MoE weight" magic-number subtraction and no activation term at all (`BUGS.md` item 6).
 
 The KV-write penalty (§6.2) is folded into the breakdown without double-counting: attention
 duration is split as `atten_sum/gen += (total - kv_write); kv_write += kv_write` at the relevant
 stamp-processing sites in `cluster.cpp`.
 
 Attention timing kernels (`AttentionSum`/`AttentionGen`/`AttentionMixed`, MLA/Absorb variants) are
-structurally the same three-regime split as upstream — see the base guide §6.5 — with the flash
-calls into `layer_impl.h` (§6.2) as the only change, plus the still-present PIM
-`memory×opb` non-roofline quirk (§16 item 9).
+structurally the same three-regime split as upstream — see the base guide — with the flash calls
+into `layer_impl.h` (§6.2) as the main change, plus the still-present PIM `memory×opb`
+non-roofline quirk (§16).
 
 ---
 
@@ -407,35 +435,70 @@ calls into `layer_impl.h` (§6.2) as the only change, plus the still-present PIM
 
 Graph assembly (`LLM` = Embedding → N×Decoder/MoEDecoder → LmHead), the `Tensor` abstraction, and
 attention geometry (MHA/GQA/MQA/MLA, `attention_group_size = num_heads/num_kv_heads`) are
-structurally the same as upstream, with three fixes now in place (fully re-verified in §16):
+structurally the same as upstream.
 
-- **`isMoELayer`** helper (`llm.cpp:16-21`) generalizes the old hardcoded `expert_freq`/
-  DeepSeek-specific branch: honors `first_k_dense` (forced-dense prefix, any model) **and**
-  `expert_freq`, so MLA-specific/DeepSeek-specific handling is derived from the model's own
-  architecture parameters rather than a global flag (`INSTRUCTIONS.md`'s explicit requirement).
-- **Decoder chaining fixed**: `LLM::forward` now threads `temp = out` between decoders
-  (`llm.cpp:114-115`) instead of feeding every decoder the raw embedding output.
-- **Decoder residual wiring fixed**: `post_attn_layer_norm` now consumes `res_1_out` (the actual
-  residual sum), not raw `attention_out` (`decoder.cpp:82-86`); `MoEDecoder`'s residual slots are
-  now real `Residual` modules, not `LayerNorm` (`decoder.cpp:129-144`).
+`isMoELayer()` (`model/model_config.h`) is a shared helper used by both the module-construction
+path (`llm.cpp`) and the parallelism optimizer, so the two can never disagree on which layers are
+MoE. Honors `first_k_dense` (forced-dense prefix, any model) and `expert_freq`, so MLA-specific/
+DeepSeek-specific handling is derived from the model's own architecture parameters rather than a
+global flag.
 
-Model presets (`model_config.h`): `llama3_405B` precision corrected **FP8 → BF16**
-(`precision_byte=2`, `:116-118`) after cross-referencing the paper's explicit "HBM4 needs ≥4 GPUs
-for both LLMs" constraint (`CHANGES.md` item 11); `llama4_maverick` (`:124-126`, already BF16,
-128 experts) is the fork's other primary evaluation model. `deepseekV3`, `mixtral`, and other
-presets' precision assumptions are **unverified** against any external reference (`BUGS.md` #5).
+### 9.1 Llama-4 "iRoPE" Interleaved Local/Global Attention
+
+Real Llama 4 uses Meta's "iRoPE" architecture: only every 4th layer is full-context ("NoPE"); the
+other 3 use a fixed 8192-token local attention window. `ModelConfig` carries
+`attn_chunk_size`/`attn_global_interval` fields, defaulting to `0`/`1` (full global attention —
+a no-op for every model that doesn't set them). `llama4_maverick` and `llama4_scout` set
+`attn_chunk_size=8192, attn_global_interval=4` (independently verified against Meta's released
+`Llama-4-Maverick-17B-128E-Instruct config.json`; Scout isn't one of the paper's own evaluated
+models, so its exact values are lower-confidence than Maverick's).
+
+Three shared helpers in `model_config.h`:
+- `isGlobalAttentionLayer(mc, layer)` — 0-indexed layer `L` is global when `(L+1) %
+  attn_global_interval == 0`.
+- `effectiveKvLen(mc, layer, context_len)` — global layers see the full context; local layers are
+  capped at `attn_chunk_size` (a deliberate flat-cap simplification vs. Llama-4's real
+  sawtoothing per-token local window).
+- `effectiveKvLenSumAllLayers(mc, context_len)` — sums `effectiveKvLen` across all layers; the
+  quantity that replaces `num_layers * context_len` everywhere. Reduces exactly to the old
+  formula when `attn_chunk_size==0`.
+
+This windowing is wired into every path that touches KV volume, kept in lock-step by design:
+
+- **Live-simulator KV-cache tensor allocation**: a `layer_idx` parameter threads through
+  `llm.cpp`'s per-layer loop → `decoder.{cpp,h}` → `layer.{cpp,h}`'s `Attention` constructor
+  (`gen_seq_len = effectiveKvLen(...)`) → `parallel.{cpp,h}`'s `SelfAttentionParallel` → its
+  `SelfAttentionGen` sub-module (the decode path every current sweep exercises; the prefill-path
+  modules were deliberately left unwindowed, since `decode_mode: on` means prefill is never
+  exercised — `BUGS.md` item 2). `SelfAttentionGen` stores the effective window as a
+  `LayerInfo::local_attention_window` field at `forward()` time — this drives
+  `cluster.cpp::checkMemorySize`'s ground-truth capacity gate, since it sizes the `k_cache`/
+  `v_cache` tensors themselves.
+- **Runtime KV-read latency**: `attention_gen_impl.cpp`'s `AttentionGenExecutionGPU` (the GQA
+  decode path both llama3/llama4 use) caps `n`/`k` at `layer_info.local_attention_window` in the
+  Scoring/Softmax/Context loops. Only the GPU variant is windowed (llama4's actual decode path);
+  Logic/PIM GQA and the MLA variants (DeepSeek, always full-global) are unaffected.
+- **Runtime KV-write latency**: `getKVWriteDuration` (§6.2) caps the write length at the same
+  per-layer window.
+- **Optimizer's analytic KV-cache-bytes and KV-write formulas** (§7.1, §7.2) both use
+  `effectiveKvLen`/`effectiveKvLenSumAllLayers` to match.
+
+Model presets (`model_config.h`): `llama3_405B` uses BF16 precision (`precision_byte=2`);
+`llama4_maverick` (also BF16, 128 experts) is the other primary evaluation model.
+`deepseekV3`, `mixtral`, and other presets' precision assumptions are unverified against any
+external reference (`BUGS.md` item 4).
 
 ---
 
 ## 10. Scheduler Layer (Continuous Batching)
 
 Sequence lifecycle, `BatchedSequence`, and expert routing (uniform/Zipfian) are unchanged from
-upstream. One real behavioral change: **`injection_rate` is no longer a dead key**.
-`eval/test.cpp:39,102-104` now reads `simulation.injection_rate` and, when `> 0`, sets
-`use_inject_rate=true` + `request_per_second`, activating the open-loop Poisson-arrival path
-(`scheduler.cpp:373,457`). `config.yaml` currently ships `injection_rate: 20` — **this means the
-system now runs open-loop by default**, a behavioral change from upstream's always-closed-loop
-default. See §16 items 3–4 for the interaction this creates.
+upstream. `simulation.injection_rate` (`eval/test.cpp`), when `> 0`, sets `use_inject_rate=true` +
+`request_per_second`, activating the open-loop Poisson-arrival path (`scheduler.cpp`) instead of
+closed-loop continuous batching. `run_experiments.py`'s sweep driver explicitly overrides
+`injection_rate = 0` for every measurement it runs ("Continuous batching" — the paper's steady-
+state saturated-batch model), so this only affects a bare `./run config.yaml` invocation with the
+shipped `config.yaml`'s default (`injection_rate: 20`), never a sweep-driven measurement.
 
 ---
 
@@ -443,84 +506,103 @@ default. See §16 items 3–4 for the interaction this creates.
 
 Unchanged from upstream (still gated behind `use_ramulator: off` by default; every sweep in this
 project runs the pure analytical path described in §5–§6, not real Ramulator cycles). See the
-base guide §9 for the full Ramulator/PIM-kernel/address-mapping description — it applies
-identically here.
+base guide for the full Ramulator/PIM-kernel/address-mapping description — it applies identically
+here.
 
 ---
 
 ## 12. Configuration Reference (config.yaml)
 
-New/changed keys relative to upstream (current values shown are what `config.yaml` ships):
+Keys relative to upstream that are new or behave differently (current shipped values shown):
 
 | Section | Key | Meaning | Current value |
 |---|---|---|---|
 | system | `gpu_gen` | now includes `Rubin` | `Rubin` |
 | system | `memory_type` | `HBM` (plain, upstream-compatible) / `HBM4` / `HBF` / `HBF+` / `CONV` / `CONV+` | `HBM` |
 | system | `chunk_size` | chunked-attention chunk size in **bytes**; `0`=auto (full SRAM staging capacity) | `0` |
-| system | `tpot_slo` | target TPOT in **seconds** (converted ×1000 internally to `tpot_slo_ms`, `eval/test.cpp:302`) | `0.1` |
+| system | `tpot_slo` | target TPOT in **seconds** (converted ×1000 internally to `tpot_slo_ms`) | `0.1` |
 | system | `optimize_parallelism` | run `ParallelismOptimizer::Optimize` to pick TP/PP/DP/EP instead of `distribution.*` | `false` |
-| system.distribution | `expert_tensor_degree` / `none_expert_tensor_degree` | `e_tp_dg` / `ne_tp_dg` (unchanged) | `1` / `8` |
+| system.distribution | `expert_tensor_degree` / `none_expert_tensor_degree` | `e_tp_dg` / `ne_tp_dg` | `1` / `8` |
 | simulation | `precision_byte` | `0` = use model preset's own precision | `0` |
-| simulation | `injection_rate` | **now live** (was dead upstream); `>0` enables open-loop Poisson arrivals | `20` |
+| simulation | `injection_rate` | `>0` enables open-loop Poisson arrivals (see §10) | `20` |
 | simulation | `validate_optimizer` | `off`/`warn`/`strict` — cross-checks optimizer prediction vs. live simulator footprint | `warn` |
 | simulation | `validate_optimizer_threshold` | relative divergence threshold for the above | `0.10` |
 | simulation | `optimizer_latency_model` | `"max"` (tighter, tracks simulator overlap) or `"sum"` (conservative additive) — §7.2 | `max` |
 | simulation | `latency_margin` | multiplicative safety margin on the optimizer's estimated latency | `1.0` |
+| simulation | `mfu_max` | asymptotic (large-batch) achieved FLOPs fraction of peak, `(0,1]`; `1.0` = no derating (§5) | *(unset → defaults to `1.0`, exact no-op)* |
+| simulation | `mfu_m_half` | GEMM row-count at half-saturation of the MFU curve; `0` disables the ramp (§5) | *(unset → defaults to `0.0`, exact no-op)* |
 
 All other keys (`num_node`/`num_device`/`processor_type`, `optimization.*`, `serving.*`,
-`log.*`) are unchanged from upstream — see the base guide §10 for the full reference.
+`log.*`) are unchanged from upstream — see the base guide for the full reference.
 
 ---
 
-## 13. Outputs: CSV · stdout markers · experiment_results.md
+## 13. Outputs: CSV, stdout markers, experiment_results.md
 
-CSV columns, `type` values, and Gantt/Timeboard export are unchanged from upstream (base guide
-§11) — one addition: the per-stage breakdown now separately reports the KV-write penalty
-(accumulated via `module_graph.cpp:219`'s `kv_write_time`) rather than folding it silently into
-attention time.
+CSV columns, `type` values, and Gantt/Timeboard export are unchanged from upstream — one
+addition: the per-stage breakdown separately reports the KV-write penalty (accumulated via
+`module_graph.cpp`'s `kv_write_time`) rather than folding it silently into attention time.
 
-**New stdout markers** (only emitted under `system.analytic_sweep_only: true`, §7.3):
+**Stdout markers** (only emitted under `system.analytic_sweep_only: true`, §7.3):
 `ANALYTIC_CAP_FEASIBLE_AT_1`, `ANALYTIC_CAP_BATCH`, `ANALYTIC_MAX_BATCH`,
-`ANALYTIC_TP/PP/EP/DP`, `ANALYTIC_ESTIMATED_LATENCY_MS` (`eval/test.cpp:323-398`). Also
+`ANALYTIC_TP/PP/EP/DP`, `ANALYTIC_ESTIMATED_LATENCY_MS`. Also
 `PEC_KV_BYTES_PER_TOKEN`/`PEC_FLASH_CAPACITY_BYTES` markers (parsed by `run_experiments.py`) for
 the write-endurance metric.
 
-`run_experiments.py`'s `main()` writes **five paper-defined metrics** to `experiment_results.md`:
-(1) Maximum Per-GPU Batch Size (`max_batch/gpu_count` — total GPU count, **not** DP replica
-count; `CHANGES.md` item 15 corrects an earlier "P1b" fix that divided by `dp` instead, which
-penalized configs for using DP *more* effectively since a DP replica still consumes real GPU
-hardware — matches `INSTRUCTIONS.md`'s own TPS formula, which was already implemented this way),
-(2) System Throughput, (3) Runtime Performance Breakdown (restricted to `{4,8,16}` GPUs — a P2
-fix, matching the paper's actual figure scope), (4) SLO Sensitivity (also `{4,8,16}`), (5) Write
-Traffic / 3-Year PEC vs. the 100K SLC cycle limit.
+`run_experiments.py`'s `main()` writes **five paper-defined metrics** to `experiment_results.md`
+(currently stale relative to the fixes described in `CHANGES.md`'s later items — regenerating it
+is a distinct, heavy step, not run automatically):
+(1) Maximum Per-GPU Batch Size (`max_batch/gpu_count` — total GPU count, not DP replica count),
+(2) System Throughput,
+(3) Runtime Performance Breakdown (restricted to `{4,8,16}` GPUs, matching the paper's figure
+scope),
+(4) SLO Sensitivity (also `{4,8,16}`),
+(5) Write Traffic / 3-Year PEC vs. the 100K SLC cycle limit.
 
 ---
 
 ## 14. Build & Run
 
-Build steps are unchanged from the base guide §12 (Ramulator 2.0 submodule + PIM patch, cmake,
-`make -j`, output `build/run`). Two sweep drivers now exist:
-
-- **`run_experiments.py`** — the maintained, fixed driver. Full sweep: GPU counts `{1,2,4,8,16}` ×
-  presets `{HBM4,HBF,HBF+,CONV,CONV+}` × workloads `{SHORT,MID,LONG}` × SLOs
-  `{0.05,0.1,0.2,offline}`. Implements the two-phase batch search (§7.3) with capacity/latency
-  separation (F1) and per-GPU batch reporting (P1b). Baseline = 8-GPU HBM4.
-- **`run_flash_only.py`** — an older, narrower driver (`gpus=[8]` only, different workload
-  lengths, flash presets only) that predates and was **not updated with** any of this session's
-  fixes: no analytic phase, no capacity/latency separation, reports raw (not per-GPU) batch size.
-  **Do not trust its output for reported numbers without auditing it first** (`BUGS.md` #4).
-
 ```bash
-./run config.yaml > output.log                       # single run
-conda run -n fluidlab python3 run_experiments.py      # full fixed sweep → experiment_results.md
-conda run -n fluidlab python3 run_flash_only.py        # older, unfixed fast check — audit before trusting
+git clone <this-repo>
+cd HBF-LLMSimulator
+git submodule update --init --recursive
+
+# Apply the Ramulator 2.0 PIM patch
+cd src/dram/ramulator2
+git apply ../../../patch/ramulator2_pim.patch
+cd ../../..
+
+mkdir build && cd build
+cmake ..
+make -j
+cd ..
 ```
+
+**Single run** — edit `config.yaml`, then:
+```bash
+./run config.yaml > output.log
+```
+Exit code 0 = success; 1 = OOM (capacity or SRAM limit exceeded).
+
+**Full experiment sweep** — all GPU counts (1/2/4/8/16), all 5 memory presets, all workloads and
+SLOs:
+```bash
+python3 run_experiments.py
+```
+Implements the two-phase batch search (§7.3) with capacity/latency separation and per-GPU batch
+reporting. Baseline for normalized metrics = 8-GPU HBM4 under the same SLO. Simulation CSV outputs
+go to `data/`.
+
+**`compare_error_rates.py`** — compares `paper_figure_readings.md` (values read off the paper's
+own figures) against `experiment_results.md` (this repo's simulator output) and reports error
+rates per figure/data-group.
 
 ---
 
-## 15. File Map (Quick Reference)
+## 15. File Map
 
-New/changed files relative to the upstream file map (base guide §14):
+New/changed files relative to the upstream file map (base guide has the full upstream reference):
 
 | File | Role |
 |---|---|
@@ -528,97 +610,59 @@ New/changed files relative to the upstream file map (base guide §14):
 | `src/hardware/layer_impl.h` | Flash timing helpers: `getLinearMemoryDuration`, `getAttentionMemoryDuration`, `getKVWriteDuration` (§6.2) |
 | `src/model/footprint.h` | Shared scarce-tier capacity/footprint logic: `checkCapacity`, `scarceTierActivationLimit`, `peakIntermediateBytes` (§6.3) |
 | `src/optimizer/parallelism_optimizer.{h,cpp}` | `ParallelismOptimizer::Optimize` — TP×PP×DP×EP sweep (§7) |
-| `eval/test.cpp` | Entry point; now also hosts `analytic_sweep_only` mode and memory-preset/chunk-size parsing (§4.1, §7.3) |
-| `run_experiments.py` | Maintained, fixed sweep driver (§14) |
-| `run_flash_only.py` | Older, unfixed sweep driver — audit before use (§14) |
-| `INSTRUCTIONS.md` | The literal HBF research spec this fork implements |
-| `CHANGES.md` | This session's fixes, with rationale, cross-referenced against the paper |
-| `BUGS.md` | Known unfixed/dormant bugs and open investigations |
-| `FAIRNESS_AUDIT.md` | External audit that seeded the `CHANGES.md` fix sprint (with corrections noted in place) |
+| `src/hardware/cluster.{h,cpp}` | `Cluster::maxDeviceTime()` — cross-stage-propagated per-token latency read (§8.3) |
+| `src/module/communication.cpp` | `PipelineStage::forward` — cross-stage time propagation (§8.2) |
+| `eval/test.cpp` | Entry point; hosts `analytic_sweep_only` mode and memory-preset/chunk-size parsing (§4.1, §7.3) |
+| `run_experiments.py` | Sweep driver — the paper-comparison harness (§14) |
+| `compare_error_rates.py` | Reusable comparison tool: `paper_figure_readings.md` vs. `experiment_results.md` (§14) |
+| `CHANGES.md` | Full history of bugs found and fixed, with rationale and paper cross-references |
+| `BUGS.md` | Currently-known unfixed/dormant bugs |
+| `BUGS_HIDDEN_BY_FLAGS.md` | Bugs masked by pinned config flags, not yet exercised |
+| `PAPER_INCONSISTENCIES.md` | Still-open and explained-not-bug paper-comparison gaps |
+| `experiment_results.md` | This repo's simulator output, in the paper's figure format |
+| `paper_figure_readings.md` | Values read directly off the paper's own figures |
 
-All other files match the upstream file map exactly (base guide §14).
-
----
-
-## 16. Modeling Simplifications · Known Quirks — Re-Verified Against the Fork
-
-Every quirk from `LLMSimulator_Guide_EN.md` §13 was re-checked directly against this fork's
-current (including uncommitted) code.
-
-| # | Upstream quirk | Verdict here | Evidence |
-|---|---|---|---|
-| 1 | "mixed" not truly mixed — any pending prefill forces the whole step to prefill, decode gets 0 tokens | **STILL PRESENT** | `scheduler.cpp:267-275` (`hasSumSeq() → process_gen=false`), `sequence.cpp:45-46` |
-| 2 | Synthetic request-length jitter computed but never applied | **STILL PRESENT** | `scheduler.cpp:52-62` (`delta` computed, apply lines commented out) |
-| 3 | `injection_rate` config key dead; `use_inject_rate` never enabled → always closed-loop | **FIXED** | `eval/test.cpp:39,102-104` now reads it; `config.yaml:46` ships `injection_rate: 20` |
-| 4 | Inter-arrival times drawn from `poisson_distribution` (should be exponential for a Poisson *process*) | **STILL PRESENT — and now live** | `scheduler.cpp:492-494`. Because #3 is fixed and the shipped config has `injection_rate: 20 > 0`, this bug is now on the **active default path**, not dormant as it was upstream |
-| 5 | Decoder residual wiring: `post_attn_layer_norm` received `attention_out` instead of `res_1_out` | **FIXED** | `decoder.cpp:80-86` — comment at `:83-85` documents the correction |
-| 6 | `MoEDecoder`'s residual slots were actually `LayerNorm`, not `Residual` | **FIXED** | `decoder.cpp:129-144` now uses `Residual::Create` for both slots |
-| 7 | `LLM::forward` fed every decoder the raw embedding output (no chaining) | **FIXED** | `llm.cpp:108-116` — `temp = out` threads the previous decoder's output forward |
-| 8 | `attention_group_size` inconsistent: gen used `num_heads/num_kv_heads`, sum/mixed/MLA-sum used `head_dim/num_heads` | **FIXED** | `attention.cpp:57,108,151,415,547` — all five sites now `num_heads/num_kv_heads` |
-| 9 | PIM decode-attention uses `memory_duration × opb` instead of `max(compute, memory)` | **STILL PRESENT** | `attention_gen_impl.cpp:449,499` (contrast with `:647,719,848,...` which correctly use `std::max`) |
-| 10 | Dead code: `data_object.*`, `pimBankgroupEnergy`, most PIM kernels (CKKS legacy), `getNumInjection`/`getPoissondistribution` (no callers) | **STILL PRESENT** | `power.h:40`, `pim_kernel.h` CKKS declarations, `scheduler.cpp:187,195` (no call sites found) |
-| 11 | Memory-limited batch shrinking (`mem_cap_limit`) happens once at startup, not dynamically at runtime | **STILL PRESENT** | `cluster.cpp:262-267` (invoked once, `model/test.cpp:36`) |
-| 12 | `gpu_gen: A100` has no Ramulator DRAM-config branch in `device.cpp` → would crash | **STILL PRESENT** (Rubin branch added alongside it) | `device.cpp:39-52` — H100/B100/B200/Rubin branches exist, no A100 branch |
-
-**Net effect of the #3/#4 interaction**: fixing the dead `injection_rate` key (a real
-correctness improvement — it makes a documented config key actually work) exposes the
-long-dormant Poisson-vs-exponential approximation on the default path for the first time. Anyone
-running QPS-style experiments (rather than the closed-loop batch-saturation sweeps this project's
-own harnesses use) should be aware inter-arrival times are approximately, not exactly,
-Poisson-process-distributed.
-
-### Open, HBF-specific items (from `BUGS.md`, not yet resolved)
-
-These are new to this fork and have no upstream analogue:
-
-- **[RESOLVED] HBF+ underperforming HBF on total achievable batch size** — the ~8-9x
-  HBM4/SHORT/8-GPU batch-size gap vs. the paper's reported numbers, and the HBF+-worse-than-HBF
-  inversion, are now both resolved (`CHANGES.md` items 14-15, `BUGS.md` #9). Root causes: the
-  scarce-tier gate summed instead of taking peak intermediate-data footprint (§6.3), and
-  `run_experiments.py`'s per-GPU batch divisor used DP replica count instead of total GPU count.
-  Recomputing already-completed simulator runs with both fixes matches the paper's own anchors
-  closely (e.g. HBM4/8-GPU/SHORT llama3_405B: 194.4 vs. paper's 194; HBF+/HBF ratio at MID/8-GPU:
-  +25.6% vs. paper's "+24% on average"). GPU-speed mismatch, TP/DP KV-sharding bugs, missing
-  communication-overhead accounting, and (per a follow-up investigation) the `injection_rate`/
-  Poisson-open-loop quirk (#3/#4 above) were all investigated and ruled out along the way — the
-  last of these is neutralized for every `run_experiments.py`-driven number by the explicit
-  `injection_rate = 0` override at `run_experiments.py:57` ("Continuous batching"); it only
-  affects a bare `./run config.yaml` invocation, never a sweep-driven one.
-- **Two smaller residuals remain** after the above fixes (`BUGS.md` #10), not yet root-caused:
-  llama4_maverick's HBM4/8-GPU/SHORT anchor is ~11% high (511.6 vs. paper's 460, vs. llama3_405B's
-  near-exact match) — possibly a MoE-specific routing/footprint assumption; and the "1-GPU
-  HBF/HBF+ beats 8-GPU HBM4 in most cases" claim now holds/is-close in 3 of 4 tested combinations
-  but llama3_405B's plain-HBF (not HBF+) case undershoots by ~61%, not yet investigated.
-- **Degenerate one-device-per-pipeline-stage optimizer choices** (e.g. PP=8/EP=1/TP=1) trivially
-  zero every communication term by construction — legitimate per the ranking, but not yet verified
-  whether the per-device all-experts-unsharded weight cost is fully/correctly counted against a
-  communication-incurring alternative (`BUGS.md` #8).
-- **`run_flash_only.py` carries none of this session's fixes** (§14) — should not be used for
-  reported numbers without auditing or retiring it (`BUGS.md` #4).
-- **`page_size_bytes` is now vestigial config surface**: after the chunked/SRAM-staging fix (§6.2),
-  nothing computes with the literal 4 KiB page size anymore except as a documentation/hardware-
-  geometry field (`BUGS.md` #6).
-- **Disaggregated path (`disagg_system=on`, currently unused by any sweep)** lost its one-time
-  prefill→decode KV-transfer term when a double-counting/never-actually-modeled block was removed;
-  the correct per-decode-step KV-write penalty (§6.2) is unaffected and present on both execution
-  paths (`BUGS.md` #3).
-- **`checkHeteroMemorySize()`** has its own capacity logic (hardcoded 3.3 GB subtraction, no
-  activation term) and was not audited or reconciled with the F8 `checkMemorySize` fix (§8.3,
-  `BUGS.md` #7).
+All other files match the upstream file map exactly (base guide has the full reference).
 
 ---
 
-## 17. Appendix: Verification Method
+## 16. Known Modeling Simplifications
 
-Every `file:line` reference in this guide was directly read from the current working tree
-(`git status` at the time of writing showed 15 modified tracked files plus several new untracked
-docs — this guide describes that *uncommitted* state, not a prior commit). Three parallel
-subsystem sweeps (HBF-specific additions; inherited-core-mechanism confirmation + Python harness;
-quirk-by-quirk re-verification against `LLMSimulator_Guide_EN.md` §13) were cross-checked against
-each other and against a second, manual read-through of the highest-traffic files
-(`layer_impl.h`, `footprint.h`, `hbf_memory_config.h`, `parallelism_optimizer.cpp`,
-`decoder.cpp`, `llm.cpp`, `attention.cpp`, `device.cpp`, `hardware_config.h`, `scheduler.cpp`,
-`config.yaml`) before this document was written, to catch any line-number drift between the two
-passes. `CHANGES.md`, `BUGS.md`, and `INSTRUCTIONS.md` were used as corroborating (not
-primary) sources — every claim sourced from them was cross-checked against the actual code they
-describe.
+Simplifications and quirks inherited from upstream that remain present in this fork (see the base
+guide's own quirks section for the original description of each):
+
+- "Mixed" scheduling isn't truly mixed — any pending prefill forces the whole step to prefill;
+  decode gets 0 tokens that step (`scheduler.cpp`).
+- Synthetic request-length jitter is computed but never applied (`scheduler.cpp`).
+- Inter-arrival times under `injection_rate > 0` are drawn from a `poisson_distribution` (should
+  be exponential for a Poisson *process*) — not exercised by any sweep in this project, since
+  `run_experiments.py` always sets `injection_rate = 0` (§10), but live on the default path for a
+  bare `./run config.yaml` invocation.
+- PIM decode-attention uses `memory_duration × opb` instead of `max(compute, memory)`
+  (`attention_gen_impl.cpp`), inconsistent with every other kernel's roofline formula. Only
+  matters if attention-gen is ever dispatched to PIM/LOGIC.
+- Dead code: `data_object.*`, `pimBankgroupEnergy`, most PIM kernels (CKKS legacy),
+  `getNumInjection`/`getPoissondistribution` (no call sites).
+- Memory-limited batch shrinking (`mem_cap_limit`) happens once at startup, not dynamically at
+  runtime (`cluster.cpp`).
+- `gpu_gen: A100` has no Ramulator DRAM-config branch in `device.cpp` and would crash if selected
+  (§8.1, `BUGS.md` item 1) — dormant, no current sweep uses it.
+
+HBF-specific simplifications, new to this fork:
+
+- **iRoPE local-attention windowing uses a flat cap**, not Llama-4's real per-token sawtooth
+  local-window trajectory (§9.1) — a deliberate simplification that empirically tracks the paper's
+  reported anchors more closely than the sawtooth's lower average would.
+- **`page_size_bytes` is vestigial config surface**: no timing formula currently computes with the
+  literal 4 KiB page size; it remains as hardware-geometry documentation only (`BUGS.md` item 5).
+- **Disaggregated path (`disagg_system=on`, currently unused by any sweep)** does not model a
+  one-time prefill→decode KV-transfer event; the per-decode-step KV-write penalty (§6.2) is
+  present and correct on both execution paths regardless (`BUGS.md` item 3).
+- **`checkHeteroMemorySize()`** (§8.3) has its own, separately-maintained capacity-check logic,
+  not reconciled with `checkMemorySize`'s scarce-tier gate (`BUGS.md` item 6).
+- **`runIterationMixed` has no internal defensive check** that `decode_mode: on` is set — decode-
+  only TPOT correctness currently depends on this convention holding, not on a structural
+  guarantee (`BUGS.md` item 2).
+
+See `PAPER_INCONSISTENCIES.md` for simulator-vs-paper numeric gaps (both still-open and
+explained-as-not-a-bug), and `BUGS.md`/`BUGS_HIDDEN_BY_FLAGS.md` for the full current bug list.

@@ -47,6 +47,20 @@ class Cluster : public std::enable_shared_from_this<Cluster> {
 
   Device::Ptr get_device(int device_total_rank);
 
+  // The per-iteration decode step time: max(status.device_time) across every
+  // device in the cluster. With pipeline parallelism (pp>1), a token's true
+  // per-step latency is the FULL pipeline traversal, not any single stage's
+  // local time -- PipelineStage::forward (communication.cpp) propagates each
+  // stage's cumulative elapsed time forward to the next stage's device, so
+  // the LAST stage of whichever pipeline finishes last already holds the true
+  // cumulative critical-path time; taking the max across all devices is a
+  // topology-agnostic way to read it back out (correct for pp==1 too, where
+  // it's a no-op equal to get_device(0)'s own value). Replaces the previous
+  // get_device(0)-only read, which under-reported by ~pp x whenever pp>1 --
+  // see CHANGES.md for the empirical confirmation (llama4_maverick/HBM4/
+  // 8-GPU/SHORT at TP=1/PP=8: ~21ms unpropagated vs. ~164ms true).
+  time_ns maxDeviceTime();
+
   void set_dependency();
   void add_module(int device_rank, std::string name, Module::Ptr module);
 

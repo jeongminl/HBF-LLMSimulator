@@ -1,5 +1,6 @@
 #include "module/communication.h"
 #include "scheduler/scheduler.h"
+#include "hardware/cluster.h"
 
 #include "common/assert.h"
 // AllReduce //
@@ -509,6 +510,29 @@ Tensor::Ptr PipelineStage::forward(const Tensor::Ptr input,
   }
 
   device->status.device_time += comm_time;
+
+  // Propagate elapsed time to the destination stage's device. A token cannot
+  // begin stage (k+1)'s compute before stage k's output has physically arrived,
+  // so dst's clock must never read earlier than src's send-complete time
+  // (src's device_time, just bumped above, already includes comm_time). Without
+  // this, dst_rank's own status.device_time independently accumulates only its
+  // own local layer work from 0 every iteration, never inheriting the upstream
+  // stages' elapsed time -- this PipelineStage module is the only cross-device
+  // hop in the decode critical path (AllReduce/MoEScatter are constructed with
+  // sync=true and go through ModuleGraph::sync_devices()'s max-and-broadcast,
+  // but their device_list only ever spans one pp-stage's TP/EP group, never a
+  // stage boundary; MoEGather is sync=false like PipelineStage but never spans
+  // a stage boundary either. PipelineStage is the only module whose device_list
+  // crosses stages, and it is sync=false, so no other mechanism reconciles
+  // this). Confirmed empirically (not just by code inspection): for
+  // llama4_maverick/HBM4/8-GPU/SHORT at TP=1/PP=8, the last stage's device_time
+  // is ~21ms without this line vs. ~164ms with it -- the latter tracks almost
+  // exactly 8 sequential per-stage times (~20.5ms each), confirming
+  // un-propagated PP severely under-counts true per-token latency.
+  Device::Ptr dst_device = device->cluster->get_device(dst_rank);
+  dst_device->status.device_time =
+      std::max(dst_device->status.device_time, device->status.device_time);
+
   return output;
 }
 

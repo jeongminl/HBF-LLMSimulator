@@ -47,16 +47,7 @@ should be reintroduced correctly — sized on the transferred sequence's `input_
 interconnect (not flash) bandwidth, without double-counting against the existing per-step
 write-overlap logic.
 
-## 4. `run_flash_only.py` was not audited or fixed this session
-
-This is an older, separate sweep driver with its own two-phase batch-size search, distinct from
-(and not routed through) `run_experiments.py`'s `find_max_batch_size`, which received all of
-this session's fixes (audit F1's capacity/latency separation, P1b's per-GPU division, etc.).
-`run_flash_only.py` almost certainly still carries every one of those bugs. Should be updated to
-share the fixed logic (or share `run_experiments.py`'s functions directly) or retired, whichever
-is intended, before being relied on for any reported numbers.
-
-## 5. Non-llama3/llama4 model presets' precision assumptions are unverified
+## 4. Non-llama3/llama4 model presets' precision assumptions are unverified
 
 This session verified and corrected `llama3_405B`'s precision (FP8→BF16) and confirmed
 `llama4_maverick`'s (already correct BF16) against the paper's explicit constraints. The other
@@ -66,7 +57,7 @@ model presets in `model_config.h` — `mixtral`, `openMoE`, `llama7bMoE`, `grok1
 assumption should be verified the same way (footprint math + any available capacity-feasibility
 constraint from a reference source), not just trusted as-is.
 
-## 6. `page_size_bytes` is now dead/vestigial config surface
+## 5. `page_size_bytes` is now dead/vestigial config surface
 
 After this session's earlier fix to the non-chunked KV-read overflow branch (which now chunks
 by SRAM staging capacity, matching the plane-parallel physical model, instead of charging one
@@ -75,7 +66,7 @@ timing formulas (`src/dram/hbf_memory_config.h` still defines and documents it a
 geometry, but nothing computes with it). Not a bug, just unused config surface worth knowing
 about if extending the flash timing model further.
 
-## 7. `checkHeteroMemorySize()` was not audited this session
+## 6. `checkHeteroMemorySize()` was not audited this session
 
 Separate from `Cluster::checkMemorySize()` (which received the F8 fix this session),
 `checkHeteroMemorySize()` in `cluster.cpp` has its own capacity-check logic, including a
@@ -85,41 +76,5 @@ session's investigation whether/when this function is actually invoked by the sw
 project runs (as opposed to `checkMemorySize()`). Flagged as unaudited and potentially
 inconsistent with the F8 fix, not confirmed broken.
 
-## 8. Open question (not a confirmed bug): are degenerate one-device-per-stage parallelism choices actually optimal?
-
-The optimizer's ranking can select configurations like llama4_maverick's 8-GPU choice
-(PP=8, EP=1, TP=1 — one device per pipeline stage) that trivially drive every communication
-term (TP all-reduce, EP scatter/gather) to exactly zero, simply because there's no other device
-in the same stage to communicate with. This is a legitimate consequence of the ranking
-correctly preferring lower communication cost — but it also means each such device must hold
-100% of the routed experts' weight for its assigned layers, with zero expert-parallel sharding.
-Not yet investigated: whether the weight-read/compute cost formula fully and correctly accounts
-for holding all experts unsharded in this configuration, or whether it under-counts that cost
-relative to a real alternative (e.g. PP=2/EP=4) that would incur communication but shard
-expert weight much more thinly per device. If under-counted, this could bias the ranking toward
-these degenerate configs more than is truly latency-optimal. Related to (but distinct from) the
-now-resolved ~8-9x batch-size gap noted in `CHANGES.md` items 14-15.
-
-**Partial finding (this session's llama4-mismatch investigation, see `CHANGES.md` item 16):**
-routed-expert weight per GPU is invariant to the TP/PP/EP split (`parallelism_optimizer.cpp`'s EP
-degree cancels out of the weight formula algebraically), so the degenerate PP=8/EP=1 choice does
-NOT under-count *capacity* — it only affects the *latency ranking* (by zeroing the EP
-scatter/gather and TP all-reduce communication terms). Still not confirmed whether the latency
-ranking itself is biased toward this config more than is truly optimal.
-
-**[LARGELY RESOLVED] A/B check executed (`PAPER_INCONSISTENCIES.md`'s U3):** forced both
-PP=8/EP=1 (optimizer's actual choice) and PP=2/EP=4 (rejected alternative) at
-llama4/HBM4/8-GPU/SHORT and compared real simulator-measured TPOT. PP=8/EP=1 genuinely wins
-(~4.6% faster; at the literal anchor batch, PP=2/EP=4 doesn't even fit — OOM), with the win coming
-entirely from PP=2/EP=4's confirmed-real extra non-expert weight cost (`layers_per_stage` 4× larger,
-not reduced by EP), not from any under-counted communication term (both configs pay zero
-communication, by construction). **The ranking is validated for this specific pair — not a bug.**
-This narrows but doesn't fully close the general question for every operating point; see
-`PAPER_INCONSISTENCIES.md` for full detail.
-
-## 9. Paper-comparison items moved
-
-All paper-vs-simulator numeric/qualitative comparison items (formerly items 9-10 here, plus the
-content of `INCONSISTENT_WITH_PAPER.md` and `INCONSISTENCY_POSSIBLE_FIXES.md`) have been merged
-into a single canonical tracker — see **`PAPER_INCONSISTENCIES.md`** for current status
-(resolved/still-open/explained-not-bugs) of every such item.
+Paper-vs-simulator numeric/qualitative comparison items live in `PAPER_INCONSISTENCIES.md`
+(still-open/explained-not-bugs) and `CHANGES.md` (resolved), not here.

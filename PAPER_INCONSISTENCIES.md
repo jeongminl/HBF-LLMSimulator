@@ -1,90 +1,42 @@
 # Paper Inconsistencies — HBF-LLMSimulator vs. Son et al. (IEEE CAL 2026)
 
-Single-source tracker for every place our simulator's results have been checked against the
-paper's reported numbers/claims. Supersedes `INCONSISTENT_WITH_PAPER.md` and
-`INCONSISTENCY_POSSIBLE_FIXES.md` (both merged in here and removed). For full fix-implementation
-detail on any resolved item, see the referenced `CHANGES.md` item number. For the original
-external audit this work grew out of, see `FAIRNESS_AUDIT.md`. The primary source
+Tracker for every place our simulator's results have been checked against the paper's reported
+numbers/claims and found **still open** or **explained (not a bug)** — i.e. every inconsistency
+that isn't a plain resolved code fix. Resolved code fixes (including several that originated as
+paper-comparison findings here) live in `CHANGES.md`; this doc only holds items that still need
+attention or whose resolution is "the paper and the simulator genuinely differ for an understood,
+non-bug reason," not "a bug was found and fixed." The primary source
 (`Exploring_High-Bandwidth_Flash_for_Modern_LLM_Inference_Opportunities_and_Challenges.pdf`, in
 this repo) was read in full when compiling this document — claims sourced from it are cited
 directly rather than through intermediary docs.
-
-## Resolved
-
-Each item: what the mismatch was, its root cause, how it was fixed, one line each.
-
-1. **HBF+ produced a LOWER total batch than HBF** (paper: HBF+ should be larger, "+24% on
-   average"). Root cause: the scarce-tier (SRAM/HBM) capacity gate summed every intermediate
-   tensor as if co-resident instead of taking peak concurrently-live footprint; the dominant
-   (wrongly-summed) term was seq-length-scaled data that should never have counted at all. Fixed
-   via a shared `peakIntermediateBytes()` helper taking `max(attention-phase, FFN-phase)`.
-   → `CHANGES.md` item 14.
-2. **Reported per-GPU batch size was wrong** (divided by DP-replica count instead of total GPU
-   count, penalizing configs for using DP more effectively). Fixed: divide by total GPU count in
-   all 4 call sites in `run_experiments.py`, matching `INSTRUCTIONS.md`'s own TPS-metric
-   convention. → `CHANGES.md` item 15.
-3. **llama3_405B wrongly showed 1-/2-GPU HBM4 as feasible** (paper: "no 1-/2-GPU segments in all
-   HBM4 bars"). Root cause: `precision_byte` was set to FP8 (~405 GB) instead of BF16 (~810 GB);
-   FP8 fits under 2×288 GB, BF16 doesn't. Fixed the model preset. → `CHANGES.md` item 11.
-4. **llama4_maverick's HBM4/8-GPU/LONG batch anchor was 68% low** (10.0 vs. paper's 31). Root
-   cause: every attention layer was modeled as full/global; real Llama-4 uses "iRoPE" interleaved
-   local/global attention (only every 4th layer is global; others use an 8192-token window) —
-   over-counted KV footprint ~3x at long context. Fixed by modeling the windowing throughout the
-   capacity, KV-cache-allocation, and runtime KV-read paths. Now 33.0 vs. paper's 31 (~6% off).
-   → `CHANGES.md` item 16.
-5. **Flash page-read latency was charged once per SRAM-staging chunk instead of once total**
-   (double-buffering should hide all but the first chunk's latency). Inflated HBF+'s KV-read time
-   ~49% above HBM4's despite identical nominal bandwidth. Fixed to expose exactly one page latency
-   (pipeline-fill) plus any residual where a chunk's transfer time is shorter than the page
-   latency. → `CHANGES.md` item 17.
-6. **MoE "experts per device" activation term divided by total device count instead of
-   devices-per-pipeline-stage** (8x undercount for degenerate one-device-per-stage configs). Fixed
-   to divide by `devices_per_stage`, matching the (already-correct) weight-term pattern. Confirmed
-   this does NOT explain the still-open U1 anchor gap below.  → `CHANGES.md` item 18.
-7. **Linear weight-read charged page-read latency once per op with no reference to chunk
-   size/SRAM capacity at all**, unlike the KV-read path, which does chunk/double-buffer (audit
-   F2). The paper's methodology describes double-buffering generically for "read data," not
-   scoped to KV — leaning toward this being a real (if minor) inconsistency with the paper's
-   stated model. Fixed: `getLinearMemoryDuration` (`src/hardware/layer_impl.h`) now uses the same
-   chunked double-buffer formula as KV reads. **Verified numerically as a no-op on every current
-   preset** (chunk-transfer time at full SRAM capacity exceeds page latency for all 4 flash
-   presets, so exposed latency reduces to exactly one page latency either way) — confirmed
-   empirically via byte-identical before/after runs on both HBF (`0.0966962731654616s`) and CONV,
-   the highest-page-latency preset (`0.09089014626032631s`). Kept for structural correctness and
-   forward-safety if config constants ever change, even though it moves no current number.
-8. **Batch-size search non-monotonicity bug — `run_experiments.py` could substantially
-   under-report the true max batch** (surfaced while root-causing U8 below; the "676→580 batch
-   drop" flagged there was this bug, not a real effect). A single failing batch probe near the
-   search boundary was trusted as proof of infeasibility, but the discrete divisibility
-   constraint on parallelism configs (`batch_size % dp == 0`) makes feasibility non-monotonic in
-   batch at the integer level — an unlucky probe value can route to an inferior config and fail
-   even though neighboring, equally-large values succeed with the true-best config. Fixed by
-   replacing every single-point probe with an 8-value window scan. llama4_maverick/HBF+/16-GPU/
-   LONG/offline: reported per-GPU batch corrected from 580.75 to 684.12 (now flat vs. the 8-GPU
-   value of 676.38, as physically expected — see U8 below). → `CHANGES.md` item 21.
-9. **No compute-utilization (MFU) factor existed anywhere in the roofline compute term** (every
-   compute-bound GEMM was implicitly charged at 100% of peak FLOPs). Added a saturating
-   `MFU(M) = mfu_max*M/(M+mfu_m_half)` factor (default no-op) across every compute-duration call
-   site. This *by itself* does not resolve any open item (see U1 below) but is a real, defensible
-   gap the audit against the paper's own stated mechanism (Fig. 3's aspect (ii)) surfaced.
-   → `CHANGES.md` item 19.
-10. **Optimizer's TP all-reduce term used a flat, non-ring communication formula**, diverging
-    from the live simulator's proper ring all-reduce (`2*(N-1)/N` bandwidth term, `2*(N-1)`
-    latency hops). Aligned the optimizer to the simulator's exact formula. Ranking-only fix (F1) —
-    verified to not move any TP=1 paper anchor, since every anchor investigated in this document
-    happens to use TP=1 (zero communication) once EP/PP are accounted for.  → `CHANGES.md` item 20.
 
 ## Still open
 
 ### U1 — llama4_maverick's HBM4/8-GPU SHORT & MID batch anchors ~9-12% high
 
-SHORT: our 514.9 vs. paper's 460 (×1.12). MID: our 164.8 vs. paper's 151.5 (×1.09). Unaffected by
-the iRoPE fix (item 4 above — both contexts are shorter than the 8192-token local-attention
-window). Two hypotheses ruled out: collision-reduced active experts (numerically negligible idle
-experts at these batch sizes) and an artificial capacity-reservation "fix" (rejected as circular —
-no such convention exists in the paper).
+**UPDATE (this session): partially closed by items 22-23 (pipeline-latency propagation +
+throughput-ranked optimizer selection), gap not fully closed.** SHORT re-verified: 500.0 vs.
+paper's 460 (×1.087, down from ×1.119/514.9). MID re-verified: 158.9 vs. paper's 151.5 (×1.049,
+down from ×1.088/164.8). The optimizer's chosen 8-GPU config for this operating point now
+genuinely pays communication instead of trivially defaulting to a zero-comm degenerate
+one-device-per-stage config (see `CHANGES.md` item 26 for the full correction) — the mechanism-(i) analysis further down
+this section (communication near-zero because of that exact degenerate choice) no longer applies
+as literally stated; the *reason* that config previously looked cheap (an ~8× undercounted
+pipeline latency, item 22) is now fixed. The residual gap is smaller but real: this operating
+point remains capacity-bound in this simulator, not the paper's comm/compute-bound SHORT regime
+described by mechanism (i)/(ii) below. The MFU-sensitivity analysis and mechanism (i)/(ii)
+reasoning below predate items 22-23 and are kept for historical context — the root-cause framing
+they establish (our cost model is too optimistic in the ways the paper's own mechanism names)
+still stands; items 22-23 closed part of the (i) communication gap specifically, not the (ii)
+compute-utilization gap.
 
-**CORRECTION (this pass): the previously-recorded root cause below was wrong. Retracted.**
+SHORT: our (pre-items-22/23) 514.9 vs. paper's 460 (×1.12). MID: our 164.8 vs. paper's 151.5
+(×1.09). Unaffected by the iRoPE fix (CHANGES.md item 16 — both contexts are shorter than the
+8192-token local-attention window). Two hypotheses ruled out: collision-reduced active experts
+(numerically negligible idle experts at these batch sizes) and an artificial capacity-reservation
+"fix" (rejected as circular — no such convention exists in the paper).
+
+**CORRECTION (an earlier pass): the previously-recorded root cause below was wrong. Retracted.**
 
 The earlier analysis in this file claimed: *"Under any pure weight+KV capacity model,
 `batch_per_gpu = (C − weight_per_gpu) / (K · ctx)`... the SHORT:MID batch ratio must exactly
@@ -122,12 +74,12 @@ regime the paper describes only for LONG:
 
 - **(i) communication**: our comm bandwidth term does scale linearly with batch (confirmed by
   code inspection — `communication.cpp`'s `AllReduce`, `parallelism_optimizer.cpp`'s aligned ring
-  term, item 10 above), but the optimizer's chosen 8-GPU config for this operating point is
+  term, CHANGES.md item 20), but the optimizer's chosen 8-GPU config for this operating point is
   TP=1/PP=8/DP=1 (confirmed via direct stdout trace — the same degenerate one-device-per-stage
-  choice already investigated in U3 below), which zeroes every communication term by construction
+  choice investigated in `CHANGES.md` item 26), which zeroes every communication term by construction
   (`AllReduce` costs nothing at TP=1; the PP send/recv term is a fixed per-transition cost, not
   the batch-linear all-reduce mechanism (i) describes). Comm contributes ~0.
-- **(ii) compute**: confirmed via item 9's diagnostic — **there was no compute-utilization factor
+- **(ii) compute**: confirmed via CHANGES.md item 19's diagnostic — **there was no compute-utilization factor
   anywhere**; every compute-bound op was charged at ideal 100% of peak FLOPs, so FFN never
   "shifts toward compute-bound GEMM under the SLO" the way the paper describes; the roofline
   `max(compute, memory)` keeps decode memory-bound far longer than real hardware would. (Note:
@@ -148,7 +100,7 @@ total, ~0.65%), the same divisibility-driven search artifact as U8, just a much 
 at this operating point. Does not change any conclusion above; all MFU-sweep numbers below predate
 item 21 and use the pre-fix 514.9/164.8 baseline for comparability across the sweep.)*
 
-**MFU sensitivity sweep (this pass, item 9's model, `mfu_m_half=128` — a stated tensor-core-tile-
+**MFU sensitivity sweep (this pass, CHANGES.md item 19's model, `mfu_m_half=128` — a stated tensor-core-tile-
 granularity assumption, not tuned to any target number):**
 
 | `mfu_max` | SHORT batch/GPU | SHORT TPOT | MID batch/GPU | MID TPOT |
@@ -170,11 +122,27 @@ communication/compute mechanism this model doesn't capture at all (e.g. the pape
 points may use a different — possibly non-pure-DP — parallelism choice than our optimizer's
 latency-ranking selects, for reasons outside a pure cost-model fix).
 
-**Status: root cause corrected (was NOT a paper inconsistency); gap NOT closed.** No further
-tuning attempted, per this investigation's standing rule against calibrating to match the paper's
-number without independent justification.
+**Status: root cause corrected (was NOT a paper inconsistency); gap improved (items 22-23) but NOT
+fully closed** (SHORT ×1.119→×1.087, MID ×1.088→×1.049). No further tuning attempted, per this
+investigation's standing rule against calibrating to match the paper's number without independent
+justification.
 
 ### U2 — "4-GPU HBF+ TPS is 15% higher than 8-GPU HBM4" residual (llama4, LONG workload)
+
+**UPDATE (this session): substantially closed by items 22-24 (pipeline-latency propagation +
+throughput-ranked optimizer selection + KV-write iRoPE windowing).** Re-measured from a clean
+baseline (both HBF+ and the HBM4 comparison point re-run post-fix, since the old HBM4 number was
+itself potentially undercounted by the same pipeline-latency bug if it picked a `PP>1` config):
+`HBF+/4gpu` TPS/GPU = 1403.90, `HBM4/8gpu` TPS/GPU = 1402.17 (both LONG/0.1s SLO) — ratio =
+**1.001×** (paper: 1.15×), up from the prior 0.722×. HBF+ now genuinely matches/edges HBM4 at this
+comparison, crossing the paper's qualitative claim ("HBF+ outperforms HBM4"), though short of its
+exact 1.15× magnitude. The analysis below (all pre-this-session) is kept for historical context;
+its "refuted" leading hypothesis (symmetric KV-read, parallel-config-asymmetry) was itself tested
+using simulator TPOT measurements now known to have been affected by item 22's bug for any `PP>1`
+config in the comparison — those specific refutations should be treated as unverified rather than
+re-asserted, though the qualitative conclusion (KV-read is symmetric by code inspection, not a
+timing-model divergence) is a static-code-analysis claim unaffected by the runtime bug and still
+holds.
 
 Paper: HBF+/4-GPU per-GPU TPS should be ~1.15× of HBM4/8-GPU's. The page-read-latency
 double-buffering fix (item 5) moved the measured ratio from 0.53× to 0.72× — real progress,
@@ -189,24 +157,45 @@ PP overlap) was tested via forced-config comparison and **refuted**: both HBM4/8
 4-GPU pick max-PP relative to their own GPU count (the same structural choice), paying zero
 communication either way.
 
-**This pass: re-verified unaffected by items 9/10/21.** `HBF+/4gpu` TPS/GPU = 1308.87,
+**This pass: re-verified unaffected by items 19/20/21.** `HBF+/4gpu` TPS/GPU = 1308.87,
 `HBM4/8gpu` TPS/GPU = 1811.67 (both at LONG/0.1s SLO) — ratio = **0.722×**, numerically identical
-to the pre-this-pass value (0.72×). Neither the MFU model (item 9), the ring all-reduce alignment
-(item 10), nor the search-boundary fix (item 21) moved this point at all — confirming the gap is
+to the pre-this-pass value (0.72×). Neither the MFU model (CHANGES.md item 19), the ring all-reduce alignment
+(CHANGES.md item 20), nor the search-boundary fix (item 21) moved this point at all — confirming the gap is
 not an artifact of any bug found and fixed in this investigation. The KV-write penalty (U6, below)
 remains a confirmed, real, ~14.8%-of-decode-time contributor, but was already known to be
 insufficient alone to close the gap.
 
-**No safe fix identified — status unchanged.** Inflating communication or FFN-compute cost terms
-purely to match the paper's two numbers would repeat the same "reverse-engineer a fudge factor
-from the answer" problem already rejected for the capacity-reservation proposal and (this pass)
-for U1. A real fix would need either a documented real-hardware basis for stronger communication/
-compute costs at scale (kernel launch overhead, real collective-communication overhead beyond pure
-bandwidth+latency, imperfect compute utilization at a magnitude well beyond what a defensible MFU
-value provides — see U1), or direct access to the paper's own methodology section, neither
-available in this repo.
+**(Historical, pre-items-22/24) No safe fix identified at the time.** Inflating communication or
+FFN-compute cost terms purely to match the paper's two numbers would repeat the same
+"reverse-engineer a fudge factor from the answer" problem already rejected for the
+capacity-reservation proposal and for U1 — this concern remains valid and was not violated by the
+actual fix found (items 22-24 are independently-motivated correctness/methodology fixes, not
+numeric calibration; see their write-ups above). **Status: substantially closed (0.722×→1.001×,
+paper 1.15×), residual not further root-caused this session** — the same "no fudge factor" rule
+applies to the remaining ~13% gap; it stays open rather than being tuned away.
 
 ### U4 — "HBF+ always outperforms HBM4 at 16 GPUs, across all SLOs" (llama4, LONG workload)
+
+**UPDATE (this session): re-swept post items 22-24.** Tight-SLO cells improved cleanly and
+substantially: 0.05s 0.959×→**1.076×**, 0.1s 1.012×→**1.171×** — both now more comfortably above
+1.0×, strengthening the "HBF+ outperforms" claim at these SLOs. The 0.2s/offline cells produced
+**9.261×/9.376×** — technically "even more true," but this magnitude is a striking outlier vs. the
+paper's own reported range (nothing above ~1.5×) and should **not** be read as an equivalent,
+directly-comparable measurement to the 0.05s/0.1s cells above. Investigated and found to be driven
+by a confirmed-real (not a search artifact) capacity cliff specific to the **HBM4 comparison
+point**, not HBF+: HBM4/8-GPU's fastest config (`TP=4/PP=2/EP=4`) hits an exact capacity ceiling at
+batch≈259 (`Out of Memory` confirmed at 260); past that, every valid `PP=4` variant (4 combinations
+force-tested directly against the live simulator, not just the optimizer's top pick) also OOMs by
+batch 262-264, leaving `TP=1/PP=8/EP=1` as the *only* capacity-feasible fallback — a discrete,
+~7.8× latency jump (0.023s→0.179s) with no intermediate option, because this simulator only
+supports powers-of-2 pipeline depths at 8 GPUs. This is a genuine consequence of item 22's fix (the
+old buggy simulator could never show this — `PP=8` used to look artificially cheap, so the
+capacity-driven fallback's latency penalty was invisible). Whether this reflects a real
+architectural insight the old bug was hiding, or whether it reflects this simulator's discrete `PP`
+granularity being coarser than whatever the paper's real system supports (smoother intermediate
+parallelism options, different capacity assumptions), is **not resolved this session** — flagged
+as a new, distinct open question rather than folded into the same throughput-ratio narrative as the
+0.05s/0.1s results.
 
 Paper: at 16 GPUs, LONG workload, HBF+'s per-GPU TPS should exceed 8-GPU HBM4 across every tested
 SLO (0.05s, 0.1s, 0.2s, offline). The page-latency fix (item 5) moved the 0.1s-SLO ratio from
@@ -225,9 +214,11 @@ ends" pattern is a **genuine throughput-ratio gap**, not an artifact of the batc
 that was corrupting the *offline* per-GPU batch number specifically (see U8). The batch number
 was wrong (580.75, corrected to 684.12); the *derived throughput* (TPS/GPU = batch/(tpot×gpu)) was
 essentially unaffected, because TPOT scaled up proportionally with the corrected batch in this
-memory-bound regime. **Holds at 0.1s and 0.2s only; misses at 0.05s (−4%) and offline (−15%) — not
-further root-caused this pass** (same open residual as U2 — see that item's "no safe fix
-identified" discussion, which applies identically here).
+memory-bound regime. **(Historical, pre-items-22/24) Held at 0.1s and 0.2s only; missed at 0.05s
+(−4%) and offline (−15%).** Superseded by the "UPDATE (this session)" block above — post items
+11-13, 0.05s/0.1s both now exceed 1.0× (1.076×/1.171×); 0.2s/offline's new numbers (9.261×/9.376×)
+are a distinct capacity-cliff finding, not a like-for-like re-measurement of this same residual —
+see above.
 
 ### U8 — llama4_maverick/HBF+'s TPS edge over HBM4 shrinks at the offline SLO instead of growing
 
@@ -259,24 +250,28 @@ The original finding conflated two things that turned out to have different caus
    *offline batch ceiling is roughly flat, not growing*, but the specific 676→580 *drop* was
    entirely the search bug, now fixed — the two should not be conflated.)
 
-2. **The offline-SLO TPS ratio (0.85× / now 0.846× post-fix) still falling short of "always
-   outperforms," and doing so most at the loosest SLO** — re-verified this pass (see U4's table)
-   and **confirmed unchanged by the batch-search fix**: TPS/GPU barely moved (1535.06→1532.61,
-   <0.2%) because TPOT scaled up proportionally with the corrected (larger, more accurate) batch.
-   This is the **same open residual as U2/U4** (not a new, offline-specific mechanism) — the
-   paper's own Fig. 6 "the more relaxed the SLO, the greater HBF's benefit" claim is not reproduced
-   at the offline end specifically for this one combination (MoE model × all-flash config), for the
-   same unexplained reason U2/U4's gap persists generally. Not further root-caused this pass beyond
-   ruling out the search-bug explanation.
+2. **The offline-SLO TPS ratio — (historical, pre-items-22/24) 0.85×/0.846×, falling short of
+   "always outperforms."** **UPDATE (this session):** re-measured post items 22-24 as part of
+   U4's fresh 4-SLO sweep — offline is now **9.376×**, technically far exceeding "always
+   outperforms," but for the capacity-cliff reason explained in U4 above (a discrete HBM4-side
+   parallelism-fallback penalty), not because the original offline-specific throughput mechanism
+   was found and fixed. **Still not root-caused in the sense the original finding meant** (why
+   HBF+'s own relative benefit doesn't monotonically grow with looser SLOs the way the paper's
+   Fig. 6 claims) — the new number is real but answers a different question than the one this
+   finding originally asked; see U4's caveat before citing this ratio.
 
-**Contrast rows, refreshed this pass with the fixed search** (16-GPU, normalized to 8-GPU HBM4,
-0.05s/0.1s/0.2s/offline):
+**Contrast rows** (16-GPU, normalized to 8-GPU HBM4, 0.05s/0.1s/0.2s/offline). Only the
+llama4/HBF+ row was re-verified this session (post items 22-24); the other two rows are unchanged
+from the pre-items-22/24 pass and may also be affected by the same fixes — not yet re-checked:
 
 | Series | 0.05s | 0.1s | 0.2s | Offline |
 |---|---|---|---|---|
-| llama4/HBF+ (the anomaly) | 0.959× | 1.012× | 1.038× | 0.846× |
-| llama4/HBF, for contrast | 0.819× | 0.870× | 0.895× | 0.906× |
-| llama3/HBF+, for contrast (not re-verified this pass) | 1.15× | 1.34× | 1.43× | 1.47× |
+| llama4/HBF+ (the anomaly), **re-verified this session** | 1.076× | 1.171× | 9.261×‡ | 9.376×‡ |
+| llama4/HBF, for contrast (not re-verified this session) | 0.819× | 0.870× | 0.895× | 0.906× |
+| llama3/HBF+, for contrast (not re-verified this session) | 1.15× | 1.34× | 1.43× | 1.47× |
+
+‡ See U4's capacity-cliff caveat above — not directly comparable to the 0.05s/0.1s cells or to the
+other two rows.
 
 llama4/HBF (1 reserved HBM stack, not all-flash) climbs monotonically toward offline as expected;
 only llama4×HBF+ (all-flash) dips at the offline end — still specific to the **MoE model ×
@@ -284,83 +279,221 @@ all-flash (no reserved HBM) config** combination, as originally observed. **Not 
 
 ## Explained — not bugs
 
-### U3 — Degenerate one-device-per-stage optimizer choices (e.g. PP=8/EP=1/TP=1)
-
-The optimizer can select configs like llama4_maverick's 8-GPU choice (PP=8/EP=1/TP=1) that
-trivially zero every communication term by construction, raising the question of whether the
-latency ranking is biased toward such degenerate configs relative to a middle-ground split (e.g.
-PP=2/EP=4).
-
-**A/B check executed this pass: ranking validated, not a bug.** Forced both PP=8/EP=1 (the
-optimizer's actual choice) and PP=2/EP=4 (the rejected alternative) via direct `distribution.*`
-overrides at llama4/HBM4/8-GPU/SHORT. At the literal reported anchor batch, PP=2/EP=4 doesn't
-even fit (OOM) — PP=8/EP=1 is the only feasible option there. At a smaller batch where both fit:
-
-| Config | Weight | Cache | Measured TPOT |
-|---|---|---|---|
-| PP=8/EP=1/TP=1 (optimizer's choice) | 94.75 GB | 176.82 GB | **0.02449 s** |
-| PP=2/EP=4/TP=1 (rejected alternative) | 103.21 GB | 176.82 GB | 0.02563 s |
-
-Cache is identical between the two (confirming the EP/PP weight-cancellation algebra); PP=2/EP=4's
-weight is ~8.9% higher (confirming that non-expert weight scales with `layers_per_stage`, which is
-4× larger for PP=2, and isn't reduced by EP). Neither pays any communication. **The optimizer's
-chosen config really is faster in the live simulator (~4.6%), not just by its own analytic
-estimate** — the ranking is validated for this pair. This narrows but doesn't fully close the
-general question of whether the ranking could still be biased for some other operating point —
-and indeed U8's search-boundary bug (item 21) shows the search *can* miss a strictly-better config
-at some operating points, though via a different mechanism (a divisibility-driven blind spot in
-the *batch* search, not a latency-ranking bias at a fixed batch).
+*(Note: an item formerly tracked here, "Degenerate one-device-per-stage optimizer choices," was
+found this session to actually be a real, now-fixed bug — see `CHANGES.md` item 26 and `BUGS.md`'s
+former item 8, both consolidated there. Removed from this section since it's no longer a genuine
+"explained, not a bug" finding.)*
 
 ### U5 — "1-GPU HBF/HBF+ per-GPU batch > 8-GPU HBM4, in most cases" (llama3_405B miss)
 
 Holds 5/6 for llama4_maverick but 0/6 (pre-fix) for llama3_405B — e.g. SHORT: 1-GPU HBF = 75 vs.
 8-GPU HBM4 = 194.8 (−61%). **Root-caused as physically correct, not a bug**, and confirmed
-airtight by the simulator's own instrumentation. **Full derivation: see
-`WHY_HBF_1GPU_BATCH_IS_LOW.md`.** Summary: a >400B-parameter dense model at 1 GPU (TP=PP=1, no
-sharding possible) must re-stream its entire weight every decode step, consuming ~63-76% of the
-100ms online SLO before any per-sequence cost — an SLO-bound, not capacity-bound, operating point
-(capacity ceiling ≈2,956 sequences vs. the reported 75). The paper's own text states this exact
-distinction generally: *"HBM4's per-GPU TPS and batch size hardly change across SLOs due to the
-memory-capacity bottleneck, whereas HBF and HBF+ significantly benefit from relaxed SLOs by
-leveraging their large capacity"* (§IV, "Effect of SLO"). No code change proposed.
+airtight by the simulator's own instrumentation.
 
-### U6 — HBF+ KV-write "unhidden" overhead (14.7%@4-GPU → 19.8%@16-GPU of decode time; 0% for HBM4)
+**The claim being checked.** The paper states "1-GPU HBF/HBF+ per-GPU batch exceeds 8-GPU HBM4's,
+in most cases." The full sweep shows this holds 5/6 for llama4_maverick and 3/6 for
+llama3_405B — HBF+ crosses the anchor in all 3 workloads, plain HBF in none:
 
-**Confirmed directly consistent with the paper, not inferred.** The paper's own footnote 2 (p. 3)
-states verbatim: *"Writing the KV cache newly generated during the decode phase can be overlapped
-with computation in the attention layer"* — exactly the mechanism our code implements (hide
-against attention-only compute). The paper's Fig. 5 discussion further states KV-cache writes
-account for "5–13.9% of the execution time in Llama4," increasing "with more GPUs, shorter
-contexts, and the MoE model" — qualitatively matching our measured range (somewhat higher in
-absolute magnitude, not alarming given different exact cells compared). Not a bug; a confirmed
-contributing factor to U2's residual, exactly as the paper's own Takeaway 3 frames it.
+| Workload | 8-GPU HBM4 | 1-GPU HBF | 1-GPU HBF+ |
+|---|---|---|---|
+| SHORT | 194.8 | 97.0 (−50%) | 235.0 (+21%) |
+| MID | 61.9 | 39.0 (−37%) | 81.0 (+31%) |
+| LONG | 3.8 | 2.0 (−47%) | 5.0 (+33%) |
+
+**HBF+ does not exhibit the problem at all** (later fixes shrank the SLO-bound floor enough that
+HBF+ beats the 8-GPU HBM4 anchor everywhere). **Plain HBF still misses at every workload**, and the
+rest of this section explains why plain HBF specifically remains SLO-bound.
+
+**Four pieces of evidence, together airtight.**
+
+1. *The weight-reread floor is real, large, and correctly modeled.* `getLinearMemoryDuration`
+   (`src/hardware/layer_impl.h:17-63`) charges weight-read time as `weight_size /
+   flash_read_bandwidth` plus one exposed flash page-read latency, where `weight_size = k*n*
+   precision` — **no batch-size factor**. This is physically required: in decode, weights are
+   streamed fresh from memory every step regardless of how many sequences are batched together
+   (the batch only changes the *activation* volume, not the weight volume read). llama3_405B
+   (hidden=16384, 126 layers, 128 heads, 8 KV heads, intermediate=53248, BF16) has 401.6B
+   parameters = **803 GB** of weight. At 1 GPU, TP=PP=1 is the *only* legal configuration (nothing
+   else to shard across) — so this entire 803 GB must be re-read from flash every decode step: HBF
+   (1 reserved HBM stack + 7 flash stacks, 11.2 TB/s flash read) ≈ **72 ms**; HBF+ (8 flash stacks,
+   12.8 TB/s) ≈ **63 ms**. Both consume **62–73% of the 100 ms TPOT SLO** before a single
+   sequence's marginal cost is added — not a hidden or synthetic penalty, just the direct
+   consequence of a model this large needing sharding to fit any real compute budget.
+2. *The same formula is independently validated by the anchor that DOES match.* The concern with
+   (1) is "maybe the formula over-charges weight cost, and 8-GPU somehow escapes it by luck." It
+   doesn't: the identical formula at 8-GPU HBM4 (weight sharded 8× via TP×PP, 12.8 TB/s, zero page
+   latency) gives a first-principles capacity ceiling of **≈197 sequences/GPU**, against the
+   simulator's reported **194.8/GPU** — a match to <2%. A bug that inflated the 1-GPU weight cost
+   would also have to leave the independently-matching 8-GPU number untouched, which is not how a
+   shared formula works.
+3. *The 1-GPU HBF operating point is SLO-bound, not capacity-bound — confirmed three ways.*
+   Direct capacity math: HBF's 1-GPU flash pool is 3,620 GB; subtracting the 803 GB weight leaves
+   ~2,817 GB for KV, enough for **≈2,956 sequences** at SHORT context (KV ≈953 MB/seq at
+   ~1660+187 avg tokens) — the reported batch (97) is about **3.3% of the capacity ceiling**.
+   SLO-sensitivity sweep: at 4-GPU, llama3/HBF's batch scales **4.8 → 14.5 → 33.8 → 68.0** across
+   SLO 0.05s/0.1s/0.2s/offline — a ~14× swing driven purely by relaxing the latency budget, vs.
+   HBM4's exactly SLO-invariant 1.8 at every SLO (the signature of capacity-bound, not
+   latency-bound). The harness's own `classify_failure()` distinguishes SRAM-bound from SLO-bound
+   points precisely because the codebase already expects different points to bind on different
+   constraints.
+4. *Independent first-principles reproduction lands in the same regime.* A back-of-envelope model
+   (weight-reread + compute + KV-read + KV-write, correctly sharded/batch-scaled) puts the 1-GPU
+   HBF SLO-limited batch at roughly 100-150 sequences; the simulator's 97 sits at the low end of
+   that range — pricing in attention/softmax compute, HBF's single reserved 1.6 TB/s activation
+   stack (vs. HBF+'s free SRAM activations), and per-op page-read latencies, every one of which
+   further tightens the SLO budget. This also explains why HBF+ (235) beats HBF (97) at 1 GPU:
+   higher bandwidth (12.8 vs 11.2 TB/s) and zero activation-bandwidth cost both shave milliseconds
+   off an SLO budget where weight-read is the binding constraint.
+
+**Why llama4_maverick doesn't show this problem.** llama4_maverick is MoE with top_k=1 of 128
+experts. At 1 GPU its per-step weight-read floor is only the active experts' weight (~1/128th the
+routed-expert pool) plus attention — an order of magnitude smaller than a fully-dense
+403B-parameter reread. Its weight floor never dominates the SLO budget the way llama3's does, so
+its 1-GPU batch is governed by the same capacity/compute trade-off as its 8-GPU case, and the
+"1-GPU beats 8-GPU" pattern holds in 5/6 of its tested combinations.
+
+**Conclusion.** This is a **binding-regime mismatch, not a bug**: HBM4's reported batch is
+capacity-bound (matches the paper); a fully-dense 400B+-parameter model's 1-GPU batch is throttled
+by an un-shardable weight-reread floor under a strict 100ms online SLO — a real architectural
+consequence of trying to serve a model this large from a single GPU, which the SLO (not capacity)
+exposes. The model's true capacity advantage (2,956 vs. 197 sequences — nearly 15×) is real and
+reappears once the SLO is relaxed. No code change proposed for this item.
+
+**Confirmed by the simulator's own instrumentation.** Running `build/run` at this operating point
+(`memory_type: HBF`, `num_device: 1`, `model_name: llama3_405B`, SHORT workload, `max_batch_size:
+75`, `optimize_parallelism: true` — which correctly re-derives TP=PP=DP=EP=1, the only legal
+1-GPU config) and extracting the live per-component decode-step breakdown from the CSV output:
+measured TPOT was 0.09670s — 96.7% of the SLO budget, confirming the operating point is
+SLO-saturating. Breakdown of that 96.7ms: FFN weight-read (gate/up/down) 63.2%, QKV/O-proj
+weight-read 13.5%, KV-write (unhidden) 14.5%, attention KV-read + compute 7.4%, others 1.4%.
+**Combined weight-read = 76.7% — the single dominant cost**, confirming this section's thesis
+directly from the simulator's own instrumentation (the hand estimate above, ~72.6%, is the same
+order/mechanism — the gap is expected since it didn't separately account for attention-projection
+weight-read as distinct from FFN weight-read). KV-write (14.5%) is the clear second-largest term.
+(This breakdown was captured at the older max_batch_size=75 anchor value, before later KV-read/MoE
+fixes moved the converged max batch for this cell to 97 — not re-captured at 97, but the
+mechanism it demonstrates is a property of the model/hardware pair near the SLO boundary, not tied
+to the exact batch number, so it remains valid as illustrative evidence.)
+
+### U6 — HBF+ KV-write "unhidden" overhead (was 14.7%@4-GPU → 19.8%@16-GPU pre-item-24; now ~10-11% post-item-24, 0% for HBM4)
+
+**Confirmed directly consistent with the paper, not inferred — and quantitatively tightened this
+session (item 24).** The paper's own footnote 2 (p. 3) states verbatim: *"Writing the KV cache
+newly generated during the decode phase can be overlapped with computation in the attention
+layer"* — exactly the mechanism our code implements (hide against attention-only compute, kept
+unchanged this session — see item 24's note on why the hiding-budget alternative was rejected).
+The paper's Fig. 5 discussion further states KV-cache writes account for "5–13.9% of the execution
+time in Llama4," increasing "with more GPUs, shorter contexts, and the MoE model." **Pre-item-13,
+our measured range (14.7-19.8% at the real near-SLO batch anchors) sat above the paper's stated
+range** — item 24 found and fixed the reason (KV-write size wasn't windowed for Llama-4's iRoPE
+local-attention layers, unlike the already-windowed KV-read/capacity paths). **Post-item-24
+(combined with items 22-23), the measured range moved to ~9-11%** (measured jointly with the
+pipeline-latency fix, so not a clean isolated before/after at the identical operating point — see
+items 24/23's write-up in `CHANGES.md` for the two measurement passes) — now comfortably inside the
+paper's stated 5-13.9% range. Not a bug, and now a better-calibrated (not just qualitatively
+consistent) contributing factor to U2's residual, exactly as the paper's own Takeaway 3 frames it.
+
+### U7 — HBF+/CONV+ per-GPU batch grows with GPU count instead of staying flat — not a bug, a documented model divergence from the paper's tool
+
+**The claim being checked.** Fig. 3 of the paper marks HBF+/CONV+ bars as **SRAM-bound**: per-GPU
+batch size does not increase once the 320-MB logic-die SRAM ceiling binds, so a larger GPU count
+"does not appear" as a new bar segment (paper's own Fig. 3 caption convention). The paper quotes
+~327 seq/GPU as an example (Llama 4 Maverick). Our full sweep instead shows
+`llama4_maverick / HBF+ / SHORT` growing monotonically with GPU count and tagged
+`bound_reason=slo`, not `sram`:
+
+| GPUs | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| per-GPU batch (current sim) | 730 | 1557.5 | 1964.5 | 2149.0 | 1870.8 |
+| bound_reason | slo | slo | slo | sram | sram |
+
+Same pattern for `llama3_405B / HBF+` and, less dramatically, `llama4_maverick / CONV+`.
+
+**Root cause: two deliberate changes to the intermediate-data footprint formula.**
+`peakIntermediateBytes()` (`src/model/footprint.h`, added during the fairness-audit sprint,
+`CHANGES.md` item 14) replaced an older formula that lived directly in
+`src/hardware/cluster.cpp::checkMemorySize` (present as far back as the repo's initial commit,
+predating any HBF-specific work). The two formulas diverge in exactly two ways: (1)
+`max(attention-phase, FFN-phase)` vs. `sum(attention-phase, FFN-phase)` — the current model
+assumes tensors are produced and consumed sequentially within a layer (attention scratch freed
+before FFN scratch is allocated), so the peak resident set is whichever phase is larger, not their
+total; the original formula summed both, assuming no intra-layer buffer reuse. (2) Excluding vs.
+including the attention-score matrix (`Q·Kᵀ`) — in decode this term is `∝ batch × num_heads ×
+total_context_length`, the only term in the whole footprint that scales with sequence length; the
+current model excludes it entirely (flash/chunked attention never materializes the full score
+matrix — it streams a chunk at a time through a separate, already-budgeted 3.13-MB/stack staging
+buffer), while the original formula counted the full score matrix against the 320-MB pool.
+Analytically, for `llama4_maverick` (hidden=5120, num_heads=40, BF16), the score term is roughly
+93% of the original formula's per-sequence footprint at MID-length context — removing it (plus the
+max/sum change) collapses the per-sequence footprint from hundreds of KB down to ~74 KB, pushing
+the SRAM ceiling from ~300–800 seq/GPU up to ~4,200 seq/GPU. At that ceiling the 0.1s TPOT SLO
+binds first instead, which is why the current sim reports `slo`, not `sram`, and why per-GPU batch
+grows with GPU count (more GPUs → more sharding → lower per-token latency → more batch fits under
+the fixed SLO).
+
+**A/B verification.** Both formulas were built as separate binaries in isolated git worktrees and
+run through the same batch-search harness. Old-style results, `llama4_maverick / HBF+`, 0.1s TPOT
+SLO: SHORT 725/725/725/725/725 (sram-bound, 5/5 GPU counts), MID 288×5 (sram-bound, 5/5), LONG
+19.0/19.5/19.8/19.8/19.8 (sram-bound, 5/5). Restoring the original formula's two changes is
+sufficient to flip every one of these 15 cells from `slo`/growing to `sram`/flat — exactly the
+paper's Fig. 3 regime. `llama3_405B / HBF+ / SHORT` showed the same effect even more cleanly (226
+seq/GPU, flat across all 5 GPU counts, `sram`-bound throughout). The `HBF` control (scarce tier =
+the 1 reserved HBM stack, not the 320 MB SRAM pool) was untouched, as expected, since that gate
+never calls `peakIntermediateBytes`.
+
+One second-order effect: `llama3_405B / HBF+` (and, more mildly, `llama4_maverick / HBF+ / LONG`)
+shows a small batch increase specifically at the 1→2 GPU transition, not perfect flatness from GPU
+1. Root cause, confirmed via the emitted `TP*_DP*` distribution: `ParallelismOptimizer`
+opportunistically switches from `TP=1` to `TP=2` once a second GPU makes it available, because
+several terms in `peakIntermediateBytes` are sharded by `tp` (query/key/value projections, the
+score term) while others are not (the residual stream, the out-projection, and — for MoE models —
+the routed-expert FFN term). This is **not** a bug: the paper's own §III states "each evaluated
+system selects the parallelism configuration that maximizes the achievable system throughput
+subject to all constraints ... by combining data, tensor, pipeline, and expert parallelism" —
+exactly what `ParallelismOptimizer` does.
+
+**Is the current (max, no-score) model more accurate?** Yes, on physical grounds independent of
+which one matches the paper: the score-matrix exclusion is correct for flash/chunked attention
+(FlashAttention provably keeps peak score memory at `O(chunk)`, not `O(context)`; charging the full
+matrix against the 320 MB pool double-counts memory that is never resident in that form and
+already has its own 3.13-MB/stack budget), and `max`-not-`sum` matches production runtime behavior
+(activation buffers are recycled as tensors die, not held for the whole layer — the paper's own
+prose, "much of the intermediate data has a short lifetime, which enables quick release of
+SRAM-buffer space," describes exactly this, even though the paper's own tool evidently did not
+implement it that way per this A/B test). The important caveat: Son et al.'s actual extended
+simulator was never open-sourced (the paper says only "we will open-source our extended LLM
+simulator"). The formula reverted for this test was reverse-engineered from Duplex-era (MICRO'24
+LLMSimulator) bookkeeping code that happened to still be present in `cluster.cpp`, under the
+assumption that the paper's authors extended that pre-existing formula rather than replacing it
+outright — plausible (same codebase lineage, same GQA/MLA math) but unconfirmed, which is also why
+the old-style magnitudes (725/288/19.8 seq/GPU) land in the same order of magnitude as, but not
+exactly on, the paper's quoted 327.
+
+**Conclusion.** This is a **real, understood model divergence**, not a bug in either direction.
+The current simulator's SLO-bound, growing-per-GPU-batch result for HBF+/CONV+ is the direct and
+correctly modeled consequence of two deliberate, physically-motivated departures from the formula
+the paper's own (unpublished) tool most likely used. The A/B experiment confirms the mechanism
+precisely — reverting those two changes reproduces the paper's SRAM-bound, flat-per-GPU-batch
+regime across every tested model and workload — without establishing that the paper's formula is
+the more physically correct one. Given flash/chunked attention and realistic buffer reuse, the
+current model's SRAM ceiling is arguably looser than the paper reports for legitimate reasons; no
+code change is proposed as a result of this investigation. Related to (and separately confirmed
+alongside) U5's SLO-vs-capacity-bound distinction above.
 
 ## Ruled out as causes (for completeness)
 
 Flash bandwidth constants and llama4's weight footprint (746.4 GiB) match the paper's Table I and
 stated figure exactly. Routing skew (`skewness: 0.8`) doesn't reach U1's capacity-bound operating
 point. Parallelism-ranking communication cost is ≤0.6% of decode time in every checked config
-(confirmed further by the U3 A/B check: zero communication either way). The MoE
-activation-divisor bug (resolved item 6 above) is real but confirmed NOT the cause of U1 (SHORT/
+(confirmed further by the forced-config A/B check in `CHANGES.md` item 26: zero communication either way). The MoE
+activation-divisor bug (`CHANGES.md` item 18) is real but confirmed NOT the cause of U1 (SHORT/
 MID anchors byte-identical before/after that fix). `BUGS_HIDDEN_BY_FLAGS.md` entries are all
 masked by pinned config flags (`decode_mode: on`, `disagg_system: off`, `parallel_execution: off`,
 `chunk_size: 0`) and confirmed to have zero effect on any current paper comparison. **This pass:**
 a compute-utilization (MFU) factor, even at a defensible `mfu_max=0.5`, does not by itself close
-U1's gap (see U1). The optimizer's TP all-reduce ring-formula misalignment (item 10) does not
+U1's gap (see U1). The optimizer's TP all-reduce ring-formula misalignment (`CHANGES.md` item 20) does not
 explain U2/U4's residual (both operating points are TP=1, zero communication, unaffected by the
-fix). The batch-search non-monotonicity bug (item 21) does not explain U2/U4's TPS-ratio residual
-(confirmed via full before/after re-sweep — see U4's table) — it only affected the *reported
-batch-size number* at U8's specific operating point, not the throughput metrics U2/U4/U8's TPS
-components are about.
-
-## Harness note
-
-`run_flash_only.py` (the fast 8-GPU-only smoke check, distinct from `run_experiments.py`, the
-paper-comparison harness used for every number in this document) previously used non-canonical
-workload token lengths (`short=(1024,1024)`, `long=(104600,1660)`, no MID) that don't match the
-paper's SHORT/MID/LONG definitions used everywhere in this document — it could not have reproduced
-any of the anchors above even before the other fixes in this pass. Corrected to use the same
-canonical `WORKLOADS` as `run_experiments.py`, and its `"Total: "` stdout parser (which could
-previously mis-parse if a future memory-report line's format changed) was made explicit about
-excluding the `"...GB"`-suffixed memory-report lines. It remains an 8-GPU-only fast check, not a
-substitute for `run_experiments.py` for any paper comparison.
+fix). The batch-search non-monotonicity bug (`CHANGES.md` item 21) does not explain U2/U4's
+TPS-ratio residual (confirmed via full before/after re-sweep — see U4's table) — it only affected
+the *reported batch-size number* at U8's specific operating point, not the throughput metrics
+U2/U4/U8's TPS components are about.

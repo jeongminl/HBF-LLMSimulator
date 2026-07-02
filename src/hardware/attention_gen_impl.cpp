@@ -208,7 +208,7 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
     // Only the unhidden portion of KV write extends the critical path.
     // The write can overlap with the attention compute phase (both Scoring and
     // Context).  exec_status.compute_duration accumulates across both phases.
-    time_ns kv_write = getKVWriteDuration(config, num_seq, num_kv_heads, head_dim, input->precision_byte, false, 0, 0, device->model_config.input_len, device->model_config.output_len);
+    time_ns kv_write = getKVWriteDuration(config, num_seq, num_kv_heads, head_dim, input->precision_byte, false, 0, 0, device->model_config.input_len, device->model_config.output_len, layer_info.local_attention_window);
     time_ns unhidden_write = std::max((time_ns)0, kv_write - exec_status.compute_duration);
     exec_status.total_duration += unhidden_write;
     exec_status.kv_write_duration = unhidden_write;
@@ -868,7 +868,7 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
   input->setShape(orig_shape); // restore orig shape of input
 
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
-    time_ns kv_write = getKVWriteDuration(config, num_seq, num_kv_heads, head_dim, input->precision_byte, compressed_kv, layer_info.kv_lora_rank, qk_rope_head_dim, device->model_config.input_len, device->model_config.output_len);
+    time_ns kv_write = getKVWriteDuration(config, num_seq, num_kv_heads, head_dim, input->precision_byte, compressed_kv, layer_info.kv_lora_rank, qk_rope_head_dim, device->model_config.input_len, device->model_config.output_len, layer_info.local_attention_window);
     // Use total compute (Scoring + Context) for overlap; exec_status.compute_duration
     // accumulates across both phases and is correct here.
     time_ns unhidden_write = std::max((time_ns)0, kv_write - exec_status.compute_duration);
@@ -1946,7 +1946,7 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
   input->setShape(orig_shape); // restore orig shape of input
 
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
-    time_ns kv_write = getKVWriteDuration(config, num_seq, num_kv_heads, head_dim, input->precision_byte, true, kv_lora_rank, qk_rope_head_dim, device->model_config.input_len, device->model_config.output_len);
+    time_ns kv_write = getKVWriteDuration(config, num_seq, num_kv_heads, head_dim, input->precision_byte, true, kv_lora_rank, qk_rope_head_dim, device->model_config.input_len, device->model_config.output_len, layer_info.local_attention_window);
     // Use total compute (Scoring + Context) for overlap; exec_status.compute_duration
     // accumulates across both phases and is correct here.
     time_ns unhidden_write = std::max((time_ns)0, kv_write - exec_status.compute_duration);

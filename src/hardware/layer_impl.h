@@ -123,15 +123,26 @@ inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric 
   return 0;
 }
 
-inline time_ns getKVWriteDuration(const SystemConfig& config, int num_seq, int num_kv_heads, int head_dim, int precision, bool compressed_kv, int kv_lora_rank, int qk_rope_head_dim, int input_len, int output_len) {
+inline time_ns getKVWriteDuration(const SystemConfig& config, int num_seq, int num_kv_heads, int head_dim, int precision, bool compressed_kv, int kv_lora_rank, int qk_rope_head_dim, int input_len, int output_len, int local_attention_window = 0) {
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
     auto& hbf = config.hbf_config;
     double num_new_queries = (double)num_seq / (output_len > 0 ? output_len : 1);
+    // Llama-4 iRoPE: a local layer only ever retains/writes a bounded KV window
+    // (attn_chunk_size), never the full input_len -- matches the cap already
+    // applied to the KV-READ path (see this file's getAttentionMemoryDuration
+    // callers, e.g. attention_gen_impl.cpp's local_attention_window usage) and
+    // the capacity path's effectiveKvLen() (model/model_config.h). Without this,
+    // the write path contradicted the capacity path (claiming to write more KV
+    // than the cache is ever sized to hold). window==0 (every non-iRoPE model,
+    // and any call site that hasn't threaded the per-layer window through) is a
+    // no-op: effective_input_len == input_len, byte-identical to before.
+    int effective_input_len = (local_attention_window > 0)
+        ? std::min(input_len, local_attention_window) : input_len;
     double kv_write_size = 0;
     if (compressed_kv) {
-      kv_write_size = num_new_queries * (kv_lora_rank + qk_rope_head_dim) * input_len * precision;
+      kv_write_size = num_new_queries * (kv_lora_rank + qk_rope_head_dim) * effective_input_len * precision;
     } else {
-      kv_write_size = 2.0 * num_new_queries * num_kv_heads * head_dim * input_len * precision;
+      kv_write_size = 2.0 * num_new_queries * num_kv_heads * head_dim * effective_input_len * precision;
     }
     double write_time = (kv_write_size / hbf.flash_write_bandwidth * 1e9) + hbf.flash_page_program_latency_ns;
     return (time_ns)write_time;

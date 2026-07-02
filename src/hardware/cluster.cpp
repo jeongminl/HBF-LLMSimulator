@@ -26,6 +26,14 @@ Device::Ptr Cluster::get_device(int device_total_rank) {
   return node.at(node_id)->get_device(device_total_rank);
 }
 
+time_ns Cluster::maxDeviceTime() {
+  time_ns max_time = 0;
+  for (int dr = 0; dr < num_total_device; dr++) {
+    max_time = std::max(max_time, get_device(dr)->status.device_time);
+  }
+  return max_time;
+}
+
 void Cluster::add_module(int device_rank, std::string name,
                          Module::Ptr module) {
   auto &module_map_ = module_map.at(device_rank);
@@ -507,7 +515,11 @@ std::vector<Stat> Cluster::runIterationMixed(int iter, std::ofstream &csv) {
 
     auto metadata = scheduler->setMetadata();
     run(metadata);
-    time_ns time = get_device(0)->status.device_time;
+    // maxDeviceTime(), not get_device(0): with pipeline parallelism, only the
+    // slowest-finishing device's status.device_time reflects the true, fully
+    // propagated per-token latency across all pp stages -- see maxDeviceTime()'s
+    // doc comment (cluster.h) and PipelineStage::forward (communication.cpp).
+    time_ns time = maxDeviceTime();
 
     // if no reqeusts, add time
     if (scheduler->getNumProcessToken() == 0) {
@@ -588,7 +600,9 @@ std::vector<Stat> Cluster::runIterationSumGenSplit(int iter,
 
     auto metadata = scheduler->setMetadata();
     run(metadata);
-    time_ns time = get_device(0)->status.device_time;
+    // maxDeviceTime(), not get_device(0) -- see the identical comment in
+    // runIterationMixed above / maxDeviceTime()'s doc comment in cluster.h.
+    time_ns time = maxDeviceTime();
 
     // if no reqeusts, add time
     if (scheduler->getNumProcessToken() == 0) {
@@ -697,7 +711,11 @@ void Cluster::exportGantt(std::string gantt_file_path) {
   }
 }
 void Cluster::setStat(Stat &stat) {
-  time_ns time = get_device(0)->status.device_time;
+  // maxDeviceTime(), not get_device(0) -- see cluster.h's doc comment. Kept as
+  // an independent read (mirroring the caller's own maxDeviceTime() call) since
+  // this function only ever reads device_time right after the same run(), so
+  // the two calls agree exactly.
+  time_ns time = maxDeviceTime();
 
   stat.batchsize = scheduler->getBatchSize();
   stat.average_seq_len = scheduler->getAverageSeqlen();
