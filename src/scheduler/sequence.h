@@ -66,9 +66,6 @@ class Sequence {
   bool sum_stage;
   bool get_expert_from_list;
 
-  time_ns kv_transfer_overhead = 0;
-  bool kv_transferred = false;
-
  private:
   Sequence(int expert_seq_id, int input_len, int output_len);
   std::vector<std::vector<int>> expert_list;  // 2차원 벡터 type,sequence안의

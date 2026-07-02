@@ -26,6 +26,14 @@ struct LayerInfo {
   // 0 = use the global system.chunk_size setting (from config.yaml).
   // Set to a positive value to override chunk granularity for this layer only.
   int chunk_size = 0;
+  // Llama-4-style interleaved local/global ("iRoPE") attention: caps how many KV
+  // positions THIS layer's decode-phase read may cover (see
+  // model/model_config.h's effectiveKvLen()/isGlobalAttentionLayer()). 0 = no cap
+  // (every model preset except llama4_maverick/llama4_scout's local layers) --
+  // matches today's behavior exactly. Only set by SelfAttentionGen::forward()
+  // (module/attention.cpp), consumed by AttentionGenExecutionGPU
+  // (hardware/attention_gen_impl.cpp). See CHANGES.md for the investigation.
+  int local_attention_window = 0;
 };
 
 enum class LayerType {

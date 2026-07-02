@@ -23,7 +23,28 @@ inline time_ns getLinearMemoryDuration(const SystemConfig& config, double m, dou
     if (num_heads > 1) {
       weight_size *= num_heads;
     }
-    double weight_read_time = (weight_size / hbf.flash_read_bandwidth * 1e9) + hbf.flash_page_read_latency_ns;
+    // Weight reads stage through the same per-stack SRAM double-buffer as KV reads
+    // (the paper's methodology describes prefetch/double-buffering generically for
+    // "read data", not scoped to KV specifically -- see getAttentionMemoryDuration's
+    // non-chunked branch below, which this mirrors exactly). Double-buffering means
+    // chunk N+1's page-read latency overlaps chunk N's transfer and is hidden for
+    // every chunk except the first (pipeline fill), which always exposes one full
+    // page latency; if a chunk's transfer time is shorter than the page latency (e.g.
+    // an unusually small SRAM capacity or high page latency), the residual is exposed
+    // per chunk too. Under every current preset's constants, chunk transfer time at
+    // full SRAM capacity exceeds the page latency, so this reduces to exactly one
+    // exposed page latency regardless of weight size or chunk count -- numerically
+    // identical to the old flat one-latency-per-op charge, but now structurally
+    // consistent with (and correct if config constants ever change relative to) the
+    // KV-read model instead of being a special-cased exemption from it.
+    double weight_sram_capacity = (double)hbf.sram_per_stack_bytes * hbf.num_flash_stacks;
+    int weight_num_chunks = (weight_sram_capacity > 0)
+        ? (int)std::ceil((double)weight_size / weight_sram_capacity) : 1;
+    if (weight_num_chunks < 1) weight_num_chunks = 1;
+    double weight_chunk_transfer_ns = weight_sram_capacity / hbf.flash_read_bandwidth * 1e9;
+    double weight_exposed_latency_ns = (double)hbf.flash_page_read_latency_ns +
+        (weight_num_chunks - 1) * std::max(0.0, (double)hbf.flash_page_read_latency_ns - weight_chunk_transfer_ns);
+    double weight_read_time = (weight_size / hbf.flash_read_bandwidth * 1e9) + weight_exposed_latency_ns;
 
     // Activations: input and output are on HBM or logic-die SRAM.
     // When num_hbm_stacks==0 (HBF+/CONV+), activations stage in logic-die SRAM
@@ -51,8 +72,16 @@ inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric 
 
     double kv_read_time = 0;
     if (use_chunked_attention) {
-      // Chunked attention: double-buffering hides read latency per chunk, so we
-      // pay one page-read latency per chunk.  Chunk granularity:
+      // Chunked attention, double-buffered per the paper ("prefetch and double-buffer
+      // read data, thereby minimizing the performance impact of us-scale read
+      // latency"): while chunk N streams out of one SRAM buffer, chunk N+1's page
+      // read is issued into the other buffer, so its latency overlaps chunk N's
+      // transfer and is hidden -- for every chunk EXCEPT the first, which has
+      // nothing to overlap with (pipeline fill) and always exposes one full page
+      // latency. If a chunk's own transfer time is shorter than the page latency
+      // (e.g. an explicit small chunk_size), double-buffering can't fully hide it;
+      // the residual (latency - transfer) per chunk is still exposed. Chunk
+      // granularity:
       //   chunk_size_override > 0 → use caller's value (per-layer override).
       //   config.chunk_size > 0   → use global system setting.
       //   both == 0               → auto = full SRAM staging capacity.
@@ -66,18 +95,23 @@ inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric 
           ? (int)std::ceil((double)kv_read_size / chunk_bytes)
           : 1;
       if (num_chunks < 1) num_chunks = 1;
-      kv_read_time = (kv_read_size / hbf.flash_read_bandwidth * 1e9) + num_chunks * hbf.flash_page_read_latency_ns;
+      double chunk_transfer_ns = chunk_bytes / hbf.flash_read_bandwidth * 1e9;
+      double exposed_latency_ns = (double)hbf.flash_page_read_latency_ns +
+          (num_chunks - 1) * std::max(0.0, (double)hbf.flash_page_read_latency_ns - chunk_transfer_ns);
+      kv_read_time = (kv_read_size / hbf.flash_read_bandwidth * 1e9) + exposed_latency_ns;
     } else {
-      // No chunked attention: if read size exceeds SRAM buffer size, double-buffering fails
-      unsigned long long sram_capacity = hbf.sram_per_stack_bytes * hbf.num_flash_stacks;
-      if (kv_read_size > sram_capacity) {
-        // Pay page read latency for every page (ceil to whole pages, consistent with chunked branch).
-        double num_pages = std::ceil((double)kv_read_size / hbf.page_size_bytes);
-        kv_read_time = (kv_read_size / hbf.flash_read_bandwidth * 1e9) + num_pages * hbf.flash_page_read_latency_ns;
-      } else {
-        // Fits in SRAM: pay page read latency only once
-        kv_read_time = (kv_read_size / hbf.flash_read_bandwidth * 1e9) + hbf.flash_page_read_latency_ns;
-      }
+      // No chunked attention: still double-buffer by SRAM-sized chunks (plane-level
+      // parallelism means flash_page_read_latency is only fully exposed once, for
+      // the pipeline-fill chunk -- see the chunked branch above for the reasoning).
+      double sram_capacity = (double)hbf.sram_per_stack_bytes * hbf.num_flash_stacks;
+      int num_chunks = (sram_capacity > 0)
+          ? (int)std::ceil((double)kv_read_size / sram_capacity)
+          : 1;
+      if (num_chunks < 1) num_chunks = 1;
+      double chunk_transfer_ns = sram_capacity / hbf.flash_read_bandwidth * 1e9;
+      double exposed_latency_ns = (double)hbf.flash_page_read_latency_ns +
+          (num_chunks - 1) * std::max(0.0, (double)hbf.flash_page_read_latency_ns - chunk_transfer_ns);
+      kv_read_time = (kv_read_size / hbf.flash_read_bandwidth * 1e9) + exposed_latency_ns;
     }
 
     double act_time = 0;

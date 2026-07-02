@@ -16,13 +16,18 @@ namespace llm_system {
 class Attention : public Module {
  public:
   using Ptr = std::shared_ptr<Attention>;
+  // layer_idx (0-indexed, model-global): used ONLY to determine whether this layer is
+  // a Llama-4-style local/global attention layer (model_config.h's
+  // isGlobalAttentionLayer()/effectiveKvLen()) -- defaults to 0 (a global layer under
+  // the default attn_global_interval==1, so every existing caller that doesn't pass it
+  // gets today's behavior unchanged).
   [[nodiscard]] static Ptr Create(std::string prefix, std::string name,
                                   const ModelConfig& model_config,
                                   Scheduler::Ptr scheduler,
                                   std::vector<int> device_list,
-                                  Device::Ptr device) {
+                                  Device::Ptr device, int layer_idx = 0) {
     Ptr ptr = Ptr(new Attention(prefix, name, model_config, scheduler,
-                                device_list, device));
+                                device_list, device, layer_idx));
     ptr->set_tensor_module();
     return ptr;
   };
@@ -30,7 +35,7 @@ class Attention : public Module {
  private:
   Attention(std::string& prefix, std::string& name,
             const ModelConfig& model_config, Scheduler::Ptr scheduler,
-            std::vector<int>& device_list, Device::Ptr device);
+            std::vector<int>& device_list, Device::Ptr device, int layer_idx);
   Attention(){};
 
   Tensor::Ptr forward(const Tensor::Ptr input,

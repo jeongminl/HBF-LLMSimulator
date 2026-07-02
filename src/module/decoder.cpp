@@ -11,7 +11,7 @@ namespace llm_system {
 
 Decoder::Decoder(std::string& prefix, std::string& name,
                  const ModelConfig& model_config, Scheduler::Ptr scheduler,
-                 std::vector<int>& device_list, Device::Ptr device)
+                 std::vector<int>& device_list, Device::Ptr device, int layer_idx)
     : Module(prefix, name, device, device_list) {
   int parallel_num = device_list.size();
 
@@ -22,7 +22,7 @@ Decoder::Decoder(std::string& prefix, std::string& name,
 
   assertTrue(parallel_num >= ne_tp_dg,
              "None expert tensor parallel degree is not supported");
-  
+
   // Input & Post-Attn LayerNorm is Standard now //
   auto input_layer_norm = LayerNorm::Create(module_map_name, "input_layer_norm", model_config.hidden_dim,
                 non_moe_device_list, device);
@@ -30,7 +30,7 @@ Decoder::Decoder(std::string& prefix, std::string& name,
 
   if(model_config.qk_rope_head_dim == 0){
     auto attention = Attention::Create(module_map_name, "attention", model_config,
-                                      scheduler, non_moe_device_list, device);
+                                      scheduler, non_moe_device_list, device, layer_idx);
     add_module(attention);
   }
   else{ // MLA
@@ -95,7 +95,7 @@ Tensor::Ptr Decoder::forward(const Tensor::Ptr input,
 MoEDecoder::MoEDecoder(std::string& prefix, std::string& name,
                        const ModelConfig& model_config,
                        Scheduler::Ptr scheduler, std::vector<int>& device_list,
-                       Device::Ptr device)
+                       Device::Ptr device, int layer_idx)
     : Module(prefix, name, device, device_list) {
   int parallel_num = device_list.size();
 
@@ -104,7 +104,7 @@ MoEDecoder::MoEDecoder(std::string& prefix, std::string& name,
 
   std::vector<int> non_moe_device_list;
   set_device_list(non_moe_device_list, ne_tp_offset, ne_tp_dg);
-  
+
   assertTrue(parallel_num >= ne_tp_dg,
              "None expert tensor parallel degree is not supported");
 
@@ -112,10 +112,10 @@ MoEDecoder::MoEDecoder(std::string& prefix, std::string& name,
   auto input_layer_norm = LayerNorm::Create(module_map_name, "input_layer_norm", model_config.hidden_dim,
     non_moe_device_list, device);
   add_module(input_layer_norm);
-  
+
   if(model_config.qk_rope_head_dim == 0){
     auto attention = Attention::Create(module_map_name, "attention", model_config,
-                                      scheduler, non_moe_device_list, device);
+                                      scheduler, non_moe_device_list, device, layer_idx);
     add_module(attention);
   }
   else{ // MLA

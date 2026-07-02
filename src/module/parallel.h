@@ -122,14 +122,22 @@ class BatchedRowParallelLinear : public Module {
 class SelfAttentionParallel : public Module {
  public:
   using Ptr = std::shared_ptr<SelfAttentionParallel>;
+  // gen_max_seq_len: the sequence length used ONLY for the SelfAttentionGen (decode-
+  // phase) sub-module's k_cache/v_cache allocation -- AttentionSplit/SelfAttentionSum/
+  // AttentionMerge (prefill/sum path) always keep the full max_seq_len. Defaults to -1,
+  // meaning "same as max_seq_len" (today's behavior for every model except
+  // llama4_maverick/llama4_scout's local attention layers -- see model/model_config.h's
+  // effectiveKvLen() and layer.cpp's Attention constructor, the only caller that computes
+  // a smaller value).
   [[nodiscard]] static Ptr Create(std::string prefix, std::string name,
                                   int head_dim, int num_heads, int num_kv_heads,
                                   int max_seq_len, int batch_size, int qk_rope_head_dim, bool compressed_kv,
                                   std::vector<int> device_list,
-                                  Device::Ptr device) {
+                                  Device::Ptr device, int gen_max_seq_len = -1) {
     Ptr ptr = Ptr(new SelfAttentionParallel(prefix, name, head_dim, num_heads,
                                             num_kv_heads, max_seq_len,
-                                            batch_size, qk_rope_head_dim, compressed_kv, device_list, device));
+                                            batch_size, qk_rope_head_dim, compressed_kv, device_list, device,
+                                            gen_max_seq_len));
     ptr->set_tensor_module();
     return ptr;
   };
@@ -138,7 +146,7 @@ class SelfAttentionParallel : public Module {
   SelfAttentionParallel(std::string& prefix, std::string& name, int head_dim,
                         int num_heads, int num_kv_heads, int max_seq_len, int qk_rope_head_dim,
                         int batch_size, bool compressed_kv, std::vector<int> device_list,
-                        Device::Ptr device);
+                        Device::Ptr device, int gen_max_seq_len);
   SelfAttentionParallel() = default;
 
   Tensor::Ptr forward(const Tensor::Ptr input,

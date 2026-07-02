@@ -45,6 +45,14 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
 
   // Scoring //
   int num_seq = seq_list.size();
+  // For HBF configs: KV (key cache) is on flash, activations (query + score
+  // output) are on the scarce tier (HBM for HBF, logic SRAM for HBF+). Sizes are
+  // accumulated across all sequences and getAttentionMemoryDuration is called once
+  // after the loop (matches AttentionGen/AttentionMixed) so the flash page-read
+  // latency is paid once per SRAM-sized chunk, not once per sequence.
+  time_ns accumul_compute_duration = 0;
+  hw_metric total_kv_read_size = 0;
+  hw_metric total_act_size = 0;
   for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
     time_ns compute_duration = 0;
     time_ns memory_duration = 0;
@@ -64,22 +72,12 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
     total_memory_size += memory_size;
 
     compute_duration = flops / compute_peak_flops * 1000 * 1000 * 1000;
-    // For HBF configs: KV (key cache) is on flash, activations (query + score
-    // output) are on the scarce tier (HBM for HBF, logic SRAM for HBF+).
-    // Route through getAttentionMemoryDuration so the page-read latency and
-    // tier split are modelled consistently with AttentionGen / AttentionMixed.
     // kv_read_size = k*n*kv_heads (the key cache rows read for scoring);
     // act_size = (query + output score) = (m*k*heads + m*n*heads).
-    // TODO: This calls getAttentionMemoryDuration once per sequence (per-seq page
-    // latency), whereas the gen path (attention_gen_impl.cpp) accumulates sizes
-    // across all sequences and calls once.  Per-seq access is a defensible model
-    // for independent prefill sequences (distinct flash addresses), but the
-    // inconsistency should be re-evaluated against the prefill spec if
-    // prefill / disaggregated experiments are added.
     if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
-      hw_metric kv_read_size = (hw_metric)k * n * num_kv_heads * input->precision_byte;
-      hw_metric act_size = (hw_metric)(m * k * num_heads + m * n * num_heads) * input->precision_byte;
-      memory_duration = getAttentionMemoryDuration(config, kv_read_size, act_size, layer_info.use_chunked_attention, layer_info.chunk_size);
+      total_kv_read_size += (hw_metric)k * n * num_kv_heads * input->precision_byte;
+      total_act_size += (hw_metric)(m * k * num_heads + m * n * num_heads) * input->precision_byte;
+      accumul_compute_duration += compute_duration;
     } else {
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
     }
@@ -152,7 +150,19 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
           getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kWrite, input);
       exec_status += temp;
     }
-    exec_status.total_duration += std::max(compute_duration, memory_duration);
+    // Flash-analytic path (HBF, non-ramulator): memory_duration is deferred to a
+    // single post-loop getAttentionMemoryDuration call (see below) so the page-read
+    // latency is paid once per SRAM chunk, not once per sequence. The ramulator path
+    // still overwrites memory_duration per sequence above (pre-existing behavior,
+    // unrelated to the flash analytic model) and is added here as before.
+    bool defer_to_chunk_aggregate = config.use_hbf && config.hbf_config.num_flash_stacks > 0 && !use_ramulator;
+    if (!defer_to_chunk_aggregate) {
+      exec_status.total_duration += std::max(compute_duration, memory_duration);
+    }
+  }
+  if (config.use_hbf && config.hbf_config.num_flash_stacks > 0 && !use_ramulator) {
+    time_ns accumul_memory_duration = getAttentionMemoryDuration(config, total_kv_read_size, total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size);
+    exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
   }
 
   // Softmax + Scale + Mask//
@@ -217,6 +227,10 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
   }
 
   // Context //
+  // Same aggregate-then-call-once pattern as Scoring above.
+  time_ns context_accumul_compute_duration = 0;
+  hw_metric context_total_kv_read_size = 0;
+  hw_metric context_total_act_size = 0;
   for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
     time_ns compute_duration = 0;
     time_ns memory_duration = 0;
@@ -240,9 +254,9 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
     // Context phase uses the flash model on HBF presets (same as Scoring above).
     // kv_read_size = score(m*k*heads) + V-cache(k*n*kv_heads); act_size = output write (m*n*heads).
     if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
-      hw_metric kv_read_size = (hw_metric)(k * n * num_kv_heads) * input->precision_byte;
-      hw_metric act_size = (hw_metric)(m * k * num_heads + m * n * num_heads) * input->precision_byte;
-      memory_duration = getAttentionMemoryDuration(config, kv_read_size, act_size, layer_info.use_chunked_attention, layer_info.chunk_size);
+      context_total_kv_read_size += (hw_metric)(k * n * num_kv_heads) * input->precision_byte;
+      context_total_act_size += (hw_metric)(m * k * num_heads + m * n * num_heads) * input->precision_byte;
+      context_accumul_compute_duration += compute_duration;
     } else {
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
     }
@@ -315,7 +329,14 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
           getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kWrite, input);
       exec_status += temp;
     }
-    exec_status.total_duration += std::max(compute_duration, memory_duration);
+    bool context_defer_to_chunk_aggregate = config.use_hbf && config.hbf_config.num_flash_stacks > 0 && !use_ramulator;
+    if (!context_defer_to_chunk_aggregate) {
+      exec_status.total_duration += std::max(compute_duration, memory_duration);
+    }
+  }
+  if (config.use_hbf && config.hbf_config.num_flash_stacks > 0 && !use_ramulator) {
+    time_ns context_accumul_memory_duration = getAttentionMemoryDuration(config, context_total_kv_read_size, context_total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size);
+    exec_status.total_duration += std::max(context_accumul_compute_duration, context_accumul_memory_duration);
   }
 
   exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /

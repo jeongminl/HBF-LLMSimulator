@@ -15,13 +15,16 @@ namespace llm_system {
 class Decoder : public Module {
  public:
   using Ptr = std::shared_ptr<Decoder>;
+  // layer_idx (0-indexed, model-global): threaded through to Attention::Create so it
+  // can determine local vs. global attention (Llama-4-style iRoPE) -- see layer.h.
+  // Defaults to 0 (a global layer), so any existing caller not passing it is unaffected.
   [[nodiscard]] static Ptr Create(std::string prefix, std::string name,
                                   const ModelConfig& model_config,
                                   Scheduler::Ptr scheduler,
                                   std::vector<int> device_list,
-                                  Device::Ptr device) {
+                                  Device::Ptr device, int layer_idx = 0) {
     Ptr ptr = Ptr(new Decoder(prefix, name, model_config, scheduler,
-                              device_list, device));
+                              device_list, device, layer_idx));
     ptr->set_tensor_module();
     return ptr;
   };
@@ -29,7 +32,7 @@ class Decoder : public Module {
  private:
   Decoder(std::string& prefix, std::string& name,
           const ModelConfig& model_config, Scheduler::Ptr scheduler,
-          std::vector<int>& device_list, Device::Ptr device);
+          std::vector<int>& device_list, Device::Ptr device, int layer_idx);
   Decoder() = default;
 
   Tensor::Ptr forward(const Tensor::Ptr input,
@@ -39,13 +42,14 @@ class Decoder : public Module {
 class MoEDecoder : public Module {
  public:
   using Ptr = std::shared_ptr<MoEDecoder>;
+  // layer_idx: see Decoder::Create's doc comment above.
   [[nodiscard]] static Ptr Create(std::string prefix, std::string name,
                                   const ModelConfig& model_config,
                                   Scheduler::Ptr scheduler,
                                   std::vector<int> device_list,
-                                  Device::Ptr device) {
+                                  Device::Ptr device, int layer_idx = 0) {
     Ptr ptr = Ptr(new MoEDecoder(prefix, name, model_config, scheduler,
-                                 device_list, device));
+                                 device_list, device, layer_idx));
     ptr->set_tensor_module();
     return ptr;
   };
@@ -53,7 +57,7 @@ class MoEDecoder : public Module {
  private:
   MoEDecoder(std::string& prefix, std::string& name,
              const ModelConfig& model_config, Scheduler::Ptr scheduler,
-             std::vector<int>& device_list, Device::Ptr device);
+             std::vector<int>& device_list, Device::Ptr device, int layer_idx);
   MoEDecoder() = default;
 
   Tensor::Ptr forward(const Tensor::Ptr input,

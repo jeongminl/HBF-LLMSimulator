@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <memory>
 
 #include "common/type.h"
@@ -62,6 +63,10 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
     m = seq->num_process_token;
     k = head_dim;
     n = seq->current_len + seq->num_process_token;
+    // Llama-4-style interleaved local/global attention: cap this layer's KV read at
+    // its effective window (0 = no cap, every model except llama4_maverick/scout's
+    // local layers -- see LayerInfo::local_attention_window / model_config.h).
+    if (layer_info.local_attention_window > 0) n = std::min(n, layer_info.local_attention_window);
 
     for (int kv_idx = 0; kv_idx < num_kv_heads; kv_idx++) {
       flops = m * k * n * 2.0 * attention_group_size;
@@ -117,6 +122,7 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
 
     m = seq->num_process_token;
     n = seq->current_len + seq->num_process_token;
+    if (layer_info.local_attention_window > 0) n = std::min(n, layer_info.local_attention_window);
 
     flops = 7.0 * m * n * num_heads; // scale + mask + softmax
     total_flops += flops;
@@ -140,6 +146,10 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
 
     m = seq->num_process_token;
     k = seq->current_len + seq->num_process_token;
+    // Llama-4-style interleaved local/global attention: same cap as the Scoring loop
+    // above, applied to k (the KV-position count) here since Context swaps k/n vs.
+    // Scoring's roles.
+    if (layer_info.local_attention_window > 0) k = std::min(k, layer_info.local_attention_window);
     n = head_dim;
 
     for (int kv_idx = 0; kv_idx < num_kv_heads; kv_idx++) {

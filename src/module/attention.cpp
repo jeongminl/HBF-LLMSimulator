@@ -18,9 +18,17 @@ SelfAttentionGen::SelfAttentionGen(std::string& prefix, std::string& name,
       head_dim(head_dim),
       num_heads(num_heads),
       num_kv_heads(num_kv_heads),
-      qk_rope_head_dim(qk_rope_head_dim) {
+      qk_rope_head_dim(qk_rope_head_dim),
+      max_seq_len(max_seq_len) {
   int parallel_num = device_list.size();
 
+  // NOTE: for Llama-4-style local/chunked attention layers, the caller
+  // (module/parallel.cpp's SelfAttentionParallel) passes a SMALLER max_seq_len here
+  // than the model's full context length -- see model/model_config.h's
+  // effectiveKvLen(). This correctly shrinks the k_cache/v_cache tensor allocation
+  // (and thus the capacity gate that reads it, hardware/cluster.cpp's
+  // checkMemorySize/checkHeteroMemorySize) for local layers. For every other model
+  // preset (attn_chunk_size==0) this is unchanged: max_seq_len == full context.
   std::vector<int> shape = {max_seq_len, head_dim};
   for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
     for (int kv_idx = 0; kv_idx < num_kv_heads; kv_idx++) {
@@ -60,6 +68,11 @@ Tensor::Ptr SelfAttentionGen::forward(const Tensor::Ptr input,
   layer_info.head_dim = head_dim;
   layer_info.qk_rope_head_dim = qk_rope_head_dim;
   layer_info.use_chunked_attention = true; // chunked attention should always be used regardless of configuration
+  // Llama-4-style interleaved local/global attention: caps this layer's decode-phase
+  // KV read at max_seq_len (see the constructor's comment; for every model except
+  // llama4_maverick/llama4_scout's local layers, max_seq_len == full context, so this
+  // is a no-op and AttentionGenExecutionGPU's cap never triggers).
+  layer_info.local_attention_window = max_seq_len;
 
   std::vector<Tensor::Ptr> tensor_list;
   tensor_list.resize(0);
@@ -445,11 +458,13 @@ AbsorbMLAGen::AbsorbMLAGen(std::string& prefix, std::string& name,
   kv_lora_rank(kv_lora_rank),
   compressed_kv(compressed_kv),
   use_flash_mla(use_flash_mla) {
-  int parallel_num = device_list.size();
-
+  // num_kv_heads is already TP-sharded by the caller (parallel.cpp passes
+  // num_kv_heads/parallel_num) -- do NOT divide by parallel_num again here (that was a
+  // double-division bug: e.g. num_kv_heads=8,tp=8 -> caller passes 1 -> dividing again
+  // gives 1/8=0, a zero-sized activation tensor).
   std::vector<int> latent_kv_shape = {max_seq_len, kv_lora_rank};
   std::vector<int> latent_pe_shape = {max_seq_len, qk_rope_head_dim};
-  std::vector<int> out_shape = {num_kv_heads / parallel_num, max_seq_len, kv_lora_rank};
+  std::vector<int> out_shape = {num_kv_heads, max_seq_len, kv_lora_rank};
 
   for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
     Tensor::Ptr latent_kv_cache = Tensor::Create(
@@ -517,9 +532,10 @@ AbsorbMLASum::AbsorbMLASum(std::string& prefix, std::string& name,
   num_kv_heads(num_kv_heads),
   qk_rope_head_dim(qk_rope_head_dim),
   kv_lora_rank(kv_lora_rank) {
-  int parallel_num = device_list.size();
-
-  std::vector<int> shape = {num_kv_heads / parallel_num, max_seq_len, kv_lora_rank};
+  // num_kv_heads is already TP-sharded by the caller (parallel.cpp passes
+  // num_kv_heads/parallel_num) -- do NOT divide by parallel_num again here (see the
+  // identical fix/comment in AbsorbMLAGen's constructor above).
+  std::vector<int> shape = {num_kv_heads, max_seq_len, kv_lora_rank};
 
   Tensor::Ptr output = Tensor::Create("attn_output", shape, "act", device, device->model_config.precision_byte);
   add_tensor(output);

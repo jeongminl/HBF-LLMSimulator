@@ -10,7 +10,7 @@ namespace llm_system {
 
 Attention::Attention(std::string& prefix, std::string& name,
                      const ModelConfig& model_config, Scheduler::Ptr scheduler,
-                     std::vector<int>& device_list, Device::Ptr device)
+                     std::vector<int>& device_list, Device::Ptr device, int layer_idx)
     : Module(prefix, name, device, device_list) {
   auto attn_qkv_proj = ColumnParallelLinear::Create(
       module_map_name, "attn_qkv_proj", model_config.hidden_dim,
@@ -19,11 +19,19 @@ Attention::Attention(std::string& prefix, std::string& name,
       device_list, device);
   add_module(attn_qkv_proj);
 
+  int full_context_len = model_config.input_len + model_config.output_len;
+  // Llama-4-style interleaved local/global ("iRoPE") attention: local layers only
+  // need to retain/read a bounded window, not the full context -- see
+  // model/model_config.h's effectiveKvLen(). For every model except
+  // llama4_maverick/llama4_scout (attn_chunk_size==0), this equals full_context_len
+  // exactly (backward compatible).
+  int gen_seq_len = (int)effectiveKvLen(model_config, layer_idx, full_context_len);
+
   auto self_attention = SelfAttentionParallel::Create(
       module_map_name, "self_attention", model_config.head_dim,
       model_config.num_heads, model_config.num_kv_heads,
-      model_config.input_len + model_config.output_len, scheduler->batch_size_per_dp, model_config.qk_rope_head_dim, 
-      model_config.compressed_kv, device_list, device);
+      full_context_len, scheduler->batch_size_per_dp, model_config.qk_rope_head_dim,
+      model_config.compressed_kv, device_list, device, gen_seq_len);
   add_module(self_attention);
 
   auto attn_o_proj =

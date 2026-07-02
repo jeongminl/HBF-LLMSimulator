@@ -86,16 +86,23 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
   int e_tp_dg = device->model_config.e_tp_dg;
 
   int num_total_device = device->config.num_device * device->config.num_node;
+  // devices_per_stage = devices sharing ONE pipeline stage's expert allotment
+  // (total_gpus / pp), matching parallelism_optimizer.cpp's `devices_per_stage`
+  // (its weight term at parallelism_optimizer.cpp:123 already divides by this,
+  // not by num_total_device). Dividing by num_total_device here instead was an
+  // 8x undercount for degenerate one-device-per-stage configs (e.g. maverick's
+  // PP=8/EP=1: devices_per_stage=1, so this used to compute 128/8=16 "experts
+  // per device" instead of the correct 128/1=128) -- see BUGS.md/CHANGES.md.
+  int devices_per_stage = num_total_device / device->model_config.pp_dg;
   // Use double: Maverick top_k=1/num_routed=128 gives expert_batch_size=0 as int
   // below batch 128, zeroing all MoE-FFN activation terms in the live-sim gate.
-  double num_routed_expert_per_device = (double)device->model_config.num_routed_expert * e_tp_dg / num_total_device;
+  double num_routed_expert_per_device = (double)device->model_config.num_routed_expert * e_tp_dg / devices_per_stage;
 
   int batch_size_per_dp = scheduler->batch_size_per_dp;
   int total_batch_size = scheduler->total_batch_size;
   double expert_batch_size = device->model_config.expert_freq ? (double)total_batch_size * device->model_config.top_k / device->model_config.num_routed_expert : 0.0;
 
   int input_len = device->model_config.input_len;
-  int total_len = device->model_config.input_len + device->model_config.output_len;
 
   int hidden_dim = device->model_config.hidden_dim;
   int q_lora_rank = device->model_config.q_lora_rank;
@@ -107,73 +114,15 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
 
   long long activation_size = 0;
   if(config.decode_mode){
-    if(device->model_config.use_absorb){
-      activation_size =
-        ((batch_size_per_dp * hidden_dim) + // input seqeunces (or tokens)
-        (batch_size_per_dp * q_lora_rank) + // c_q
-        (batch_size_per_dp * kv_lora_rank) + // c_kv
-        (batch_size_per_dp * qk_rope_head_dim) + // kr
-
-        (batch_size_per_dp * (3.0 * qk_rope_head_dim + head_dim) * num_heads / ne_tp_dg) + // query + rope out + cos/sin
-        (batch_size_per_dp * num_heads * kv_lora_rank / ne_tp_dg) + // tr_k up out
-
-        (batch_size_per_dp * 2.0 * num_heads * total_len / ne_tp_dg) + // attn score out
-        (batch_size_per_dp * num_heads * kv_lora_rank / ne_tp_dg) + // attn context out
-
-        (batch_size_per_dp * num_heads * head_dim / ne_tp_dg) + // v_up out
-        (batch_size_per_dp * hidden_dim) + // out proj out
-
-        // MoE FFN
-        (num_routed_expert_per_device + device->model_config.num_shared_expert) * // routed + shared
-        ((expert_batch_size * 2.0 * expert_intermediate_dim) + // gate proj out + silu out
-        (expert_batch_size * expert_intermediate_dim) + // up proj out
-        (expert_batch_size * hidden_dim))) * // down proj out) 
-        device->model_config.precision_byte;
-    }
-    else if(device->model_config.compressed_kv){ // base w/ compressed kv
-      activation_size =
-        ((batch_size_per_dp * hidden_dim) + // input seqeunces (or tokens)
-        (batch_size_per_dp * q_lora_rank) + // c_q
-        (batch_size_per_dp * kv_lora_rank) + // c_kv
-        (batch_size_per_dp * qk_rope_head_dim) + // kr
-
-        (batch_size_per_dp * (3.0 * qk_rope_head_dim + head_dim) * num_heads / ne_tp_dg) + // query + rope out + cos/sin
-        (batch_size_per_dp * 2.0 * total_len * head_dim * num_heads / ne_tp_dg) + // kv
-
-        (batch_size_per_dp * 2.0 * total_len * num_heads / ne_tp_dg) + // attn score out
-        (batch_size_per_dp * num_heads * head_dim / ne_tp_dg) + // attn context out
-
-        (batch_size_per_dp * hidden_dim) + // out proj out
-
-        // MoE FFN
-        (num_routed_expert_per_device + device->model_config.num_shared_expert) * // routed + shared
-        (2.0 * (expert_batch_size * expert_intermediate_dim) + // gate proj out + silu out
-        (expert_batch_size * expert_intermediate_dim) + // up proj out
-        (expert_batch_size * hidden_dim))) * // down proj out) 
-        device->model_config.precision_byte;
-    }
-    else{ // base
-      activation_size =
-        ((batch_size_per_dp * hidden_dim) + // input seqeunces (or tokens)
-        (batch_size_per_dp * q_lora_rank) + // c_q
-        (batch_size_per_dp * kv_lora_rank) + // c_kv
-        (batch_size_per_dp * qk_rope_head_dim) + // kr
-
-        (batch_size_per_dp * (3.0 * qk_rope_head_dim + head_dim) * num_heads / ne_tp_dg) + // query + rope out + cos/sin
-        (batch_size_per_dp * 2.0 * head_dim * num_heads / ne_tp_dg) + // kv
-
-        (batch_size_per_dp * 2.0 * total_len * num_heads / ne_tp_dg) + // attn score out
-        (batch_size_per_dp * num_heads * head_dim / ne_tp_dg) + // attn context out
-
-        (batch_size_per_dp * hidden_dim) + // out proj out
-
-        // MoE FFN
-        (num_routed_expert_per_device + device->model_config.num_shared_expert) * // routed + shared
-        (2.0 * (expert_batch_size * expert_intermediate_dim) + // gate proj out + silu out
-        (expert_batch_size * expert_intermediate_dim) + // up proj out
-        (expert_batch_size * hidden_dim))) * // down proj out) 
-        device->model_config.precision_byte;
-    }
+    // Peak concurrently-live intermediate-data footprint (not a sum of every
+    // op's output) -- see footprint.h::peakIntermediateBytes. Must stay the
+    // single shared definition with parallelism_optimizer.cpp so the two
+    // scarce-tier gates (Part C below / checkCapacity) never drift apart.
+    activation_size = (long long)peakIntermediateBytes(
+        device->model_config, batch_size_per_dp, ne_tp_dg, expert_batch_size,
+        num_routed_expert_per_device,
+        /*has_moe_layer=*/device->model_config.num_routed_expert > 0,
+        /*has_dense_layer=*/hasDenseFfnLayer(device->model_config));
   }
   else{ // prefill mode & colocated system (mixed)
     if(device->model_config.use_absorb){
@@ -249,8 +198,9 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
     // full scheduler working set, not the per-step peak — using it here would falsely OOM
     // HBF+/CONV+ runs even at batch=1 (see Part E comment below for why it is skipped
     // in the drift harness for the same reason).  The analytic activation_size is computed
-    // above for all decode/prefill branches (lines 107-222) and is the same metric used
-    // by the optimizer's checkCapacity gate, so the two gates are now consistent.
+    // above (peakIntermediateBytes for decode; the older summed formula for prefill/mixed)
+    // and is the same metric used by the optimizer's checkCapacity gate, so the two gates
+    // are consistent for the decode-mode path that all current sweeps use.
     double act_val = activation_size;
     if (act_val > act_limit) {
       out_of_memory = true;
@@ -311,7 +261,14 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
       check_field("total(wgt+kv)", pred_wgt_kv, actual_wgt_kv);
     }
   }
-  if (size > config.memory_capacity) {
+  // Capacity gate (F8 fix): for flash systems, activation already has its own scarce-tier
+  // gate above (Part C -- HBM stack or logic SRAM). Charging it AGAIN here against the
+  // flash weight+KV pool double-counts it and diverges from the optimizer's own
+  // checkCapacity() (footprint.h), which never sums activation into the flash-pool
+  // comparison. For plain HBM systems (no scarce tier), this lumped act+weight+kv check
+  // is the sole legitimate capacity gate, so activation must stay included there.
+  double size_for_capacity_gate = hasScarceTier(config) ? (size - activation_size) : size;
+  if (size_for_capacity_gate > config.memory_capacity) {
     out_of_memory = true;
     if (config.exit_out_of_memory) {
       return true;
@@ -558,6 +515,15 @@ std::vector<Stat> Cluster::runIterationMixed(int iter, std::ofstream &csv) {
       continue;
     }
 
+    // NOTE: unconditionally added regardless of whether this iteration processed
+    // "sum" (prefill) or "gen" (decode) sequences -- unlike runIterationSumGenSplit,
+    // which isolates prefill time into a separate sum_machine_time accumulator. This
+    // is safe ONLY because decode_mode=on (config.yaml) guarantees every sequence is
+    // synthesized already fully prefilled (current_len == input_len at creation, see
+    // scheduler.cpp's pushDummySeq), so hasSumSeq() is always false here and no
+    // prefill time is ever actually accumulated. If decode_mode were ever disabled,
+    // this function has no defensive check and would leak prefill compute time into
+    // the reported decode-only TPOT (INSTRUCTIONS.md Section 3).
     total_time += time;
 
     Stat stat;
@@ -661,36 +627,6 @@ std::vector<Stat> Cluster::runIterationSumGenSplit(int iter,
 
       scheduler->fillSequenceQueue(time, total_time);
       scheduler->fillRunningQueue(sum_machine_time);
-
-      time_ns kv_overhead_in_this_iter = 0;
-      if (get_device(0)->config.use_hbf && get_device(0)->config.hbf_config.num_flash_stacks > 0) {
-        auto& cfg = get_device(0)->config;
-        auto& model_config = get_device(0)->model_config;
-        for (auto batch : scheduler->running_queue) {
-          for (auto seq : batch->get_gen()) {
-            if (!seq->kv_transferred) {
-              long long kv_size = 0;
-              if (model_config.compressed_kv) {
-                kv_size = (long long)model_config.num_layers *
-                          (model_config.kv_lora_rank + model_config.qk_rope_head_dim) *
-                          seq->input_len * model_config.precision_byte;
-              } else {
-                kv_size = 2LL * model_config.num_layers * model_config.num_kv_heads *
-                          model_config.head_dim * seq->input_len * model_config.precision_byte;
-              }
-
-              time_ns write_latency = ((double)kv_size / cfg.hbf_config.flash_write_bandwidth * 1e9) +
-                                      cfg.hbf_config.flash_page_program_latency_ns;
-              time_ns transfer_latency = (double)kv_size / cfg.device_ict_bandwidth * 1e9;
-
-              seq->kv_transfer_overhead = transfer_latency;
-              seq->kv_transferred = true;
-              kv_overhead_in_this_iter += seq->kv_transfer_overhead;
-            }
-          }
-        }
-      }
-      total_time += kv_overhead_in_this_iter;
     }
     // sum machine
     else {

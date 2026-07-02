@@ -132,7 +132,8 @@ SelfAttentionParallel::SelfAttentionParallel(std::string& prefix,
                                              int max_seq_len, int batch_size, int qk_rope_head_dim,
                                              bool compressed_kv,
                                              std::vector<int> device_list,
-                                             Device::Ptr device)
+                                             Device::Ptr device,
+                                             int gen_max_seq_len)
     : Module(prefix, name, device, device_list),
       head_dim(head_dim),
       num_heads(num_heads),
@@ -144,6 +145,10 @@ SelfAttentionParallel::SelfAttentionParallel(std::string& prefix,
   assertTrue(num_heads % parallel_num == 0, "num_head mod parallel_num == 0");
   assertTrue(num_kv_heads % parallel_num == 0,
              "num_kv_head mod parallel_num == 0");
+
+  // -1 sentinel = "same as max_seq_len" (every model except llama4_maverick/scout's
+  // local attention layers -- see Create()'s doc comment in parallel.h).
+  int resolved_gen_max_seq_len = (gen_max_seq_len > 0) ? gen_max_seq_len : max_seq_len;
 
   Module::Ptr attention_split = AttentionSplit::Create(
   module_map_name, "AttentionSplit", head_dim, num_heads / parallel_num,
@@ -157,9 +162,13 @@ SelfAttentionParallel::SelfAttentionParallel(std::string& prefix,
   device);
   add_module(attention_sum);
 
+  // AttentionGen (decode-phase) is the only sub-module that gets the
+  // resolved_gen_max_seq_len (possibly smaller, for Llama-4-style local attention
+  // layers) instead of the full max_seq_len -- this sizes its k_cache/v_cache
+  // allocation (and thus the capacity gate that reads it) correctly for local layers.
   Module::Ptr attention_gen = SelfAttentionGen::Create(
   module_map_name, "AttentionGen", head_dim, num_heads / parallel_num,
-  num_kv_heads / parallel_num, max_seq_len, batch_size, qk_rope_head_dim, device_list,
+  num_kv_heads / parallel_num, resolved_gen_max_seq_len, batch_size, qk_rope_head_dim, device_list,
   device);
   add_module(attention_gen);
 

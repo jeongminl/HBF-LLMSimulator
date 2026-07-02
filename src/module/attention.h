@@ -42,6 +42,11 @@ class SelfAttentionGen : public Module {
   int num_heads;
   int num_kv_heads;
   int qk_rope_head_dim;
+  // max_seq_len as constructed with (may be < the model's full context length for
+  // Llama-4-style local/chunked attention layers -- see model/model_config.h's
+  // effectiveKvLen()). Stored so forward() can populate LayerInfo::local_attention_window,
+  // capping the decode-phase KV read at this layer's effective window.
+  int max_seq_len;
   // std::vector<int> device_list;
 };
 

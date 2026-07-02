@@ -15,11 +15,13 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
 
   // Search space
   for (int tp = 1; tp <= total_gpus; tp *= 2) {
-    // When num_kv_heads >= tp: require even divisibility (each TP rank gets kv_heads/tp KV heads).
-    // When num_kv_heads < tp: physical hardware replicates the KV head across TP ranks;
-    //   the live sim accounts for this via kv_cache_per_gpu = kv_cache_total / tp (unchanged),
-    //   and compute cost is the same as num_kv_heads==1, so allow all tp >= num_kv_heads configs.
-    if (model_config.num_kv_heads >= tp && model_config.num_kv_heads % tp != 0) {
+    // Require even divisibility (each TP rank gets num_kv_heads/tp KV heads). tp >
+    // num_kv_heads is NOT supported by the simulator today -- src/module/parallel.cpp
+    // hard-asserts num_kv_heads % parallel_num == 0 (crashes rather than replicating KV
+    // heads across TP ranks), so a config with tp > num_kv_heads that this optimizer
+    // proposed would make the live simulator abort. Unconditionally excluding it here
+    // caps TP at num_kv_heads; DP/PP make up the remainder of the GPU count.
+    if (model_config.num_kv_heads % tp != 0) {
       continue;
     }
     for (int pp = 1; pp <= total_gpus; pp *= 2) {
@@ -138,13 +140,32 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
 
       double weight_per_gpu = layers_per_stage * (attn_weights_per_gpu + mlp_weights_per_gpu);
 
-      // Determine how many MoE layers are in this PP stage.
-      // Two patterns (mutually exclusive):
-      //   a) first_k_dense > 0: the first N layers are always dense regardless of expert_freq.
-      //      (mirrors isMoELayer() in llm.cpp)
-      //   b) expert_freq > 0: only every expert_freq-th layer is MoE.
-      int dense_in_stage = 0;  // dense layers replacing MoE in this stage (pattern a)
-      int moe_layers_in_stage = layers_per_stage;  // initial assumption: all MoE
+      // Determine how many MoE layers are in this PP stage, using an EXACT per-layer count
+      // (isMoELayer(), shared with llm.cpp's module-construction path -- model/model_config.h)
+      // instead of the old two-pattern approximation. This fixes two bugs in one pass:
+      //   1) first_k_dense handling was gated to `model_name == "deepseekV3"` only, silently
+      //      ignoring it for any other model with first_k_dense>0 (e.g. llama4_maverick/scout).
+      //   2) the expert_freq>1 branch rounded an evenly-averaged count
+      //      (round(total_moe_layers/pp)) instead of counting each stage exactly, which could
+      //      over/under-count a specific stage's MoE-layer weight.
+      // isMoELayer() already honors both first_k_dense and expert_freq for any model, so a
+      // single exact per-stage count replaces both old patterns. We evaluate every stage and
+      // take the HEAVIEST stage's count: this optimizer models one representative PP stage,
+      // and the pipeline throughput / capacity (OOM) gate are both governed by the slowest/
+      // heaviest stage, not an average one.
+      int moe_layers_in_stage = 0;
+      {
+        int lps = (int)layers_per_stage;  // num_layers % pp == 0 is enforced above (line 30)
+        for (int stage = 0; stage < pp; ++stage) {
+          int start_layer = stage * lps;
+          int count = 0;
+          for (int layer = start_layer; layer < start_layer + lps; ++layer) {
+            if (isMoELayer(model_config, layer)) count++;
+          }
+          moe_layers_in_stage = std::max(moe_layers_in_stage, count);
+        }
+      }
+      int non_moe_in_stage = (int)layers_per_stage - moe_layers_in_stage;
       // Weight of a dense FFN layer inside a MoE model (e.g. first_k_dense layers of deepseekV3,
       // or the non-MoE layers of llama4). This uses intermediate_dim (not expert_intermediate_dim).
       // Note: distinct from mlp_weights_per_gpu which, for MoE models, holds the MoE-expert weight.
@@ -152,24 +173,10 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
                                    precision / tp;
 
       if (model_config.num_routed_expert > 0) {
-        if (model_config.model_name == "deepseekV3" && model_config.first_k_dense > 0) {
-          // Pattern a: first first_k_dense layers of stage 0 use dense FFN.
-          dense_in_stage = std::min(model_config.first_k_dense, (int)layers_per_stage);
-          moe_layers_in_stage = layers_per_stage - dense_in_stage;
-          weight_per_gpu -= dense_in_stage * mlp_weights_per_gpu;
-          weight_per_gpu += dense_in_stage * dense_ffn_per_layer;
-        } else if (model_config.expert_freq > 1) {
-          // Pattern b: only num_layers/expert_freq layers are MoE; rest use dense FFN.
-          // We approximate evenly across stages (the actual per-stage count may vary by 1).
-          int total_moe_layers = model_config.num_layers / model_config.expert_freq;
-          moe_layers_in_stage = (total_moe_layers * layers_per_stage + model_config.num_layers / 2)
-                                  / model_config.num_layers;  // rounded
-          int non_moe_in_stage = layers_per_stage - moe_layers_in_stage;
-          // Rebuild weight estimate with correct MoE/dense split.
-          weight_per_gpu = layers_per_stage * attn_weights_per_gpu
-                         + moe_layers_in_stage * mlp_weights_per_gpu
-                         + non_moe_in_stage * dense_ffn_per_layer;
-        }
+        // Rebuild weight estimate with the exact MoE/dense split.
+        weight_per_gpu = layers_per_stage * attn_weights_per_gpu
+                       + moe_layers_in_stage * mlp_weights_per_gpu
+                       + non_moe_in_stage * dense_ffn_per_layer;
       }
 
       // Memory type determination (used both here and in the latency section below).
@@ -228,100 +235,48 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
         }
       }
 
-      // KV cache size
-      double kv_cache_per_gpu = layers_per_stage * (2.0 * sequence_length * (model_config.num_kv_heads / (double)tp) * model_config.head_dim * precision) * batch_size_per_gpu;
+      // KV cache size. Uses effectiveKvLenSumAllLayers() (model/model_config.h) instead of
+      // "layers_per_stage * sequence_length" so Llama-4-style interleaved local/global
+      // attention (attn_chunk_size>0) is accounted for: local layers only read/retain a
+      // bounded window, not the full context. Divide the whole-model sum by pp to get this
+      // representative stage's share (this optimizer evaluates one representative stage, not
+      // a sum across stages -- consistent with weight_per_gpu above). Reduces EXACTLY to
+      // "layers_per_stage * sequence_length" when attn_chunk_size==0 (every other model).
+      double effective_seqsum_per_stage =
+          effectiveKvLenSumAllLayers(model_config, sequence_length) / pp;
+      double kv_cache_per_gpu = effective_seqsum_per_stage *
+          (2.0 * (model_config.num_kv_heads / (double)tp) * model_config.head_dim * precision) *
+          batch_size_per_gpu;
       if (model_config.compressed_kv) {
+        // MLA/deepseek: full-global attention only (attn_chunk_size==0), unaffected by this
+        // change -- kept as the pre-existing whole-context formula.
         kv_cache_per_gpu = layers_per_stage * (model_config.kv_lora_rank + model_config.qk_rope_head_dim) * precision * batch_size_per_gpu * sequence_length;
       }
 
-      // ---- Activation size (per active layer, per GPU) -----------------------
-      // Mirrors cluster.cpp:101-218.  Gated on q_lora_rank!=0 (consistent with cluster.cpp:221).
-      // expert_batch_size: global batch_size * top_k (not batch_per_gpu / num_routed_expert).
-      // num_routed_expert_per_device: matches cluster.cpp:84.
-      double act_size = 0.0;
-
-      // expert_batch_size: matches cluster.cpp:88
-      // (uses total batch, not per-gpu; gated by expert_freq)
+      // ---- Activation size (peak intermediate data, per GPU) -----------------
+      // Gates the scarce tier (36-GB HBM stack for HBF, 320-MB logic SRAM for
+      // HBF+/CONV+) against the PEAK concurrently-live footprint, not a sum of
+      // every op's output -- see footprint.h::peakIntermediateBytes for why
+      // (paper: intermediate data has a short lifetime and is quickly
+      // released; the seq-length-scaled attention-score/decompressed-KV terms
+      // stream through a separate double-buffer and are excluded entirely).
+      // expert_batch_size: matches cluster.cpp:88 (uses total batch, not
+      // per-gpu; gated by expert_freq). num_routed_expert_per_device: matches
+      // cluster.cpp:84, and now divides by devices_per_stage (not total_gpus),
+      // mirroring the weight term's already-correct pattern above (:123) --
+      // dividing by total_gpus was an 8x undercount for degenerate
+      // one-device-per-stage configs (e.g. PP=8/EP=1: devices_per_stage=1).
       double expert_batch_size = (model_config.expert_freq > 0 && model_config.num_routed_expert > 0)
           ? (double)batch_size * model_config.top_k / model_config.num_routed_expert
           : 0.0;
-      // num_routed_expert_per_device: matches cluster.cpp:84
       double num_routed_expert_per_device = (model_config.num_routed_expert > 0)
-          ? (double)model_config.num_routed_expert * e_tp_dg / total_gpus
+          ? (double)model_config.num_routed_expert * e_tp_dg / devices_per_stage
           : 0.0;
-
-      if (model_config.q_lora_rank != 0) {
-        // MLA activation (decode path): mirrors cluster.cpp:107-174 exactly.
-        // Branch priority matches cluster.cpp: use_absorb > compressed_kv > base.
-        // sequence_length == cluster's total_len (eval/test.cpp:273 passes input+output).
-        double ffn_act = (num_routed_expert_per_device + model_config.num_shared_expert) *
-                         (2.0 * expert_batch_size * model_config.expert_intermediate_dim +
-                          expert_batch_size * model_config.expert_intermediate_dim +
-                          expert_batch_size * hidden_dim);
-        // Common prefix terms (identical in all three cluster.cpp MLA branches):
-        double common_prefix =
-            (batch_size_per_gpu * hidden_dim) +                                     // input tokens
-            (batch_size_per_gpu * model_config.q_lora_rank) +                       // c_q
-            (batch_size_per_gpu * model_config.kv_lora_rank) +                      // c_kv
-            (batch_size_per_gpu * model_config.qk_rope_head_dim) +                  // kr
-            (batch_size_per_gpu * (3.0 * model_config.qk_rope_head_dim +
-             model_config.head_dim) * model_config.num_heads / tp);                 // query+rope+cos/sin
-        if (model_config.use_absorb) {
-          // Mirrors cluster.cpp:108-129.
-          act_size = (common_prefix +
-                      (batch_size_per_gpu * model_config.num_heads *
-                       model_config.kv_lora_rank / tp) +                            // tr_k up out
-                      (batch_size_per_gpu * 2.0 * sequence_length *
-                       model_config.num_heads / tp) +                               // attn score out
-                      (batch_size_per_gpu * model_config.num_heads *
-                       model_config.kv_lora_rank / tp) +                            // attn context out
-                      (batch_size_per_gpu * model_config.num_heads *
-                       model_config.head_dim / tp) +                                // v_up out
-                      (batch_size_per_gpu * hidden_dim) +                           // out proj
-                      ffn_act) * precision;
-        } else if (model_config.compressed_kv) {
-          // Mirrors cluster.cpp:131-151.
-          act_size = (common_prefix +
-                      (batch_size_per_gpu * 2.0 * sequence_length * model_config.head_dim *
-                       model_config.num_heads / tp) +                               // kv
-                      (batch_size_per_gpu * 2.0 * sequence_length *
-                       model_config.num_heads / tp) +                               // attn score out
-                      (batch_size_per_gpu * model_config.num_heads *
-                       model_config.head_dim / tp) +                                // attn context out
-                      (batch_size_per_gpu * hidden_dim) +                           // out proj
-                      ffn_act) * precision;
-        } else {
-          // Base MLA branch: mirrors cluster.cpp:153-173.
-          act_size = (common_prefix +
-                      (batch_size_per_gpu * 2.0 * model_config.head_dim *
-                       model_config.num_heads / tp) +                               // kv
-                      (batch_size_per_gpu * 2.0 * sequence_length *
-                       model_config.num_heads / tp) +                               // attn score out
-                      (batch_size_per_gpu * model_config.num_heads *
-                       model_config.head_dim / tp) +                                // attn context out
-                      (batch_size_per_gpu * hidden_dim) +                           // out proj
-                      ffn_act) * precision;
-        }
-      } else {
-        // Non-MLA activation
-        double ffn_act = 0.0;
-        if (model_config.num_routed_expert > 0) {
-          ffn_act = (num_routed_expert_per_device + model_config.num_shared_expert) *
-                    (3.0 * expert_batch_size * model_config.expert_intermediate_dim +
-                     expert_batch_size * hidden_dim);
-        }
-        act_size = ((batch_size_per_gpu * hidden_dim) +
-                    (batch_size_per_gpu * model_config.q_lora_rank) +
-                    (batch_size_per_gpu * model_config.kv_lora_rank) +
-                    (batch_size_per_gpu * model_config.qk_rope_head_dim) +
-                    (batch_size_per_gpu * (3.0 * model_config.qk_rope_head_dim + model_config.head_dim) *
-                     model_config.num_heads / tp) +
-                    (batch_size_per_gpu * 2.0 * model_config.num_heads * model_config.head_dim / tp) +
-                    (batch_size_per_gpu * 2.0 * sequence_length * model_config.num_heads / tp) +
-                    (batch_size_per_gpu * model_config.num_heads * model_config.head_dim / tp) +
-                    (batch_size_per_gpu * hidden_dim) +
-                    ffn_act) * precision;
-      }
+      double act_size = peakIntermediateBytes(
+          model_config, batch_size_per_gpu, tp, expert_batch_size,
+          num_routed_expert_per_device,
+          /*has_moe_layer=*/model_config.num_routed_expert > 0,
+          /*has_dense_layer=*/hasDenseFfnLayer(model_config));
 
       // ---- Memory limit verification (via shared checkCapacity) ---------------
       // Uses hbm_per_stack_bytes and the same partitioning rule as cluster.cpp (via footprint.h).
@@ -345,8 +300,21 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
 
       // Fix 2b: per-op page-read latency.
       // The simulator calls getLinearMemoryDuration once per linear op (layer_impl.h:17),
-      // each paying one flash_page_read_latency_ns.  We count distinct ops per layer to
-      // match the cycle model.  HBM path has page_lat_per_ns=0 so page_lat_total==0.
+      // which now double-buffers each weight read through the same per-stack SRAM
+      // staging mechanic as KV reads (audit F2 fix): exposed latency per op is
+      // page_lat + (num_chunks-1)*max(0, page_lat-chunk_transfer). Under every current
+      // preset's constants, chunk-transfer time at full SRAM capacity exceeds the page
+      // latency for both HBF/HBF+ (1us) and CONV/CONV+ (3us), so this reduces to exactly
+      // ONE exposed page latency per op regardless of the op's weight size or chunk
+      // count -- i.e. `ops * page_lat_per_ns` below already matches the simulator's
+      // per-op chunked model exactly. This equivalence would break only if a future
+      // preset made chunk-transfer-at-full-SRAM-capacity shorter than the page latency
+      // (e.g. much higher bandwidth or much higher page latency than any current
+      // preset) -- if that ever happens, this formula would need to become genuinely
+      // per-op-size-aware (this aggregate model doesn't track individual op weight
+      // sizes) to stay in lock-step with layer_impl.h's getLinearMemoryDuration.
+      // We count distinct ops per layer to match the cycle model.  HBM path has
+      // page_lat_per_ns=0 so page_lat_total==0.
       //
       //   attn_ops: MLA-absorb=8 (q_down, kv_down, kr, q_up, qr, tr_k_up, v_up, o_proj)
       //             MLA-base≈7 (without separate tr_k_up/v_up expansion)
@@ -403,8 +371,16 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
             ? (int)std::ceil(kv_read_size / chunk_bytes)
             : 1;
         if (num_chunks < 1) num_chunks = 1;
-        kv_read_time = (kv_read_size / hbf.flash_read_bandwidth * 1e9) +
-                       num_chunks * (double)hbf.flash_page_read_latency_ns;
+        // Double-buffered: page-read latency for chunk N+1 overlaps chunk N's
+        // transfer, so only the first (pipeline-fill) chunk fully exposes it;
+        // later chunks expose only the residual if a chunk's own transfer time
+        // is shorter than the page latency. Must stay in lock-step with
+        // getAttentionMemoryDuration (layer_impl.h) -- see its comment for the
+        // full reasoning.
+        double chunk_transfer_ns = chunk_bytes / hbf.flash_read_bandwidth * 1e9;
+        double exposed_latency_ns = (double)hbf.flash_page_read_latency_ns +
+            (num_chunks - 1) * std::max(0.0, (double)hbf.flash_page_read_latency_ns - chunk_transfer_ns);
+        kv_read_time = (kv_read_size / hbf.flash_read_bandwidth * 1e9) + exposed_latency_ns;
       } else {
         kv_read_time = kv_read_size / system_config.memory_bandwidth * 1e9;
       }
@@ -427,8 +403,15 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
         }
         double single_layer_kv_write = (kv_write_size / hbf.flash_write_bandwidth * 1e9) +
                                        (double)hbf.flash_page_program_latency_ns;
-        double single_layer_compute  = compute_time / layers_per_stage;
-        double unhidden_write = std::max(0.0, single_layer_kv_write - single_layer_compute);
+        // Hiding budget is ATTENTION-ONLY compute (not attn+FFN), matching the simulator's
+        // basis exactly: attention_gen_impl.cpp's unhidden_write = max(0, kv_write -
+        // exec_status.compute_duration) only accumulates the attention kernel's own
+        // compute time (FFN runs as a separate module/kernel and never contributes to
+        // this overlap). Using total per-layer compute here would over-credit hiding and
+        // under-count the write penalty relative to the simulator.
+        double attn_flops_per_layer = 2.0 * attn_weights_params * batch_size_per_gpu / tp;
+        double single_layer_attn_compute = attn_flops_per_layer / system_config.compute_peak_flops * 1e9;
+        double unhidden_write = std::max(0.0, single_layer_kv_write - single_layer_attn_compute);
         kv_write_time = unhidden_write * layers_per_stage;
       }
 
@@ -495,11 +478,12 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
         total_latency_ns += scatter_time;
       }
 
+      // NOTE: estimated_latency_ms is used only to RANK capacity-feasible candidates
+      // (see selection below) — it must never set config.oom. The simulator's
+      // measured tpot is the sole SLO arbiter (see run_experiments.py's
+      // analytic-search-then-simulator-verify batch search). Capacity/SRAM (checked
+      // above via checkCapacity) remain the only hard feasibility constraints here.
       config.estimated_latency_ms = total_latency_ns / 1e6 * system_config.latency_margin;
-      if (!config.oom && config.estimated_latency_ms > tpot_slo_ms) {
-        config.oom = true;
-        config.oom_reason = "TPOT SLO exceeded (" + std::to_string(config.estimated_latency_ms) + " ms > " + std::to_string(tpot_slo_ms) + " ms)";
-      }
 
       // Part E: store predicted footprint for the drift harness
       config.pred_weight_bytes = weight_per_gpu;

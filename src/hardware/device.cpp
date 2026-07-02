@@ -40,7 +40,13 @@ Device::Device(SystemConfig config, int device_total_rank, Cluster_ptr cluster)
   if(config.gpu_gen == "H100"){
     dram_cfg_path = "./dram_config_HBM3_80GB.yaml";
   }
-  else if(config.gpu_gen == "B100" || config.gpu_gen == "B200"){
+  else if(config.gpu_gen == "B100" || config.gpu_gen == "B200" || config.gpu_gen == "Rubin"){
+    // Rubin has no dedicated Ramulator2 DRAM config file (its real HBM generation isn't
+    // one of the presets below); reuse B100/B200's HBM3E file as a placeholder. This is
+    // inert for every sweep in this repo -- use_ramulator is always false, so
+    // DRAMInterface/MMapController are constructed but never actually driven, and the
+    // flash-preset memory_capacity/memory_bandwidth override (eval/test.cpp) is what
+    // actually governs simulated behavior regardless of this file's contents.
     dram_cfg_path = "./dram_config_HBM3E_192GB.yaml";
   }
   YAML::Node cfg = YAML::LoadFile(dram_cfg_path);
@@ -54,8 +60,8 @@ Device::Device(SystemConfig config, int device_total_rank, Cluster_ptr cluster)
     memory_config.num_cube = config.num_cube;
     memory_config.num_logic_cube = config.num_logic_cube;
   }
-  else if((config.gpu_gen == "B100") || (config.gpu_gen == "B200")){
-    // B100, HBM3E 192GB, 8Gbps
+  else if((config.gpu_gen == "B100") || (config.gpu_gen == "B200") || (config.gpu_gen == "Rubin")){
+    // B100/B200/Rubin, HBM3E 192GB, 8Gbps (see dram_cfg_path comment above re: Rubin)
     memory_scale_factor = 0.5; // 8.0Gbps pin rate's ideal bandwidth = 8000, tCK = 2000, 1 / 2GHz = 0.5
     memory_config = hbm3e_192GB;
     memory_config.num_cube = config.num_cube;

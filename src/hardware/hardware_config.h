@@ -171,9 +171,14 @@ class SystemConfig {
   double validate_optimizer_threshold = 0.10;  // relative divergence threshold (10%)
 
   // optimizer_latency_model: "sum" | "max"
-  //   sum – conservative: compute + memory (current default, never under-predicts)
-  //   max – tighter: max(compute, memory) per stage, hidden behind compute
-  std::string optimizer_latency_model = "sum";
+  //   sum – conservative: compute + memory (never under-predicts, but diverges
+  //         further from the simulator's own std::max()-based overlap model)
+  //   max – tighter: max(compute, memory) per stage, hidden behind compute; tracks
+  //         the simulator's overlap behavior closely, which is what the batch-size
+  //         search (run_experiments.py) relies on to rank candidates before
+  //         simulator verification (default: this is a ranking heuristic only —
+  //         the simulator's measured tpot is the sole SLO arbiter)
+  std::string optimizer_latency_model = "max";
   double latency_margin = 1.0;  // multiplicative safety margin on the estimated latency
 
   // Chunked-attention chunk granularity, in BYTES of KV staged per chunk.
@@ -323,6 +328,57 @@ static SystemConfig B200 = SystemConfig(
                  false,                             // communication_hiding
                  false,                             // disagg_system
                  false,                             // use_low_unit_moe_only 
+                 false,                             // use_ramulator
+                 true,                              // exit_out_of_memory
+                 false,                             // mem_cap_limit
+                 true,                              // use_flash_mla
+                 true,                              // use_flash_attention
+                 false,                             // reuse_kv_cache
+                 0.0,                               // kv_cache_reuse_rate
+                 false,                             // prefill_mode
+                 false,                             // decode_mode
+                 false,                             // use_inject_rate
+                 10,                                // request_per_second
+                 8,                                 // num_cube
+                 8                                  // int num_logic_cube
+                 );
+
+// Rubin: models the NVIDIA DGX Rubin NVL8 reference GPU that the "Exploring High-Bandwidth
+// Flash for Modern LLM Inference" paper (Son et al.) cites as its "state-of-the-art GPU-core
+// architecture" for all five evaluated memory configs. compute_peak_flops is ESTIMATED, not
+// directly sourced: the datasheet publishes only "NVFP4 inference: 400 PFLOPS" and "FP8/FP6
+// training (dense): 140 PFLOPS" aggregate across the system's 8 GPUs -- no FP16 figure is
+// given. Per-GPU dense FP8/FP6 = 140 PFLOPS / 8 = 17.5 PFLOPS; halving that (matching this
+// file's existing FP16-base-then-double-for-FP8 convention, see eval/test.cpp's
+// "precision_byte==1: compute_peak_flops *= 2") gives an estimated FP16 base of 8.75 PFLOPS.
+// memory_bandwidth/memory_capacity below are placeholders derived the same way (176 TB/s / 8,
+// 2.3 TB / 8) but are NOT load-bearing: eval/test.cpp always overwrites
+// system_config.memory_capacity/memory_bandwidth from the selected hbf_memory_config.h preset
+// once system.memory_type is set (true in every sweep), so only compute_peak_flops (and
+// device_ict_bandwidth, itself separately overridden by nvlink_gen) actually affect results.
+static SystemConfig Rubin = SystemConfig(
+                 "Rubin",                           // gpu gen
+                 1,                                 // num_node
+                 2,                                 // num_device
+                 130.0,                             // node_ict_latency, connectx-7
+                 50.0 * 1000 * 1000 * 1000,         // node_ict_bandwidth
+                 0.8 * 1000,                        // device_ict_latency, nvlink 6.0
+                 900.0 * 1000 * 1000 * 1000,        // device_ict_bandwidth
+                 8750.0 * 1000 * 1000 * 1000 * 1000,// compute_peak_flops, FP16 (ESTIMATED, see comment above)
+                 22.0 * 1000 * 1000 * 1000 * 1000,  // memory_bandwidth (176 TB/s / 8, not load-bearing)
+                 287.5 * 1024 * 1024 * 1024,        // memory_capacity (2.3 TB / 8, not load-bearing)
+                 4,                                 // logic_x
+                 8,                                 // logic_op_b
+                 16,                                // pim_x
+                 1,                                 // pim_op_b
+                 {},                                // processor_type
+                 false,                             // parallel_execution
+                 false,                             // hetero_subbatch
+                 ProcessorType::GPU,                // high_processor_type
+                 ProcessorType::LOGIC,              // low_processor_type
+                 false,                             // communication_hiding
+                 false,                             // disagg_system
+                 false,                             // use_low_unit_moe_only
                  false,                             // use_ramulator
                  true,                              // exit_out_of_memory
                  false,                             // mem_cap_limit

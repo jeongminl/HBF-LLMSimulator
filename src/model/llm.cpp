@@ -8,17 +8,8 @@
 
 namespace llm_system {
 
-// Returns true if the given layer index is a MoE (routed-expert) layer.
-// Honors both first_k_dense (the first N layers are always dense regardless of
-// expert_freq) and expert_freq (every expert_freq-th layer is MoE).
-// Works for ALL models, not just deepseekV3: deepseekV3 uses first_k_dense only,
-// llama4/mixtral use expert_freq only, dense models have expert_freq==0.
-static bool isMoELayer(const ModelConfig& mc, int layer) {
-  if (mc.num_routed_expert == 0) return false;              // dense model
-  if (mc.first_k_dense > 0 && layer < mc.first_k_dense) return false; // forced-dense prefix
-  if (mc.expert_freq == 0) return true;                     // all remaining layers are MoE
-  return (layer % mc.expert_freq == 0);
-}
+// isMoELayer() moved to model/model_config.h (shared with parallelism_optimizer.cpp so the
+// module-construction path and the optimizer never disagree on which layers are MoE).
 
 LLM::LLM(const ModelConfig& model_config, Cluster::Ptr cluster,
          Scheduler::Ptr scheduler, Device::Ptr device)
@@ -64,12 +55,12 @@ LLM::LLM(const ModelConfig& model_config, Cluster::Ptr cluster,
     if (isMoELayer(model_config, layer)) {
       auto moe_decoder = MoEDecoder::Create(
           module_map_name, "MoE_decoder_" + std::to_string(layer),
-          model_config, scheduler, stage_device_list, device);
+          model_config, scheduler, stage_device_list, device, layer);
       add_module(moe_decoder);
     } else {
       auto decoder =
           Decoder::Create(module_map_name, "decoder_" + std::to_string(layer),
-                          model_config, scheduler, stage_device_list, device);
+                          model_config, scheduler, stage_device_list, device, layer);
       add_module(decoder);
     }
   }

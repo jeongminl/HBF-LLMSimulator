@@ -57,6 +57,9 @@ int main(int argc, char *argv[]) {
   else if (config["system"]["gpu_gen"].as<std::string>() == "B200"){
     system_config = B200;
   }
+  else if (config["system"]["gpu_gen"].as<std::string>() == "Rubin"){
+    system_config = Rubin;
+  }
   else{
     fail("No GPU generation information");
   }
@@ -130,6 +133,19 @@ int main(int argc, char *argv[]) {
   // Chunked-attention chunk size (bytes); 0 = auto (per-stack SRAM staging capacity).
   if (config["system"]["chunk_size"]) {
     system_config.chunk_size = config["system"]["chunk_size"].as<int>();
+    // Sanity guard: a value strictly between 0 and one flash page (4 KiB) is almost
+    // certainly a tokens-vs-bytes unit mistake (chunk_size is BYTES, not tokens) rather
+    // than an intentional sub-page micro-chunk request -- reject early rather than let it
+    // silently multiply the flash page-read-latency count by ~1000x.
+    if (system_config.chunk_size > 0 &&
+        system_config.chunk_size < (int)system_config.hbf_config.page_size_bytes) {
+      fail("system.chunk_size (" + std::to_string(system_config.chunk_size) +
+           " bytes) is smaller than one flash page (" +
+           std::to_string(system_config.hbf_config.page_size_bytes) +
+           " bytes) -- this is almost certainly a tokens-vs-bytes unit mistake "
+           "(chunk_size must be specified in BYTES). Use 0 for auto (full SRAM "
+           "staging capacity) or a value >= page_size_bytes.");
+    }
   }
 
 
@@ -264,6 +280,125 @@ int main(int argc, char *argv[]) {
         config["simulation"]["latency_margin"].as<double>();
   }
 
+  // ---- Analytic-only batch-size sweep (F1 fix) -----------------------------
+  // Find the largest batch B for which SOME parallelism config satisfies
+  // capacity/SRAM (checkCapacity, inside Optimize()) AND the analytic
+  // max()-model estimated latency is <= SLO -- using ONLY in-process Optimize()
+  // calls. No Scheduler/Cluster/Model is constructed and no discrete-event
+  // simulation runs, so this is cheap enough to run the full two-phase
+  // (exponential bounds + binary search) sweep in one process. This lets
+  // run_experiments.py bound the batch search without spawning a full-simulation
+  // subprocess at every probed batch value; the simulator remains the sole SLO
+  // arbiter via a small number of follow-up verification runs (this binary's
+  // normal optimize_parallelism path, invoked separately per candidate batch).
+  bool analytic_sweep_only = false;
+  if (config["system"]["analytic_sweep_only"]) {
+    analytic_sweep_only = config["system"]["analytic_sweep_only"].as<bool>();
+  }
+  if (analytic_sweep_only) {
+    int total_gpus = num_node * num_device;
+    double tpot_slo_ms = 100.0;
+    if (config["system"]["tpot_slo"]) {
+      tpot_slo_ms = config["system"]["tpot_slo"].as<double>() * 1000.0;
+    }
+    int seq_len = input_len + output_len;
+
+    // capacity_feasible: the ONLY hard, exact constraint (GPU memory capacity + the
+    // SRAM/intermediate-data limit) -- Optimize() never sets oom for latency (see F1 fix
+    // in parallelism_optimizer.cpp), so !out.oom here means purely "some parallelism
+    // config's weights+KV+activation footprint fits."
+    auto capacity_feasible = [&](int b, ParallelConfig& out) -> bool {
+      out = ParallelismOptimizer::Optimize(model_config, system_config, total_gpus, b, seq_len, tpot_slo_ms);
+      return !out.oom;
+    };
+    // slo_feasible: capacity-feasible AND the analytic max()-model latency estimate is
+    // <= SLO. This is a RANKING/SEARCH heuristic only (INSTRUCTIONS.md Section 6) -- it
+    // must never by itself be reported as a rejection; the caller (run_experiments.py)
+    // always verifies with the real simulator before treating any batch as infeasible.
+    auto slo_feasible = [&](int b, ParallelConfig& out) -> bool {
+      return capacity_feasible(b, out) && out.estimated_latency_ms <= tpot_slo_ms;
+    };
+
+    ParallelConfig cand;
+    if (!capacity_feasible(1, cand)) {
+      // Not even a single sequence fits under any parallelism config. This IS a
+      // legitimate analytic-only rejection (exact capacity/SRAM constraint) -- no
+      // simulator run can rescue it, unlike a pure-latency-estimate rejection.
+      std::cout << "ANALYTIC_CAP_FEASIBLE_AT_1: 0" << std::endl;
+      std::cout << "ANALYTIC_MAX_BATCH: 0" << std::endl;
+      return 0;
+    }
+    std::cout << "ANALYTIC_CAP_FEASIBLE_AT_1: 1" << std::endl;
+    ParallelConfig best = cand;  // B=1's config; always a safe fallback to print/report
+    int b_success = 0;          // no SLO-feasible batch confirmed yet
+
+    // Phase 0: find the capacity/SRAM ceiling B_cap directly. Capacity feasibility is
+    // exact and monotonic (see plan's envelope-monotonicity argument), so this needs no
+    // exponential-doubling-from-1 search of its own -- just bracket-then-binary-search to
+    // pin the exact ceiling (bounded defensively at 2^30 purely as an infinite-loop guard,
+    // never expected to trigger since capacity always eventually fails for large enough B).
+    int cap_success = 1;
+    int cap_fail = -1;
+    int b = 2;
+    while (b <= (1 << 30)) {
+      if (capacity_feasible(b, cand)) {
+        cap_success = b;
+        b *= 2;
+      } else {
+        cap_fail = b;
+        break;
+      }
+    }
+    int b_cap = cap_success;
+    if (cap_fail > 0) {
+      int low = cap_success + 1;
+      int high = cap_fail - 1;
+      while (low <= high) {
+        int mid = low + (high - low) / 2;
+        if (capacity_feasible(mid, cand)) {
+          b_cap = mid;
+          low = mid + 1;
+        } else {
+          high = mid - 1;
+        }
+      }
+    }
+
+    // Phase 1: starting from the capacity ceiling, binary-search DOWNWARD using the
+    // analytic max()-model latency estimate against the SLO -- the approach validated in
+    // the design discussion (start at the highest theoretically-possible batch per
+    // capacity/SRAM, then decrease until the estimate clears the SLO).
+    if (slo_feasible(b_cap, cand)) {
+      b_success = b_cap;
+      best = cand;
+    } else {
+      int low = 1;
+      int high = b_cap - 1;
+      while (low <= high) {
+        int mid = low + (high - low) / 2;
+        if (slo_feasible(mid, cand)) {
+          b_success = mid;
+          best = cand;
+          low = mid + 1;
+        } else {
+          high = mid - 1;
+        }
+      }
+    }
+
+    // b_cap: the capacity/SRAM-only ceiling (Phase 0), before the SLO-latency binary
+    // search narrows it down in Phase 1. Comparing this to ANALYTIC_MAX_BATCH shows
+    // whether capacity/SRAM or the latency estimate is the binding constraint.
+    std::cout << "ANALYTIC_CAP_BATCH: " << b_cap << std::endl;
+    std::cout << "ANALYTIC_MAX_BATCH: " << b_success << std::endl;
+    std::cout << "ANALYTIC_TP: " << best.tp << std::endl;
+    std::cout << "ANALYTIC_PP: " << best.pp << std::endl;
+    std::cout << "ANALYTIC_EP: " << best.ep << std::endl;
+    std::cout << "ANALYTIC_DP: " << best.dp << std::endl;
+    std::cout << "ANALYTIC_ESTIMATED_LATENCY_MS: " << best.estimated_latency_ms << std::endl;
+    return 0;
+  }
+
   // Part E: hold predictions outside the if(optimize_parallelism) scope so
   // checkMemorySize and the latency harness can access them.
   ParallelConfig opt_pred;
@@ -280,13 +415,14 @@ int main(int argc, char *argv[]) {
     opt_pred = opt;
     have_opt_pred = true;
     if (opt.oom) {
-      // Spec: a batch size FAILS when NO parallelism configuration can satisfy
-      // GPU-memory capacity, the SRAM / intermediate-data limit, AND the TPOT
-      // SLO simultaneously (all three are enforced inside Optimize()).  Emit an
-      // "Out of Memory" marker and exit non-zero so the batch-size sweep treats
-      // this as a hard failure instead of silently continuing with pp=1.
+      // opt.oom now ONLY reflects true capacity/SRAM infeasibility (the F1 fix
+      // removed the analytic-latency SLO gate from Optimize() -- estimated
+      // latency is a ranking heuristic only; the simulator that runs below is
+      // the sole SLO arbiter). Emit an "Out of Memory" marker and exit non-zero
+      // so the batch-size sweep treats this as a hard failure instead of
+      // silently continuing with pp=1.
       std::cout << "[Parallelism Optimizer] Out of Memory: no parallelism configuration "
-                << "satisfies capacity/SRAM/SLO constraints. Reason: " << opt.oom_reason << std::endl;
+                << "satisfies capacity/SRAM constraints. Reason: " << opt.oom_reason << std::endl;
       std::exit(EXIT_FAILURE);
     } else {
       std::cout << "[Parallelism Optimizer] Found optimal configuration: TP=" << opt.tp
@@ -311,6 +447,22 @@ int main(int argc, char *argv[]) {
       config["system"]["optimization"]["compressed_kv"].as<bool>();
   model_config.use_absorb =
       config["system"]["optimization"]["use_absorb"].as<bool>();
+
+  // F6 fix: compressed_kv/use_absorb/use_flash_mla are MLA-specific optimizations.
+  // config.yaml's system.optimization block is not model-aware (its defaults are
+  // tuned for MLA models like deepseekV3) -- blindly applying it here would force
+  // MLA-only code paths (KV-cache sizing, KV-write sizing, activation footprint)
+  // onto non-MLA presets (e.g. llama3_405B, llama4_maverick have q_lora_rank==0,
+  // kv_lora_rank==0, qk_rope_head_dim==0), corrupting their KV geometry to zero.
+  // Derive model-architecture-dependent flags from the model preset itself,
+  // mirroring the q_lora_rank-based gating already used correctly elsewhere
+  // (parallelism_optimizer.cpp:78,253,364; cluster.cpp:297,335).
+  if (model_config.q_lora_rank == 0) {
+    model_config.compressed_kv = false;
+    model_config.use_absorb = false;
+    system_config.use_flash_mla = false;
+  }
+
   model_config.skewness =
       config["simulation"]["skewness"].as<double>();
   
@@ -506,6 +658,19 @@ int main(int argc, char *argv[]) {
         } else {
           std::cout << msg << std::endl;
         }
+      }
+      // Directional divergence audit (F1): the batch-size search (run_experiments.py)
+      // relies on the analytic max()-model estimate consistently UNDER-estimating the
+      // simulator's measured latency -- that's what guarantees the analytic search
+      // never silently skips a batch the simulator would have accepted (analytic
+      // reject implies true reject only when estimate <= measured). Flag the opposite
+      // (dangerous) direction explicitly so it's visible across sweeps, independent of
+      // the symmetric |div| threshold above.
+      if (opt_pred.estimated_latency_ms > measured_latency_ms) {
+        std::cout << "[OptValidation] OVERESTIMATE: pred=" << opt_pred.estimated_latency_ms
+                  << "ms > actual=" << measured_latency_ms << "ms -- analytic model may "
+                  << "reject batches the simulator would accept (F1 safety assumption violated)"
+                  << std::endl;
       }
     }
   }
