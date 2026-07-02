@@ -7,3 +7,4 @@ __pycache__/
 .claude/
 config_temp.yaml
 run
+error_rates_detail.csv

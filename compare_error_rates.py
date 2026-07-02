@@ -1,0 +1,302 @@
+"""
+Compare paper_figure_readings.md (values read off the paper's figures) against
+experiment_results.md (this repo's simulator output) and report error rates.
+
+Error rate for a matched pair is defined as:
+
+    error_rate = |paper_value - sim_value| / |sim_value|
+
+i.e. the simulator's own output is treated as the reference ("actual"), and
+the pixel-read paper value is the "prediction" being scored against it. Pairs
+where either side is missing (NA / not present in one of the two tables) or
+where the simulator value is exactly 0 (relative error undefined) are skipped
+and reported separately as "unmatched".
+
+Usage:
+    python compare_error_rates.py
+    python compare_error_rates.py --details   # also print every matched pair
+
+Outputs:
+    - error_rates_detail.csv   one row per matched value, with error rate
+    - Printed summary: average error rate per figure, and per "data group"
+      within each figure (e.g. Figure 6 -> TPS Ratio vs Batch Ratio).
+"""
+import argparse
+import re
+from pathlib import Path
+
+import pandas as pd
+
+REPO_ROOT = Path(__file__).resolve().parent
+PAPER_MD = REPO_ROOT / "paper_figure_readings.md"
+SIM_MD = REPO_ROOT / "experiment_results.md"
+
+MODEL_MAP = {"Llama3": "llama3_405B", "Llama4": "llama4_maverick"}
+
+CELL_RE = re.compile(r"([-\d.]+)\s*\(([-\d.]+)x\)")
+GPU_COLS = ["1 GPU", "2 GPU", "4 GPU", "8 GPU", "16 GPU"]
+
+
+# --------------------------------------------------------------------------
+# Markdown table parsing
+# --------------------------------------------------------------------------
+def parse_markdown_tables(path):
+    """Return {section_title: DataFrame} for every '## N. Title' + table
+    block in a markdown file. Cells are left as raw strings; numeric
+    interpretation happens later per-figure since formats differ."""
+    text = path.read_text()
+    lines = text.splitlines()
+
+    tables = {}
+    current_title = None
+    table_lines = []
+
+    def flush():
+        nonlocal table_lines
+        if current_title and table_lines:
+            header = [c.strip() for c in table_lines[0].strip("|").split("|")]
+            rows = []
+            for line in table_lines[2:]:  # skip header + '---' separator
+                cells = [c.strip() for c in line.strip("|").split("|")]
+                if len(cells) == len(header):
+                    rows.append(cells)
+            tables[current_title] = pd.DataFrame(rows, columns=header)
+        table_lines = []
+
+    for line in lines:
+        m = re.match(r"^##\s*\d+\.\s*(.+)$", line.strip())
+        if m:
+            flush()
+            current_title = m.group(1).strip()
+            continue
+        if line.strip().startswith("|"):
+            table_lines.append(line.strip())
+        elif table_lines:
+            flush()
+    flush()
+    return tables
+
+
+def extract_value(cell, mode):
+    """mode='abs' -> the plain leading number; mode='ratio' -> the (X.XXx)
+    factor; returns None for 'NA' or unparsable cells."""
+    cell = cell.strip()
+    if cell.upper() == "NA" or cell == "":
+        return None
+    m = CELL_RE.search(cell)
+    if m:
+        return float(m.group(1)) if mode == "abs" else float(m.group(2))
+    cell = cell.lstrip("~")
+    try:
+        return float(cell)
+    except ValueError:
+        return None
+
+
+# --------------------------------------------------------------------------
+# Per-figure comparison builders -> each returns a long DataFrame with
+# columns: figure, group, key (human-readable), paper_value, sim_value
+# --------------------------------------------------------------------------
+def compare_wide_gpu_table(paper_df, sim_df, figure_name, value_mode):
+    """Shared logic for Fig 3 & Fig 4: wide GPU-count tables joined on
+    (Model, Workload, Memory Config); 'group' = Memory Config."""
+    paper_long = paper_df.melt(
+        id_vars=["Model", "Workload", "Memory Config"],
+        value_vars=GPU_COLS,
+        var_name="GPU",
+        value_name="paper_raw",
+    )
+    paper_long["paper_value"] = paper_long["paper_raw"].apply(
+        lambda c: extract_value(c, "abs")
+    )
+    paper_long["Model"] = paper_long["Model"].map(MODEL_MAP)
+
+    sim_long = sim_df.melt(
+        id_vars=["Model", "Workload", "Memory Config"],
+        value_vars=GPU_COLS,
+        var_name="GPU",
+        value_name="sim_raw",
+    )
+    sim_long["sim_value"] = sim_long["sim_raw"].apply(lambda c: extract_value(c, value_mode))
+
+    merged = paper_long.merge(sim_long, on=["Model", "Workload", "Memory Config", "GPU"])
+    merged["figure"] = figure_name
+    merged["group"] = merged["Memory Config"]
+    merged["key"] = (
+        merged["Model"] + " | " + merged["Workload"] + " | "
+        + merged["Memory Config"] + " | " + merged["GPU"]
+    )
+    return merged[["figure", "group", "key", "paper_value", "sim_value"]]
+
+
+def compare_fig5(paper_df, sim_df):
+    categories = ["Attention", "FFN", "KV Write", "Communication", "Others"]
+
+    def prep(df, value_suffix):
+        long = df.melt(
+            id_vars=["Model", "Workload", "Memory", "GPUs"],
+            value_vars=categories,
+            var_name="Category",
+            value_name=f"raw_{value_suffix}",
+        )
+        long[f"val_{value_suffix}"] = (
+            long[f"raw_{value_suffix}"].str.rstrip("%").apply(lambda c: extract_value(c, "abs"))
+        )
+        return long
+
+    paper_long = prep(paper_df, "paper")
+    paper_long["Model"] = paper_long["Model"].map(MODEL_MAP)
+    sim_long = prep(sim_df, "sim")
+
+    merged = paper_long.merge(
+        sim_long, on=["Model", "Workload", "Memory", "GPUs", "Category"]
+    )
+    merged["figure"] = "Figure 5"
+    merged["group"] = merged["Category"]
+    merged["key"] = (
+        merged["Model"] + " | " + merged["Workload"] + " | " + merged["Memory"]
+        + " | " + merged["GPUs"] + " GPU | " + merged["Category"]
+    )
+    merged = merged.rename(columns={"val_paper": "paper_value", "val_sim": "sim_value"})
+    return merged[["figure", "group", "key", "paper_value", "sim_value"]]
+
+
+def compare_fig6(paper_df, sim_df):
+    # sim table's Metric is "Batch Size" / "TPS/GPU"; paper table's Metric is
+    # "Batch Ratio" / "TPS Ratio" (both compared as ratios, i.e. the (X.XXx)
+    # factor in the sim table).
+    metric_map = {"TPS Ratio": "TPS/GPU", "Batch Ratio": "Batch Size"}
+
+    paper_long = paper_df.melt(
+        id_vars=["Model", "Memory", "SLO", "Metric"],
+        value_vars=["4 GPU", "8 GPU", "16 GPU"],
+        var_name="GPU",
+        value_name="paper_raw",
+    )
+    paper_long["paper_value"] = paper_long["paper_raw"].apply(lambda c: extract_value(c, "abs"))
+    paper_long["Model"] = paper_long["Model"].map(MODEL_MAP)
+    paper_long["SimMetric"] = paper_long["Metric"].map(metric_map)
+
+    sim_long = sim_df.melt(
+        id_vars=["Model", "Memory", "SLO", "Metric"],
+        value_vars=["4 GPU", "8 GPU", "16 GPU"],
+        var_name="GPU",
+        value_name="sim_raw",
+    )
+    sim_long["sim_value"] = sim_long["sim_raw"].apply(lambda c: extract_value(c, "ratio"))
+
+    merged = paper_long.merge(
+        sim_long,
+        left_on=["Model", "Memory", "SLO", "SimMetric", "GPU"],
+        right_on=["Model", "Memory", "SLO", "Metric", "GPU"],
+    )
+    merged["figure"] = "Figure 6"
+    merged["group"] = merged["Metric_x"]
+    merged["key"] = (
+        merged["Model"] + " | " + merged["Memory"] + " | " + merged["SLO"]
+        + " | " + merged["GPU"] + " | " + merged["Metric_x"]
+    )
+    return merged[["figure", "group", "key", "paper_value", "sim_value"]]
+
+
+def compare_fig7(paper_df, sim_df):
+    paper_df = paper_df.copy()
+    paper_df["Model"] = paper_df["Model"].map(MODEL_MAP)
+    paper_df["paper_value"] = paper_df["3-Year PEC (@8 GPU, online)"].apply(
+        lambda c: extract_value(c, "abs")
+    )
+
+    sim_df = sim_df.copy()
+    sim_df["sim_value"] = sim_df["3-Year PEC"].apply(lambda c: extract_value(c, "abs"))
+
+    merged = paper_df.merge(sim_df, on=["Model", "Workload", "Memory"])
+    merged["figure"] = "Figure 7"
+    merged["group"] = merged["Memory"]
+    merged["key"] = merged["Model"] + " | " + merged["Workload"] + " | " + merged["Memory"]
+    return merged[["figure", "group", "key", "paper_value", "sim_value"]]
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--details", action="store_true", help="print every matched pair")
+    ap.add_argument("--out", default="error_rates_detail.csv")
+    args = ap.parse_args()
+
+    paper_tables = parse_markdown_tables(PAPER_MD)
+    sim_tables = parse_markdown_tables(SIM_MD)
+
+    frames = [
+        compare_wide_gpu_table(
+            paper_tables["Maximum Per-GPU Batch Size (Figure 3)"],
+            sim_tables["Maximum Per-GPU Batch Size (Figure 3 Replication)"],
+            "Figure 3",
+            value_mode="abs",
+        ),
+        compare_wide_gpu_table(
+            paper_tables["System Throughput (Figure 4)"],
+            sim_tables["System Throughput (Figure 4 Replication)"],
+            "Figure 4",
+            value_mode="abs",
+        ),
+        compare_fig5(
+            paper_tables["Runtime Performance Breakdown (Figure 5)"],
+            sim_tables["Runtime Performance Breakdown (Figure 5 Replication)"],
+        ),
+        compare_fig6(
+            paper_tables["SLO Sensitivity Analysis (Figure 6)"],
+            sim_tables["SLO Sensitivity Analysis (Figure 6 Replication)"],
+        ),
+        compare_fig7(
+            paper_tables["Write Traffic and Endurance (Figure 7)"],
+            sim_tables["Write Traffic and Endurance Assessment (Figure 7 Replication)"],
+        ),
+    ]
+    all_pairs = pd.concat(frames, ignore_index=True)
+
+    n_total = len(all_pairs)
+    unmatched = all_pairs["paper_value"].isna() | all_pairs["sim_value"].isna() | (
+        all_pairs["sim_value"] == 0
+    )
+    scored = all_pairs.loc[~unmatched].copy()
+    scored["error_rate"] = (scored["paper_value"] - scored["sim_value"]).abs() / scored[
+        "sim_value"
+    ].abs()
+
+    scored.to_csv(REPO_ROOT / args.out, index=False)
+
+    if args.details:
+        with pd.option_context("display.max_rows", None, "display.width", 140):
+            print(scored[["figure", "group", "key", "paper_value", "sim_value", "error_rate"]])
+        print()
+
+    print(f"Matched & scored values: {len(scored)} / {n_total} total table cells")
+    print(f"Skipped (NA / unresolved / zero-division): {unmatched.sum()}")
+    print()
+
+    print("=" * 70)
+    print("AVERAGE ERROR RATE PER FIGURE")
+    print("=" * 70)
+    per_figure = scored.groupby("figure")["error_rate"].agg(["mean", "median", "count"])
+    per_figure["mean"] = (per_figure["mean"] * 100).round(2)
+    per_figure["median"] = (per_figure["median"] * 100).round(2)
+    per_figure.columns = ["mean_error_%", "median_error_%", "n"]
+    print(per_figure.to_string())
+    print()
+
+    print("=" * 70)
+    print("AVERAGE ERROR RATE PER DATA GROUP WITHIN EACH FIGURE")
+    print("=" * 70)
+    per_group = scored.groupby(["figure", "group"])["error_rate"].agg(["mean", "median", "count"])
+    per_group["mean"] = (per_group["mean"] * 100).round(2)
+    per_group["median"] = (per_group["median"] * 100).round(2)
+    per_group.columns = ["mean_error_%", "median_error_%", "n"]
+    print(per_group.to_string())
+    print()
+    print(f"Full per-value detail written to: {args.out}")
+
+
+if __name__ == "__main__":
+    main()
