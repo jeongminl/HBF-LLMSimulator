@@ -365,6 +365,76 @@ found:
     (same mechanism as the LONG-workload gains above), confirming Fix B has no effect once the
     SRAM tier isn't the binding constraint.
 
+19. **Compute-utilization (MFU) derating added to the roofline compute term (was implicitly
+    100% of peak).** `linear_impl.cpp`, `activation_impl.cpp`, `attention_{gen,sum,mixed}_impl.cpp`,
+    and `parallelism_optimizer.cpp` all computed `compute_duration = flops/compute_peak_flops`
+    with no efficiency factor — every compute-bound GEMM was charged at ideal 100% of peak
+    FLOPs, which no real GEMM achieves (tensor-core tile/wave quantization, epilogue overhead).
+    Added `SystemConfig::mfu_max`/`mfu_m_half` (`hardware_config.h`, parsed from config.yaml's
+    `simulation.mfu_max`/`mfu_m_half`) implementing a saturating curve `MFU(M) =
+    mfu_max*M/(M+mfu_m_half)` (M = the GEMM's row/token count at that call site) via a shared
+    `effectiveMFU()` helper, applied at every compute-duration call site. Defaults
+    (`mfu_max=1.0`, `mfu_m_half=0.0`) make `MFU(M) == 1.0` for all M — an **exact no-op**
+    verified byte-identical against a pre-change baseline across 7 anchor points. Investigated
+    while root-causing `PAPER_INCONSISTENCIES.md`'s U1 (see that file): a sensitivity sweep
+    (`mfu_max` in {1.0, 0.7, 0.6, 0.5}, `mfu_m_half=128` as a stated tensor-core-tile-granularity
+    assumption, not tuned to any target number) confirms the effect is real and physically
+    consistent — TPOT rises meaningfully as `mfu_max` drops (e.g. llama4_maverick/HBM4/8-GPU/
+    SHORT: 0.0259s→0.0414s), with the steepest change right where the shared-expert MoE FFN's
+    compute/memory ratio (~65% at mfu_max=1.0, hand-derived) crosses the roofline threshold
+    around mfu_max≈0.6-0.7 — but even at mfu_max=0.5 the SHORT/MID batch anchors barely move
+    (TPOT only reaches ~37-41% of the SLO), so this alone does not close U1's gap to the paper's
+    reported numbers. Kept as a real, defensible, non-tuned addition to the cost model.
+
+20. **Optimizer's TP all-reduce term aligned to the live simulator's ring-collective formula.**
+    `parallelism_optimizer.cpp`'s analytic TP-communication estimate used a flat
+    `2*layers*(device_ict_latency + full_message/device_ict_bandwidth)` — no `(N-1)/N` bandwidth
+    factor, no per-hop latency multiply, full unsplit message per hop. The live simulator's
+    `AllReduce::forward` (`communication.cpp`) instead models a proper ring all-reduce: for a
+    group of size `N`, `2*(N-1)` hops, each hop paying one `device_ict_latency` plus `1/N` of the
+    message. The optimizer now uses the identical ring formula (`per_allreduce = 2*(tp-1)*
+    device_ict_latency + (2*(tp-1)/tp)*(message/device_ict_bandwidth)`, two all-reduces per
+    layer). This is a ranking-heuristic-only fix (the simulator's measured TPOT remains the sole
+    SLO arbiter, per audit F1) — verified to not move any of the tp=1 (pure-DP, zero-comm) paper
+    anchors, but removes a latent optimizer/simulator drift relevant whenever TP>1 is in play.
+
+21. **Batch-size search non-monotonicity bug fixed — `run_experiments.py`'s `find_max_batch_size`
+    could substantially under-report the true max batch (found investigating
+    `PAPER_INCONSISTENCIES.md`'s U8).** The search's boundary/exponential/binary-search steps
+    each probed a single batch value and treated a failure there as proof that batch is
+    infeasible from that point on. But parallelism-config selection is gated by an exact
+    divisibility constraint (`batch_size % dp == 0`, `parallelism_optimizer.cpp`), so the set of
+    TP/PP/DP/EP candidates available to the optimizer's ranking changes discontinuously between
+    adjacent integer batch values — a batch value that happens to only be divisible for an
+    inferior config (e.g. one with a much lower capacity ceiling) can spuriously "fail" even
+    though slightly larger or smaller batches, divisible for the true-best config, succeed.
+    Confirmed empirically: llama4_maverick/HBF+/16-GPU/LONG/offline — `b=9292` (divisible by 4,
+    TP=1/PP=4/DP=4 selected, feasible up to ~10947) succeeds; `b=9293` (divisible by neither 4
+    nor 2, only TP=4/PP=4/DP=1 remains divisibility-eligible, ceiling ~8192) spuriously fails;
+    `b=9296` (divisible by 4 again) succeeds with TP=1 same as 9292. The single-probe boundary
+    check took 9293's failure as final, under-reporting the true ~10947 ceiling as 9292 (a
+    per-GPU batch of 580.75 instead of the true 684.12 — the exact spurious "676→580 batch drop"
+    `PAPER_INCONSISTENCIES.md`'s U8 had flagged as "itself unusual...not yet investigated").
+    Fixed by replacing every single-point probe (the boundary check, the exponential-doubling
+    loop's failure point, and both binary searches) with `probe_window()`, which scans up to 8
+    consecutive batch values (covering the TP-degree range this codebase's model presets use,
+    `num_kv_heads`-capped) before concluding infeasibility. **Impact:** the reported per-GPU
+    offline batch for llama4_maverick/HBF+/16-GPU jumps from 580.75 to 684.12 — essentially flat
+    relative to the 8-GPU value (676.38), matching the paper's mechanism (iii) expectation
+    (SRAM-tier capacity is a roughly fixed per-GPU ceiling, largely independent of total GPU
+    count when TP is chosen appropriately) rather than the previously-reported drop. **Crucially,
+    the corresponding per-GPU *throughput* (TPS/GPU) barely changed** (1535.06→1532.61,
+    <0.2%) because TPOT scaled up proportionally with the corrected batch in this memory-
+    bound regime — confirming the U4/U8 TPS-ratio gap (paper vs. simulator) is a *distinct*,
+    still-open phenomenon, not an artifact of this search bug. Re-verified the full llama4/HBF+
+    16-GPU LONG SLO sweep post-fix: TPS ratios vs. 8-GPU HBM4 are 0.959x/1.012x/1.038x/0.846x
+    (0.05s/0.1s/0.2s/offline) — statistically identical to the pre-fix 0.96x/1.01x/1.04x/0.85x,
+    confirming the fix is a pure batch/TPOT-reporting correction with no effect on the
+    already-reported throughput ratios. The same artifact also produces a smaller shift on other
+    anchors already reported in `PAPER_INCONSISTENCIES.md`'s U1: llama4_maverick/HBM4/8-GPU/SHORT
+    moves 514.9→518.3 batch/GPU (~0.65%), TP=1/PP=8/DP=1 both before and after — noted there for
+    bookkeeping; does not change any conclusion.
+
 **Still open, smaller residual:**
 - llama4_maverick's HBM4/8-GPU/SHORT anchor is ~11% high (511.6 vs. paper's 460) — much smaller
   than the earlier ~8-9x gap, not yet root-caused. Possibly model-specific (MoE routing/expert
