@@ -208,18 +208,20 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
       //      -> replicated per GPU, one per MoE layer.
       //   2) LayerNorm gammas: 2 per decoder layer (input + post-attention),
       //      hidden x precision each, replicated (layernorm.cpp).
-      //   3) Embedding / LM head: full {n_vocab, hidden} tensors, NOT TP-sharded
-      //      (embedding.cpp / lm_head.cpp). Embedding lives on pp stage 0 and the
-      //      LM head on the last stage; the live gate checks device 0 == stage 0,
-      //      so mirror stage 0's holdings: embedding always, LM head only when
-      //      pp == 1 (stage 0 is then also the last stage).
+      //   3) Embedding / LM head: vocab-parallel {ceil(n_vocab/tp), hidden}
+      //      tensors, TP-sharded Megatron-style (embedding.cpp / lm_head.cpp).
+      //      Embedding lives on pp stage 0 and the LM head on the last stage; the
+      //      live gate checks device 0 == stage 0, so mirror stage 0's holdings:
+      //      embedding always, LM head only when pp == 1 (stage 0 is then also
+      //      the last stage).
       double router_weight_bytes = (model_config.num_routed_expert > 0)
           ? moe_layers_in_stage * hidden_dim * model_config.num_routed_expert * precision
           : 0.0;
       double layernorm_weight_bytes = layers_per_stage * 2.0 * hidden_dim * precision;
-      double embed_weight_bytes = (double)model_config.n_vocab * hidden_dim * precision;
+      double vocab_rows_per_rank = std::ceil((double)model_config.n_vocab / tp);
+      double embed_weight_bytes = vocab_rows_per_rank * hidden_dim * precision;
       double lm_head_weight_bytes = (pp == 1)
-          ? (double)hidden_dim * model_config.n_vocab * precision
+          ? (double)hidden_dim * vocab_rows_per_rank * precision
           : 0.0;
       weight_per_gpu += router_weight_bytes + layernorm_weight_bytes +
                         embed_weight_bytes + lm_head_weight_bytes;
@@ -367,22 +369,12 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
       //   dense_ffn_ops: 3 (gate/up/down)
       double page_lat_per_ns = use_flash
           ? (double)system_config.hbf_config.flash_page_read_latency_ns : 0.0;
-      double page_lat_total = 0.0;
-      if (page_lat_per_ns > 0.0) {
-        int attn_ops = (model_config.q_lora_rank != 0)
-            ? (model_config.use_absorb ? 8 : 7)   // MLA-absorb=8, MLA-base~7
-            : 4;                                    // GQA: Q+K+V+O
-        int non_moe_layers_in_stage = layers_per_stage - moe_layers_in_stage;
-        int moe_ffn_ops   = 1                                                     // gate routing op
-                          + 3 * (int)std::round(e_active) * e_tp_dg              // page reads scale with e_tp_dg
-                          + 3 * model_config.num_shared_expert;                   // shared (ne_tp_dg split)
-        int dense_ffn_ops = 3;                                      // gate/up/down for dense FFN
-        int ops_per_moe_layer   = attn_ops + (model_config.num_routed_expert > 0
-                                              ? moe_ffn_ops : dense_ffn_ops);
-        int ops_per_dense_layer = attn_ops + dense_ffn_ops;
-        page_lat_total = (moe_layers_in_stage * ops_per_moe_layer +
-                          non_moe_layers_in_stage * ops_per_dense_layer) * page_lat_per_ns;
-      }
+      // One pipeline-fill latency per per-iteration weight stream, in lock-step
+      // with getLinearMemoryDuration's weight_stream_ops_per_iter amortization:
+      // consecutive weight tensors double-buffer across ops (no activation
+      // dependency), so per-op charging (the former attn_ops/moe_ffn_ops count
+      // here) no longer matches the live model.
+      double page_lat_total = page_lat_per_ns;
 
       // Weight read time: active-expert weight bandwidth + per-op page latency.
       double weight_read_time = (weight_for_latency / weight_bw * 1e9) + page_lat_total;

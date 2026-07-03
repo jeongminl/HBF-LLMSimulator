@@ -45,8 +45,9 @@ struct ExecStatus {
     memory_duration += rhs.memory_duration;
     kv_write_duration += rhs.kv_write_duration;
     generic_read_cmd += rhs.generic_read_cmd;
+    generic_write_cmd += rhs.generic_write_cmd;
     compute_pim_cmd += rhs.compute_pim_cmd;
-    move_pim_cmd += rhs.compute_pim_cmd;
+    move_pim_cmd += rhs.move_pim_cmd;
 
     act_count += rhs.act_count;
     read_count += rhs.read_count;

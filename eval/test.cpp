@@ -628,6 +628,12 @@ int main(int argc, char *argv[]) {
     fail("[Decode Mode] Output length must be larger than 1");
   }
 
+  // Flash weight-stream pipeline-fill amortization (see getLinearMemoryDuration
+  // and SystemConfig::weight_stream_ops_per_iter): computed here, AFTER the
+  // final distribution (optimizer override or yaml) fixed ne_tp_dg/e_tp_dg/pp_dg.
+  system_config.weight_stream_ops_per_iter =
+      weightReadOpsPerIteration(model_config, num_node * num_device);
+
   // long max_batch_size = 128;
   if (max_process_token == 0) {
     // max_process_token = 8192 * 16;

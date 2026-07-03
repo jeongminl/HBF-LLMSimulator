@@ -14,7 +14,12 @@ Embedding::Embedding(std::string& prefix, std::string& name,
       model_config(model_config) {
   int hidden_dimension = model_config.hidden_dim;
   int n_vocab = model_config.n_vocab;
-  std::vector<int> wgt_shape = {n_vocab, hidden_dimension};
+  // Vocab-parallel sharding across the TP group (Megatron-style): each TP rank
+  // holds n_vocab/tp rows; DP replicas each hold a full TP-sharded copy, so the
+  // divisor is ne_tp_dg, NOT device_list.size() (which spans DP replicas here).
+  int tp = (model_config.ne_tp_dg > 0) ? model_config.ne_tp_dg : 1;
+  int vocab_per_rank = (n_vocab + tp - 1) / tp;
+  std::vector<int> wgt_shape = {vocab_per_rank, hidden_dimension};
   std::vector<int> act_shape = {1, hidden_dimension};
 
   Tensor::Ptr embedding = Tensor::Create("Embedding", wgt_shape, "weight", device, device->model_config.precision_byte);

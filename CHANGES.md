@@ -973,3 +973,86 @@ a fit to any one cell. Not a bug; a better-calibrated contributing factor to U2'
     prints `SRAM_DIAG_SCORE_INCLUSIVE_ACT_BYTES` and `SRAM_DIAG_CEILING_BATCH_PER_GPU` on
     scarce-tier decode runs; `run_experiments.py` parses the ceiling into run results and appends
     `sram_diag_ceiling_per_gpu` to `[config-search]` lines. No reported metric changes.
+
+## Paper-comparison fixes, second pass (2026-07-03, paper-bughunt worktree)
+
+Root causes found by a four-agent investigation (two agents independently converged on item 37's
+mechanism from different evidence: a machine-precision component fit and CSV component shares vs
+Fig-5). Verification numbers below are from the fixed binary's throughput-max searches
+(`find_max_batch_size`, 0.1 s SLO) against `paper_figure_readings.md`.
+
+37. **AllReduce ring-latency overcharge fixed — resolves U9 (llama3/HBM4/8-GPU LONG TPS −13%).**
+    `communication.cpp::AllReduce::forward` multiplied BOTH the per-hop latency AND the
+    bandwidth term by `hop = 2(N−1)` (ring schedule). The latency part is batch-independent
+    (252 all-reduces/step × 14 hops × 800 ns = 2.822 ms at llama3 TP=8 — an exact fit to the
+    measured comm column across LONG/MID/SHORT), which contradicts (a) the reference DGX Rubin
+    NVL8's fully-connected NVSwitch fabric, and (b) §III's own "the inter-GPU communication
+    increases almost linearly with batch size." Fix: keep the bandwidth-optimal volume
+    `2(N−1)/N × size` and charge latency for `2·ceil(log2 N)` hops (recursive doubling; N=2
+    unchanged, N=8: 6 vs 14). Post-fix comm matches Fig-5: llama3 LONG 5.4% vs paper 5.1%, MID
+    15.7% vs ~14.6%. Cell result: batch 3.75/GPU vs paper 3.8 (−1.3%), TPS/GPU 138.2 vs 146.6
+    (−5.8%, was −13.0%). NOTE the honest consequence: the old ring latency partially cancelled
+    an unmodeled GEMM-efficiency (MFU<1) divergence at high batch; SHORT/MID tpot now reads
+    ~4-6% fast vs paper — see PAPER_INCONSISTENCIES.md "Deferred by decision."
+
+38. **Flash page-read pipeline-fill latency amortized across the per-iteration weight stream —
+    resolves the llama4/CONV+/SHORT 4-GPU −33% residual.** `getLinearMemoryDuration` charged one
+    full `flash_page_read_latency` per weight tensor: 32 experts × 3 matrices × 24 MoE layers =
+    2304 ops × 3 µs = 6.91 ms/step at 4 GPUs, while KV-read (single post-loop call) and KV-write
+    (`program_latency_amortize_calls`) already amortize their µs-scale latencies per stream and
+    the paper's double-buffer/prefetch thesis covers "read data" generically (weights have no
+    activation dependency — prefetch depth is unbounded). Fix: new
+    `SystemConfig::weight_stream_ops_per_iter` (computed at startup by
+    `model_config.h::weightReadOpsPerIteration` from the final distribution; default 1 =
+    legacy), divided into the fill term only; per-chunk residual logic unchanged; optimizer's
+    `page_lat_total` switched to one fill latency in lock-step. The over-charge ∝
+    experts/device (∝ 1/GPUs) with max batch-leverage exactly at 4 GPUs, reproducing the old
+    −4/−12/−33/−10/−4 shape. Cell result: 4-GPU 189.25/GPU vs paper 173.9 (+8.8%, was −33%);
+    1/2-GPU 59/88 vs printed readings 54.3/54.3 — those two bars sit below the figure's
+    line-thickness resolution (user-confirmed huge reading tolerance), and the 1→2 GPU growth is
+    the physical halving of the expert weight-read floor.
+
+39. **Embedding + LM-head vocab-parallel sharding (was: replicated per GPU) — closes the llama3
+    batch residuals.** `embedding.cpp` / `lm_head.cpp` built full `{n_vocab, hidden}` weights on
+    every GPU (llama3 TP=8: 8.4 GB/GPU vs ~1.05 GB sharded), directly costing KV headroom on
+    capacity-bound cells; optimizer parity terms matched the replicated convention
+    (`parallelism_optimizer.cpp` embed/lm_head bytes). Fix: Megatron-standard vocab-parallel
+    sharding by `ne_tp_dg` (NOT device_list.size(), which spans DP replicas); LmHead::forward
+    computes its vocab shard (the cross-rank argmax gather is bytes-negligible; no comm op
+    added); optimizer divides by tp. Cell results (llama3/HBM4/8-GPU batch/GPU vs paper):
+    SHORT 197.88 vs 195.5 (+1.2%, was −2.4%), MID 62.88 vs 62.0 (+1.4%, was −2.3%), LONG 3.75
+    vs 3.8 (−1.3%, was −4.7%).
+
+40. **`ExecStatus::operator+=` counter hygiene.** `move_pim_cmd += rhs.compute_pim_cmd` (copy-
+    paste) now adds `rhs.move_pim_cmd`; `generic_write_cmd` was missing entirely and is now
+    accumulated. Zero metric impact (grep-verified: these counters have no consumers; energy
+    uses act/read/write_count) — correctness hygiene only.
+
+**Combined re-verification (fixed binary, all four fixes):** U2 ratio (llama4 HBF+/4-GPU LONG ÷
+HBM4/8-GPU LONG TPS/GPU) = 1575.5/1376.5 = **1.145 vs paper 1.15** (was 1.116); numerator batch
+157.5/GPU vs 151.5 (+4.0%), denominator 31.5/GPU vs 31.3 (+0.6%). llama3/HBF/1-GPU SHORT 185 vs
+paper 176.2 (+5.0%) — U5 confirmed matching on its own 1-GPU bar (the old PAPER_INCONSISTENCIES
+table's 97 was a stale pre-fix number).
+
+**Full 13-cell verification table (fixed binary, throughput-max search, 0.1 s SLO):**
+
+| Cell | ours | paper | Δ |
+|---|---|---|---|
+| llama3 HBM4/8 SHORT batch/GPU | 197.88 | 195.5 | +1.2% (was −2.4%) |
+| llama3 HBM4/8 MID batch/GPU | 62.88 | 62.0 | +1.4% (was −2.3%) |
+| llama3 HBM4/8 LONG batch / TPS/GPU | 3.75 / 138.2 | 3.8 / 146.6 | −1.3% / **−5.8% (was −13.0%)** |
+| llama4 HBM4/8 LONG batch / TPS/GPU | 31.5 / 1376.5 | 31.3 / 1296.1 | +0.6% / +6.2% |
+| llama4 HBF+/4 LONG batch / TPS/GPU | 157.5 / 1575.5 | 151.5 / 1489.8 | +4.0% / +5.8% |
+| U2 ratio (HBF+/4 ÷ HBM4/8, LONG) | **1.145** | 1.15 | −0.4% (was 1.116) |
+| U4 spot (HBF+/16 ÷ HBM4/8, LONG, 0.1s) | 1.267 | ≈1.30 | −2.5% |
+| llama4 HBF+/8 MID batch/GPU | 814.0 | 745.1 | +9.2% (documented HBF+ looseness) |
+| llama4 CONV+ SHORT 1/2/4/8/16 batch/GPU | 59/88/189.25/383/476.75 | 54.3/54.3†/173.9/390.1/477.5 | +8.7%/†/**+8.8% (was −33%)**/−1.8%/−0.2% |
+| llama3 HBF/1 SHORT batch | 185 | 176.2 | +5.0% |
+| U6 spot: llama4 HBF+/8 MID kv-write share | 14.35% | 13.6% | +0.75pp (within ±1pp of pre-fix 14.18%) |
+
+† the 1/2-GPU CONV+ bars sit below the figure's line-thickness resolution (user-confirmed
+reading tolerance); the 1→2 GPU growth is the physical halving of the expert weight-read floor.
+
+Exit criteria met: both outliers (U9, CONV+ 4-GPU) collapsed into band; no cell regressed beyond
+the documented, deliberate SHORT/MID exposure band (see PAPER_INCONSISTENCIES.md "Deferred by
+decision"); nothing calibrated to a target.
