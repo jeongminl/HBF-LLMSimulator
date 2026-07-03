@@ -28,14 +28,27 @@ Tensor::Ptr Residual::forward(const Tensor::Ptr input,
   }
 
   hw_metric compute_peak_flops = device->config.compute_peak_flops;
-  hw_metric memory_bandwidth = device->config.memory_bandwidth;
 
   double flops, memory_size;
   flops = m * k * 1;
   memory_size = (3.0 * m * k) * input->precision_byte; // input x 2, store x 1
 
   time_ns compute_duration = flops / compute_peak_flops * 1000 * 1000 * 1000;
-  time_ns memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+  // Residual traffic is pure activation data: on flash presets it lives on the
+  // intermediate tier (the reserved HBM stack for HBF/CONV, 0-cost logic-die
+  // SRAM for HBF+/CONV+), never on flash — same tier selection as
+  // activationCore (activation_impl.cpp). The device-wide memory_bandwidth
+  // scalar equals the FLASH read bandwidth on these presets and priced this
+  // op ~7x too fast on HBF.
+  time_ns memory_duration;
+  auto& hw_config = device->config;
+  if (hw_config.use_hbf && hw_config.hbf_config.num_flash_stacks > 0) {
+    memory_duration = (hw_config.hbf_config.num_hbm_stacks > 0)
+        ? memory_size / hw_config.hbf_config.hbm_read_bandwidth * 1000 * 1000 * 1000
+        : 0;
+  } else {
+    memory_duration = memory_size / hw_config.memory_bandwidth * 1000 * 1000 * 1000;
+  }
 
   time_ns total_time = std::max(compute_duration, memory_duration);
 

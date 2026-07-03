@@ -3,6 +3,7 @@
 #include "hardware/cluster.h"
 
 #include <cmath>
+#include <algorithm>
 
 #include "common/assert.h"
 // AllReduce //
@@ -47,10 +48,28 @@ Tensor::Ptr AllReduce::forward(const Tensor::Ptr input,
   int latency_hops =
       (n_ranks > 1) ? 2 * (int)std::ceil(std::log2((double)n_ranks)) : 0;
 
+  // Link selection: a group confined to one node runs on NVLink
+  // (device_ict); a group spanning nodes is bottlenecked by the
+  // inter-node link (node_ict), same rule as MoEScatter/MoEGather's
+  // decode path and PipelineStage.
+  int num_device_per_node = device->config.num_device;
+  int min_node = device_list.front() / num_device_per_node;
+  int max_node = min_node;
+  for (int rank : device_list) {
+    int node = rank / num_device_per_node;
+    min_node = std::min(min_node, node);
+    max_node = std::max(max_node, node);
+  }
+  bool cross_node = (max_node != min_node);
+  hw_metric link_latency = cross_node ? device->config.node_ict_latency
+                                      : device->config.device_ict_latency;
+  hw_metric link_bandwidth = cross_node ? device->config.node_ict_bandwidth
+                                        : device->config.device_ict_bandwidth;
+
   time_ns total_time =
-      (time_ns)(latency_hops * device->config.device_ict_latency +
+      (time_ns)(latency_hops * link_latency +
                 (double)bw_hops * ((double)size / n_ranks) /
-                    device->config.device_ict_bandwidth * 1e9);
+                    link_bandwidth * 1e9);
 
   if (input->parallel_execution && !device->config.communication_hiding) {
     if (input->isPerformHigh()) {

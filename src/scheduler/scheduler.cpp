@@ -1,4 +1,5 @@
 #include "scheduler/scheduler.h"
+#include <numeric>
 
 namespace llm_system {
 Scheduler::Scheduler(SystemConfig system_config, ModelConfig& model_config,
@@ -95,7 +96,14 @@ void Scheduler::pushDummySeq(int input_len, int output_len) {
     new_seq->total_len = input_len;
   }
   else if(system_config.decode_mode){
-    new_seq->current_len = input_len; // for decode mode
+    // Steady-state decode: under continuous batching with arrival rate
+    // matching completion rate (paper SS-III), in-flight queries are uniformly
+    // distributed over their output lifetime, so the representative context is
+    // input + output/2 — not start-of-generation (input), which under-charged
+    // the context-linear attention cost by output/2 tokens (~10% of context on
+    // SHORT, ~4% MID, ~0.5% LONG). Capacity/KV-write admission accounting are
+    // config-driven (full input+output lifetime) and unaffected by this seed.
+    new_seq->current_len = input_len + output_len / 2; // for decode mode
   }
   new_seq->get_expert_from_list = false;
   sequence_queue.push_back(new_seq);
@@ -175,12 +183,31 @@ std::set<int> Scheduler::getZipfianRandomExpert(std::vector<double> weight, int 
   static unsigned int seed = 777;
   static std::mt19937 generator(seed);
   static std::discrete_distribution<int> distribution(weight.begin(), weight.end());
-  
+
+  // The Zipf weights are index-monotone (expert 0 hottest) and expert->device
+  // placement is contiguous (expert.cpp: experts [i*16, i*16+16) -> device i),
+  // so drawing the raw index would colocate ALL hot experts on device 0 —
+  // an accidental artifact, not a modeled placement policy. At low batch
+  // (llama4 LONG, ~31 active experts) that inflates the bottleneck device's
+  // expert weight-stream count ~3x vs any balanced placement, since
+  // per-iteration time is max-over-devices and expert weight-read cost is
+  // token-count-independent. Decorrelate hotness from placement with a fixed
+  // coprime-stride permutation of the drawn hotness rank: hot ranks 0..7 land
+  // on 8 distinct devices (round-robin), preserving the skew distribution
+  // itself and per-seed determinism.
+  int n = model_config.num_routed_expert;
+  static const int kStrideCandidates[] = {17, 19, 23, 29, 31, 1};
+  int stride = 1;
+  for (int s : kStrideCandidates) {
+    if (std::gcd(s, n) == 1) { stride = s; break; }
+  }
+
   std::set<int> route;
 
   while (route.size() < top_k) {
-    int seq_id = (distribution(generator) % model_config.num_routed_expert);
-    route.insert(seq_id);
+    int hotness_rank = (distribution(generator) % n);
+    int expert_id = (int)(((long)hotness_rank * stride) % n);
+    route.insert(expert_id);
   }
   return route;
 }

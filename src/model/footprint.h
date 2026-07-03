@@ -63,8 +63,14 @@ inline CapacityResult checkCapacity(const SystemConfig& s,
   if (s.use_hbf && s.hbf_config.num_flash_stacks > 0) {
     const auto& hbf = s.hbf_config;
 
-    // Weights + KV live on flash
-    double flash_cap = static_cast<double>(hbf.total_capacity_bytes);
+    // Weights + KV live on flash ONLY. total_capacity_bytes is the paper's
+    // Table-I combined figure (HBM + flash: 3,620 GB for HBF/CONV includes the
+    // 36-GB reserved HBM stack); the HBM stack is the activation tier below and
+    // must not also back weights/KV — subtract it to get the physical flash pool
+    // (7x512 = 3,584 GB for HBF/CONV; unchanged 4,096 GB for HBF+/CONV+).
+    double flash_cap = static_cast<double>(hbf.total_capacity_bytes) -
+                       static_cast<double>(hbf.num_hbm_stacks) *
+                       static_cast<double>(hbf.hbm_per_stack_bytes);
     if (weight + kv > flash_cap) {
       return {true,
               "Flash capacity exceeded (" +
@@ -192,10 +198,21 @@ inline double peakIntermediateBytes(const ModelConfig& model,
 
   double ffn_moe = 0.0;
   if (has_moe_layer && model.num_routed_expert > 0) {
-    ffn_moe = (num_routed_expert_per_device + model.num_shared_expert) *
+    // Routed experts see expert_batch_size tokens each (global average per
+    // routed expert); the SHARED expert is dense — every token in the
+    // per-device batch flows through it (expert.cpp:204 passes the full
+    // input), so it must be charged at batch_per_dp, not expert_batch_size
+    // (a 16x under-count for maverick at 8 GPUs). Its gate/silu/up widths are
+    // TP-sharded at runtime (built on the ne_tp group), hence the /tp.
+    double routed_act = num_routed_expert_per_device *
         (2.0 * (expert_batch_size * model.expert_intermediate_dim) +  // gate proj + silu out
          expert_batch_size * model.expert_intermediate_dim +          // up proj out
-         expert_batch_size * hidden_dim) * precision;                 // down proj out
+         expert_batch_size * hidden_dim);                             // down proj out
+    double shared_act = model.num_shared_expert *
+        (2.0 * (batch_per_dp * model.expert_intermediate_dim / tp) +  // gate proj + silu out
+         batch_per_dp * model.expert_intermediate_dim / tp +          // up proj out
+         batch_per_dp * hidden_dim);                                  // down proj out
+    ffn_moe = (routed_act + shared_act) * precision;
   }
   double ffn_dense = 0.0;
   if (has_dense_layer) {

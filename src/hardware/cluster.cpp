@@ -151,11 +151,17 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
 
         (double)batch_size_per_dp * input_len * hidden_dim + // out proj out
 
-        // MoE FFN
-        (num_routed_expert_per_device + device->model_config.num_shared_expert) * // routed + shared
+        // MoE FFN — routed experts at expert_batch_size; the SHARED expert is
+        // dense (sees the full per-device batch; expert.cpp passes the whole
+        // input) and is TP-sharded on the ne_tp group at runtime.
+        num_routed_expert_per_device *
         (2.0 * (expert_batch_size * input_len * expert_intermediate_dim) + // gate proj out + silu out
         (expert_batch_size * input_len * expert_intermediate_dim) + // up proj out
-        (expert_batch_size * input_len * hidden_dim))) * // down proj out) 
+        (expert_batch_size * input_len * hidden_dim)) +  // down proj out
+        (double)device->model_config.num_shared_expert *
+        (2.0 * ((double)batch_size_per_dp * input_len * expert_intermediate_dim / ne_tp_dg) +
+        ((double)batch_size_per_dp * input_len * expert_intermediate_dim / ne_tp_dg) +
+        ((double)batch_size_per_dp * input_len * hidden_dim))) *
         device->model_config.precision_byte;
     }
     else{ // base
@@ -174,11 +180,17 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
 
         (double)batch_size_per_dp * input_len * hidden_dim + // out proj out
 
-        // MoE FFN
-        (num_routed_expert_per_device + device->model_config.num_shared_expert) * // routed + shared
+        // MoE FFN — routed experts at expert_batch_size; the SHARED expert is
+        // dense (sees the full per-device batch; expert.cpp passes the whole
+        // input) and is TP-sharded on the ne_tp group at runtime.
+        num_routed_expert_per_device *
         (2.0 * (expert_batch_size * input_len * expert_intermediate_dim) + // gate proj out + silu out
         (expert_batch_size * input_len * expert_intermediate_dim) + // up proj out
-        (expert_batch_size * input_len * hidden_dim))) * // down proj out) 
+        (expert_batch_size * input_len * hidden_dim)) +  // down proj out
+        (double)device->model_config.num_shared_expert *
+        (2.0 * ((double)batch_size_per_dp * input_len * expert_intermediate_dim / ne_tp_dg) +
+        ((double)batch_size_per_dp * input_len * expert_intermediate_dim / ne_tp_dg) +
+        ((double)batch_size_per_dp * input_len * hidden_dim))) *
         device->model_config.precision_byte;
     }
   }

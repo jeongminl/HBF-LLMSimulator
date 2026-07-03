@@ -80,7 +80,11 @@ int main(int argc, char *argv[]) {
     // its Rubin-based systems verbatim: "NVLink (1,800 GB/s) for intra-node GPU
     // communication".
     system_config.device_ict_bandwidth = 1800.0 * 1000 * 1000 * 1000; // B/s
-    system_config.device_ict_latency = 0.8 * 1000; // ns
+    // The paper anchors NO interconnect latencies (bandwidths only). The previous
+    // 0.8 us here (an H100-era carry-over) was also INVERTED against the IB value
+    // (0.13 us) — NVLink cannot be slower end-to-end than cross-node InfiniBand.
+    // Use a datasheet-plausible per-hop NVLink/NVSwitch latency.
+    system_config.device_ict_latency = 0.5 * 1000; // ns
   }else{
     fail("Not support NVLink generation");
   }
@@ -92,7 +96,10 @@ int main(int argc, char *argv[]) {
   }
   else if(config["system"]["infiniband_gen"].as<int>() == 800){
     system_config.node_ict_bandwidth = 100.0 * 1000 * 1000 * 1000; // B/s InfiniBand XDR
-    system_config.node_ict_latency = 0.13 * 1000; // ns
+    // End-to-end cross-node latency (NIC + switch fabric), datasheet-plausible.
+    // The previous 0.13 us was a NIC port-to-port figure and sat BELOW the NVLink
+    // constant — physically inverted (see NVLink block above).
+    system_config.node_ict_latency = 3.0 * 1000; // ns
   }
   else if(config["system"]["infiniband_gen"].as<int>() == 3600){
     system_config.node_ict_bandwidth = 450.0 * 1000 * 1000 * 1000; // B/s NVLink 4th Gen
@@ -251,6 +258,14 @@ int main(int argc, char *argv[]) {
       config["system"]["distribution"]["expert_tensor_degree"].as<int>();
   model_config.ne_tp_dg =
       config["system"]["distribution"]["none_expert_tensor_degree"].as<int>();
+
+  // Set workload lengths on the model config BEFORE any optimizer call: the
+  // analytic KV-READ latency estimate needs the steady-state decode context
+  // (input + output/2) while capacity keeps the full lifetime (input+output);
+  // both derive from these fields. (The later dataset=="synthesis" branch
+  // re-assigns the same values — kept for the real-data path's semantics.)
+  model_config.input_len = input_len;
+  model_config.output_len = output_len;
 
   bool optimize_parallelism = false;
   if (config["system"]["optimize_parallelism"]) {
@@ -765,19 +780,39 @@ int main(int argc, char *argv[]) {
   }
 
   // Emit PEC geometry so Python post-processing never needs to duplicate model
-  // dimensions or precision.  Matches getKVWriteDuration() exactly:
-  //   standard KV: 2 * num_layers * num_kv_heads * head_dim * precision_byte
-  //   compressed KV (MLA): (kv_lora_rank + qk_rope_head_dim) * num_layers * precision_byte
+  // dimensions or precision.  Matches getKVWriteDuration() exactly, INCLUDING
+  // the per-layer iRoPE window: a local-attention layer only ever receives
+  // min(input_len, attn_chunk_size) admission tokens plus the decode appends,
+  // so its lifetime write volume per sequence is (min(in, W) + out) tokens —
+  // the same cap the timing and capacity models already apply. Emitting the
+  // full per-sequence volume (summed over layers) instead of a uniform
+  // per-token value keeps Fig-7 endurance consistent with the write model
+  // that produced the very tpot it is scaled by.
+  //   standard KV per layer-token: 2 * num_kv_heads * head_dim * precision_byte
+  //   compressed KV (MLA):         (kv_lora_rank + qk_rope_head_dim) * precision_byte
   {
-    double kv_bytes_per_token = model_config.compressed_kv
+    double kv_bytes_per_layer_token = model_config.compressed_kv
         ? (double)(model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-            * model_config.num_layers * model_config.precision_byte
-        : 2.0 * model_config.num_layers * model_config.num_kv_heads
+            * model_config.precision_byte
+        : 2.0 * model_config.num_kv_heads
             * model_config.head_dim * model_config.precision_byte;
+    double in_len  = (double)model_config.input_len;
+    double out_len = (double)model_config.output_len;
+    double kv_bytes_per_seq = 0.0;
+    for (int layer = 0; layer < model_config.num_layers; ++layer) {
+      double written_tokens = isGlobalAttentionLayer(model_config, layer)
+          ? (in_len + out_len)
+          : (std::min(in_len, (double)model_config.attn_chunk_size) + out_len);
+      kv_bytes_per_seq += kv_bytes_per_layer_token * written_tokens;
+    }
+    // Flash pool = combined capacity minus the reserved HBM stack(s), which are
+    // the activation tier and hold no KV (mirrors footprint.h checkCapacity).
     double flash_capacity = (system_config.use_hbf && system_config.hbf_config.num_flash_stacks > 0)
-        ? (double)system_config.hbf_config.total_capacity_bytes
+        ? (double)system_config.hbf_config.total_capacity_bytes -
+          (double)system_config.hbf_config.num_hbm_stacks *
+          (double)system_config.hbf_config.hbm_per_stack_bytes
         : (double)system_config.memory_capacity;
-    std::cout << "PEC_KV_BYTES_PER_TOKEN: " << kv_bytes_per_token << std::endl;
+    std::cout << "PEC_KV_BYTES_PER_SEQ: " << kv_bytes_per_seq << std::endl;
     std::cout << "PEC_FLASH_CAPACITY_BYTES: " << flash_capacity << std::endl;
   }
 

@@ -36,6 +36,23 @@ directly rather than through intermediary docs.
 > Two physically-motivated changes were DELIBERATELY DEFERRED by user decision (score-matrix
 > traffic + MFU pair; steady-state context seeding) — see "Deferred by decision" below.
 
+> **Session note (2026-07-03, third pass): Residual-1 RESOLVED (not a bug — capacity mechanism);
+> U7 disposition FINALIZED; 10 new fixes (CHANGES.md items 41-50).** An independent bug hunt (run
+> blind to this file; convergence-checked afterwards; full records in `FINDINGS_REGISTER.md`,
+> paper ground truth in `PAPER_ANCHOR_SHEET.md`) found and fixed: optimizer↔live comm/capacity
+> drift (items 41-43 — NOTE: items #20/#32/#37's "lock-step"/"parity" claims were false, the
+> optimizer mirror had never been updated), a non-node-aware live AllReduce (44), inverted ICT
+> latencies (45), Residual op priced at flash bandwidth on HBF (46), flash-pool double-count +
+> unwindowed Fig-7 PEC (47), the shared expert 16×-undersized in the SRAM footprint gates (48),
+> steady-state decode context on both sides (49 — supersedes deferral #2 below, user-approved;
+> the MFU pair item REMAINS deferred), and Zipf-hot experts accidentally colocated on device 0
+> (50 — scopes the "routing skew ruled out" note below). Residual-1's root cause: the cell is
+> CAPACITY-bound (tpot≈26 ms ≪ SLO); TP=2 wins by TP-sharding non-expert weights into KV headroom
+> (DP-pure ceiling = 3680 = the paper's 460/GPU exactly ⇒ the paper's tool evidently restricted
+> this cell to DP-pure). The old comm-model suspect list below is superseded. U7 final: item 48's
+> bug was real but the cell stays SLO-bound — the throughput-max search escapes the SRAM ceiling
+> via EP=1 (see the U7 section's "THIRD-PASS FINAL" block).
+
 ## Resolved — see CHANGES.md
 
 Full resolution records (original inconsistency, root cause, fix references, final verified
@@ -68,16 +85,24 @@ numbers) are in `CHANGES.md`'s "Paper-comparison items resolved (2026-07-03)" se
 
 ## Still open
 
-### Residual-1 — llama4/HBM4/8-GPU SHORT: batch high / TPS low (only surviving open residual)
+*(none — Residual-1 resolved below, 2026-07-03 third pass)*
 
-Winner `TP=2/PP=1/EP=1/DP=4`. Pre-second-pass: batch +5.1% (483.5/GPU vs 460), TPS −4.9%. The
-comm model prices TP=2 marginally better than the DP-pure layout whose batch (460.0/GPU) equals
-the paper's printed anchor exactly; the fix-37 latency change does NOT alter N=2 (ring == log at
-2 ranks), and fix-39 frees ~1 GB/GPU of vocab weight on this capacity-bound cell, so expect the
-batch side to drift slightly HIGHER — an accepted, documented entanglement (the compensating
-lever is the deferred MFU item below, not comm tuning). Suspects if reopened: MoE cross-replica
-all-to-all volume at dp>1 vs the single attention all-reduce at TP=2 (static audit found the
-ring formula itself correct and the optimizer-vs-live MoE comm drift to be ranking-only).
+### [RESOLVED 2026-07-03 third pass — NOT A BUG] Residual-1 — llama4/HBM4/8-GPU SHORT: batch high / TPS low
+
+**Root cause (measured, adversarially verified — see FINDINGS_REGISTER.md Track A):** the cell is
+**CAPACITY-bound, not SLO- or comm-bound** (tpot ≈ 26 ms ≪ 100 ms at every feasible batch; all OOM
+boundaries probed directly). TP=2 genuinely beats DP-pure: TP shards only the non-expert weights
+(attn QKVO + shared expert + embed/lm_head, −10.36 GiB/GPU at TP=2, verified in recorded weights),
+which buys ~6% more KV headroom → batch ceiling 3908 total (488.5/GPU) vs DP-pure's 3680 → +1.7%
+TPS/GPU despite a real +408 µs/step TP-comm penalty. The full 9-component step decomposition sums
+to the measured latency to the ns in both layouts. **DP-pure's ceiling = 3680 = the paper's
+printed 460/GPU anchor EXACTLY**, so the paper's tool evidently restricted this MoE cell to pure
+DP replication; ours explores the fuller space the paper's own §III objective describes. Matching
+460 would require artificially restricting the search — calibration — and is not recommended.
+The old suspect list (comm mispricing, MoE all-to-all asymmetry) is superseded: comm is 1.8-3.4%
+of tpot here and not the deciding term. The predicted batch drift HIGHER materialized (488.5/GPU
+post-third-pass, +6.2% vs paper; TPS −2.9%). Residual TPS gap at the paper's own batch (−6%
+tpot) is the deferred MFU item, not this cell's config choice.
 
 ### [RESOLVED 2026-07-03 second pass] U9 — llama3_405B/HBM4/8-GPU LONG TPS −13%
 
@@ -231,6 +256,29 @@ mechanism it demonstrates is a property of the model/hardware pair near the SLO 
 to the exact batch number, so it remains valid as illustrative evidence.)
 
 ### U7 — HBF+/CONV+ per-GPU batch grows with GPU count instead of staying flat — not a bug, a documented model divergence from the paper's tool
+
+**THIRD-PASS FINAL (2026-07-03; supersedes the re-audit below where they differ — full derivation
+in FINDINGS_REGISTER.md "U7 FINAL" + Track B sections):**
+1. **A real footprint bug WAS hiding under this item** (CHANGES.md item 48): the shared expert
+   was charged at expert_batch_size (avg tokens/ROUTED expert) instead of the full per-device
+   batch it actually processes — a 16× under-count, now fixed. It is context-INDEPENDENT, so it
+   changes SRAM ceilings without touching the MID/LONG bars (corrected llama4-SHORT-HBF+ ceilings:
+   2824/1883/1130/628 per GPU at EP=1/2/4/8).
+2. **The cell nonetheless stays SLO-bound**: the throughput-max search escapes the SRAM ceiling
+   via EP=1 (the highest-ceiling EP) and lands at 2245/GPU slo-bound (winner tp1/pp1/ep1/dp8) vs
+   the paper's flat ✕ 759. For the paper's tool to report a flat SRAM bar it must BOTH carry a
+   larger per-seq footprint AND not escape via EP.
+3. **Impossibility proof (stronger than the A/B below):** binding SHORT at ~759 while leaving MID
+   unbound at 742 requires an O(ctx) coefficient ≤ 2.3 B/token; the smallest physical score
+   coefficient is ≈20 B/token (tp8). No context-scaled SRAM charge fits the paper's own bars.
+4. **"327" reconciled exactly**: 320 MiB/(2·40 heads·6399·2 B) = **327.7** — the paper's TEXT
+   quotes a score-INCLUSIVE MID-context ceiling while its MID/LONG BARS are score-EXCLUSIVE.
+   The paper is internally inconsistent; no single accounting satisfies text + all bars.
+5. Post-fix curiosity (recorded, no action): the score-inclusive DIAGNOSTIC ceiling with item-48
+   applied reads 755.6/GPU (434 KB/seq) ≈ the paper's ✕ bar — but adopting it as the gate would
+   sink MID to ~254 vs the paper's own 742 (point 3 stands).
+**Disposition: keep the current gate; the divergence on this one bar is a paper-internal
+inconsistency, now with the sharpest available mechanism map.**
 
 **ADVERSARIAL RE-AUDIT (2026-07-03 second pass): explanation SURVIVES, strengthened.** Two new
 findings: (1) the paper-text "327 seq/GPU (Llama 4 Maverick)" does not match the llama4 SHORT
@@ -472,12 +520,12 @@ can pick them up as a PAIR:
    **Honest post-fix state**: with the ring-latency overcharge (item 37) gone, llama3 SHORT/MID
    tpot reads ~4-6% FAST vs paper (TPS high; e.g. MID TPS/GPU 1904.7). This is the exposed
    compute-under-charge, no longer masked by accidental cancellation.
-2. **Steady-state decode context seeding.** Decode tpot is measured over 10 iterations seeded at
-   `current_len = input_len` (start-of-generation), while steady-state serving averages
-   `input + output/2`. Raises tpot ~2-3% on SHORT/MID, ~0.2% on LONG; helps the post-fix-37
-   fast cells, slightly worsens llama4 SHORT. Deferred with the MFU item (same cells, same
-   direction); the CAPACITY convention stays at full `input+output` — steady-state there was
-   REFUTED (overshoots SHORT by +7%).
+2. **[APPLIED 2026-07-03 third pass — no longer deferred]** ~~Steady-state decode context
+   seeding.~~ Applied as CHANGES.md item 49 with fresh user approval (live seeding AND the
+   analytic read basis both moved to `input + output/2`; capacity stays full `input+output` as
+   established). Item 1 above (score-traffic + MFU pair) **remains deferred** — so llama3
+   SHORT/MID TPS currently reads ~5-8% fast vs the paper (the exposed compute under-charge, no
+   longer masked). A future pass deciding item 1 should re-measure those cells.
 
 ## Ruled out as causes (for completeness)
 
@@ -491,7 +539,10 @@ drift" (a GiB-vs-GB units artifact in the comparison itself, not a real drift).
 
 Flash bandwidth constants and llama4's weight footprint (746.4 GiB) match the paper's Table I and
 stated figure exactly. Routing skew (`skewness: 0.8`) doesn't reach U1's capacity-bound operating
-point. Parallelism-ranking communication cost is ≤0.6% of decode time in every checked config
+point — **SCOPE CORRECTION (2026-07-03 third pass): that ruling covered ONLY U1's high-batch
+cells. At llama4 LONG's low batch the index-monotone skew + contiguous placement colocated all
+hot experts on device 0 (~3× bottleneck inflation) — a real artifact, fixed as CHANGES.md item
+50.** Parallelism-ranking communication cost is ≤0.6% of decode time in every checked config
 (confirmed further by the forced-config A/B check in `CHANGES.md` item 26: zero communication either way). The MoE
 activation-divisor bug (`CHANGES.md` item 18) is real but confirmed NOT the cause of U1 (SHORT/
 MID anchors byte-identical before/after that fix). `BUGS_HIDDEN_BY_FLAGS.md` entries are all
