@@ -259,6 +259,14 @@ int main(int argc, char *argv[]) {
   model_config.ne_tp_dg =
       config["system"]["distribution"]["none_expert_tensor_degree"].as<int>();
 
+  // Set workload lengths on the model config BEFORE any optimizer call: the
+  // analytic KV-READ latency estimate needs the steady-state decode context
+  // (input + output/2) while capacity keeps the full lifetime (input+output);
+  // both derive from these fields. (The later dataset=="synthesis" branch
+  // re-assigns the same values — kept for the real-data path's semantics.)
+  model_config.input_len = input_len;
+  model_config.output_len = output_len;
+
   bool optimize_parallelism = false;
   if (config["system"]["optimize_parallelism"]) {
     optimize_parallelism = config["system"]["optimize_parallelism"].as<bool>();

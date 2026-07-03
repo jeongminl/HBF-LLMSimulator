@@ -391,8 +391,31 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
       double compute_time = total_flops /
           (system_config.compute_peak_flops * effectiveMFU(system_config, batch_size_per_gpu)) * 1e9;
 
-      // KV read time (decode: reads full KV cache from flash/HBM)
-      double kv_read_size = kv_cache_per_gpu;
+      // KV read time (decode). CONTEXT BASIS: the capacity term above sizes the
+      // FULL lifetime (input+output — a sequence must fit at its longest), but
+      // the per-step READ volume the live simulator measures is the
+      // steady-state average context (input + output/2: continuous batching
+      // with arrival matching completion spreads in-flight queries uniformly
+      // over their output lifetime, and the live scheduler seeds decode
+      // sequences at exactly that age). Using the full lifetime here
+      // over-estimated attention-read latency by up to 22% (SHORT), which
+      // deflated seed_tps below its supposed upper-bound role and could prune
+      // the true winner unverified (run_experiments.py's pruning invariant).
+      double steady_ctx = (double)sequence_length;
+      if (model_config.input_len > 0 && model_config.output_len > 0 &&
+          model_config.input_len + model_config.output_len == sequence_length) {
+        steady_ctx = model_config.input_len + model_config.output_len / 2.0;
+      }
+      double kv_read_size;
+      if (model_config.compressed_kv) {
+        kv_read_size = layers_per_stage *
+            (model_config.kv_lora_rank + model_config.qk_rope_head_dim) *
+            precision * batch_size_per_gpu * steady_ctx;
+      } else {
+        kv_read_size = (effectiveKvLenSumAllLayers(model_config, (int)steady_ctx) / pp) *
+            (2.0 * (model_config.num_kv_heads / (double)tp) * model_config.head_dim * precision) *
+            batch_size_per_gpu;
+      }
       double kv_read_time = 0.0;
       if (use_flash) {
         const auto& hbf = system_config.hbf_config;
