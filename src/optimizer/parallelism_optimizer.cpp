@@ -148,10 +148,13 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
         double routed = (double)model_config.num_routed_expert / devices_per_stage *
                         model_config.ffn_way * hidden_dim *
                         model_config.expert_intermediate_dim * precision;
-        // Shared experts: fully replicated on each device (not TP-split).
+        // Shared experts: TP-sharded at runtime (expert.cpp builds shared_expert_ffn
+        // on non_moe_device_list of size ne_tp_dg = tp), so divide by tp to mirror
+        // the actually-constructed tensor bytes (verified against the live sim's
+        // recorded per-GPU weights: 116.384 GiB @ tp1 vs 106.020 GiB @ tp2).
         double shared = (double)model_config.num_shared_expert *
                         model_config.ffn_way * hidden_dim *
-                        model_config.expert_intermediate_dim * precision;
+                        model_config.expert_intermediate_dim * precision / tp;
         mlp_weights_per_gpu = routed + shared;
         // Use top_k active experts (not num_routed/tp): the outer /tp in total_flops
         // provides the TP split, so no inner /tp here.  No * precision: param count.
@@ -502,39 +505,65 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
       // Communication latency
       // TP All-Reduce (2 per layer) and PP send/receive share the same message shape.
       double inter_stage_message_size = batch_size_per_gpu * hidden_dim * precision;
-      // Ring all-reduce, matching the live simulator's AllReduce::forward exactly
-      // (src/module/communication.cpp): for a group of size N, cost = 2*(N-1) hops,
-      // each hop paying one device_ict_latency plus 1/N of the message over
-      // device_ict_bandwidth. Two all-reduces per layer (attention + FFN). This
-      // recurs identically on EVERY pp stage (each stage does its own TP all-reduce
-      // over its own layers), so it stays a PER-STAGE term below (added into
-      // stage_latency_ns, not total_latency_ns directly).
+      // All-reduce cost model, mirroring the live AllReduce::forward
+      // (src/module/communication.cpp): bandwidth-optimal volume 2(N-1)/N * size per
+      // link, plus a LOGARITHMIC latency term 2*ceil(log2(N)) (recursive-doubling on
+      // the NVSwitch-connected Rubin node) -- NOT the ring's 2(N-1) sequential hops.
+      // Groups that span nodes (rank stride > gpus per node) pay the inter-node link.
+      int gpus_per_node = system_config.num_device;
+      auto allreduce_ns = [&](int n_ranks, double msg_bytes) -> double {
+        if (n_ranks <= 1) return 0.0;
+        bool cross_node = n_ranks > gpus_per_node;
+        double lat = cross_node ? system_config.node_ict_latency
+                                : system_config.device_ict_latency;
+        double bw  = cross_node ? system_config.node_ict_bandwidth
+                                : system_config.device_ict_bandwidth;
+        double latency_hops = 2.0 * std::ceil(std::log2((double)n_ranks));
+        return latency_hops * lat +
+               (2.0 * (n_ranks - 1) / n_ranks) * (msg_bytes / bw * 1e9);
+      };
+      // Two all-reduces per layer (attention + FFN). Recurs identically on EVERY pp
+      // stage, so it stays a PER-STAGE term (added into stage_latency_ns).
       double tp_comm_time = 0.0;
       if (tp > 1) {
-        double per_allreduce =
-            2.0 * (tp - 1) * system_config.device_ict_latency +
-            (2.0 * (tp - 1) / tp) * (inter_stage_message_size / system_config.device_ict_bandwidth * 1e9);
-        tp_comm_time = 2.0 * layers_per_stage * per_allreduce;
+        tp_comm_time = 2.0 * layers_per_stage * allreduce_ns(tp, inter_stage_message_size);
       }
 
-      // MoE scatter/gather overhead: when e_tp_dg < devices_per_stage, each MoE layer
-      // requires scattering a fraction of the batch tokens to another device and gathering
-      // results back (NVLink hop).  When e_tp_dg == devices_per_stage, all experts are
-      // local to each device (EP-TP group) so scatter is eliminated.
-      // This term correctly makes EP=devices_per_stage strictly better than EP < devices_per_stage
-      // when bandwidth and page-latency are otherwise equivalent (as on HBM). Also a
-      // PER-STAGE term (each stage's own MoE layers), same reasoning as TP above.
-      double scatter_time = 0.0;
-      if (model_config.num_routed_expert > 0 && e_tp_dg < devices_per_stage) {
-        double scatter_frac = 1.0 - (double)e_tp_dg / devices_per_stage;
-        // Tokens that need to cross a device boundary (scatter + gather = 2×)
-        double scatter_msg = scatter_frac * batch_size_per_gpu * model_config.top_k *
+      // MoE communication, mirroring the live modules per MoE layer
+      // (expert.cpp: MoEScatter -> e_tp all-reduce -> MoEGather -> ne_tp all-reduce):
+      //  - scatter: crossing fraction excludes the ne_tp(=tp) group
+      //    (communication.cpp MoEScatter builds its exclusion set from ne_tp_dg) and
+      //    the volume is divided by ne_tp_dg (TP-replicated tokens are sent once);
+      //  - gather: crossing fraction excludes the e_tp group and the volume is
+      //    divided by e_tp_dg * ne_tp_dg (communication.cpp MoEGather);
+      //  - link: decode-path selection is device_ict when num_node == 1, node_ict
+      //    otherwise (communication.cpp decode branches);
+      //  - the two all-reduces use the shared allreduce_ns model above (the e_tp
+      //    group spans nodes when e_tp_dg > gpus_per_node).
+      double moe_comm_time = 0.0;
+      if (model_config.num_routed_expert > 0) {
+        bool multi_node = system_config.num_node > 1;
+        double link_lat = multi_node ? system_config.node_ict_latency
+                                     : system_config.device_ict_latency;
+        double link_bw  = multi_node ? system_config.node_ict_bandwidth
+                                     : system_config.device_ict_bandwidth;
+        double token_bytes = batch_size_per_gpu * model_config.top_k *
                              hidden_dim * precision;
-        // 2 (scatter + gather) × moe_layers_in_stage intra-node NVLink round-trips
-        scatter_time = 2.0 * moe_layers_in_stage *
-                       (system_config.device_ict_latency +
-                        scatter_msg / system_config.device_ict_bandwidth * 1e9);
+        double scatter_ns = 0.0, gather_ns = 0.0;
+        if (e_tp_dg < devices_per_stage) {
+          double scatter_frac = 1.0 - (double)tp / devices_per_stage;
+          double gather_frac  = 1.0 - (double)e_tp_dg / devices_per_stage;
+          scatter_ns = link_lat +
+                       (scatter_frac * token_bytes / tp) / link_bw * 1e9;
+          gather_ns  = link_lat +
+                       (gather_frac * token_bytes / (e_tp_dg * tp)) / link_bw * 1e9;
+        }
+        double e_tp_ar_ns  = allreduce_ns(e_tp_dg, token_bytes);
+        double ne_tp_ar_ns = allreduce_ns(tp, inter_stage_message_size);
+        moe_comm_time = moe_layers_in_stage *
+                        (scatter_ns + gather_ns + e_tp_ar_ns + ne_tp_ar_ns);
       }
+      double scatter_time = moe_comm_time;
 
       // total_latency_ns above (compute/weight/kv terms, "max" or "sum" model) plus
       // tp_comm_time and scatter_time together are ONE PIPELINE STAGE's decode-step
