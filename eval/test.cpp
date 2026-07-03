@@ -80,7 +80,11 @@ int main(int argc, char *argv[]) {
     // its Rubin-based systems verbatim: "NVLink (1,800 GB/s) for intra-node GPU
     // communication".
     system_config.device_ict_bandwidth = 1800.0 * 1000 * 1000 * 1000; // B/s
-    system_config.device_ict_latency = 0.8 * 1000; // ns
+    // The paper anchors NO interconnect latencies (bandwidths only). The previous
+    // 0.8 us here (an H100-era carry-over) was also INVERTED against the IB value
+    // (0.13 us) — NVLink cannot be slower end-to-end than cross-node InfiniBand.
+    // Use a datasheet-plausible per-hop NVLink/NVSwitch latency.
+    system_config.device_ict_latency = 0.5 * 1000; // ns
   }else{
     fail("Not support NVLink generation");
   }
@@ -92,7 +96,10 @@ int main(int argc, char *argv[]) {
   }
   else if(config["system"]["infiniband_gen"].as<int>() == 800){
     system_config.node_ict_bandwidth = 100.0 * 1000 * 1000 * 1000; // B/s InfiniBand XDR
-    system_config.node_ict_latency = 0.13 * 1000; // ns
+    // End-to-end cross-node latency (NIC + switch fabric), datasheet-plausible.
+    // The previous 0.13 us was a NIC port-to-port figure and sat BELOW the NVLink
+    // constant — physically inverted (see NVLink block above).
+    system_config.node_ict_latency = 3.0 * 1000; // ns
   }
   else if(config["system"]["infiniband_gen"].as<int>() == 3600){
     system_config.node_ict_bandwidth = 450.0 * 1000 * 1000 * 1000; // B/s NVLink 4th Gen
