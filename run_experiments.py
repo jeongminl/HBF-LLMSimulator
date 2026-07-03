@@ -268,7 +268,10 @@ def run_simulation(model, mem_type, num_device, batch_size, input_len, output_le
         sram_diag_ceiling = None  # score-inclusive SRAM ceiling, diagnostic only (see cluster.cpp)
         dp = known_dp
         for line in stdout.split("\n"):
-            if line.startswith("PEC_KV_BYTES_PER_TOKEN: "):
+            if line.startswith("PEC_KV_BYTES_PER_SEQ: "):
+                # Full per-sequence lifetime KV write volume (all layers, iRoPE
+                # window applied per layer) — replaces the old uniform
+                # PEC_KV_BYTES_PER_TOKEN marker; see eval/test.cpp emission.
                 try:
                     pec_kv_bytes = float(line.split(": ", 1)[1])
                 except Exception:
@@ -760,16 +763,18 @@ def compute_pec(row):
     duplicates or risks desyncing from that)."""
     if row is None or row.get("max_batch", 0) == 0:
         return None
-    kv_bytes_per_token = row.get("pec_kv_bytes")
+    kv_bytes_per_seq = row.get("pec_kv_bytes")
     capacity = row.get("pec_capacity")
-    if kv_bytes_per_token is None or capacity is None or capacity == 0:
+    if kv_bytes_per_seq is None or capacity is None or capacity == 0:
         return None
 
     in_len, out_len = WORKLOADS[row["workload"]]
-    # kv_bytes_per_token is the system-total KV bytes per token (all GPUs, all
-    # layers).  Dividing by row["gpus"] gives per-GPU write rate, which is
-    # correct for any TP/PP split (uniform sharding).
-    kv_size = kv_bytes_per_token * (in_len + out_len)
+    # kv_bytes_per_seq is the system-total lifetime KV write volume per
+    # sequence (all GPUs, all layers, per-layer iRoPE window applied — emitted
+    # by the binary so it can never desync from the write-timing model).
+    # Dividing by row["gpus"] gives per-GPU write rate, which is correct for
+    # any TP/PP split (uniform sharding).
+    kv_size = kv_bytes_per_seq
     num_gpus = row["gpus"]
 
     # Completion rate ≈ max_batch / out_len per decode step. NOTE: uses the RAW

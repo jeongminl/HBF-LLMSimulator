@@ -63,8 +63,14 @@ inline CapacityResult checkCapacity(const SystemConfig& s,
   if (s.use_hbf && s.hbf_config.num_flash_stacks > 0) {
     const auto& hbf = s.hbf_config;
 
-    // Weights + KV live on flash
-    double flash_cap = static_cast<double>(hbf.total_capacity_bytes);
+    // Weights + KV live on flash ONLY. total_capacity_bytes is the paper's
+    // Table-I combined figure (HBM + flash: 3,620 GB for HBF/CONV includes the
+    // 36-GB reserved HBM stack); the HBM stack is the activation tier below and
+    // must not also back weights/KV — subtract it to get the physical flash pool
+    // (7x512 = 3,584 GB for HBF/CONV; unchanged 4,096 GB for HBF+/CONV+).
+    double flash_cap = static_cast<double>(hbf.total_capacity_bytes) -
+                       static_cast<double>(hbf.num_hbm_stacks) *
+                       static_cast<double>(hbf.hbm_per_stack_bytes);
     if (weight + kv > flash_cap) {
       return {true,
               "Flash capacity exceeded (" +
