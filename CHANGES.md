@@ -627,3 +627,76 @@ established practice of retaining superseded analysis with a pointer to the corr
     22) and the ranking objective (item 23: `argmin(latency)`→`argmax(throughput)`) now fixed, the
     optimizer's config selection is grounded in a real, correctly-computed comparison going
     forward.
+
+27. **`num_max_batched_token` hardcoded to 8192 made every batch > 8192 crash on a zero-length
+    `Sequence`, masquerading as a real capacity ceiling.** `eval/test.cpp:507` constructs the
+    scheduler with `num_max_batched_token = 8192` (a fixed literal, independent of the batch under
+    test). `Scheduler::getMaxMetadata` (`src/scheduler/scheduler.cpp:261`) then derives each
+    sequence's length as `int seq_len = num_max_batched_token / batch_size_per_dp;`. For any
+    `batch_size_per_dp > 8192` this integer-divides to **0**, and the immediately-following
+    `Sequence::Create(seq_len, seq_len)` trips `sequence.cpp:19`'s `assertTrue(input_len > 0, ...)`
+    ("input len is 0"), aborting the process with a non-zero exit. `run_experiments.py`'s
+    `run_simulation` catches any non-zero exit as `"OOM/Crash"` (line 154) and `classify_failure`
+    returns `"unknown"` (no capacity marker present), so `find_max_batch_size` reads the crash as a
+    genuine capacity ceiling and stops the batch search at 8192 — under-reporting the true feasible
+    batch for any cell whose real ceiling exceeds 8192/dp. **Fix:** clamp `if (seq_len < 1) seq_len
+    = 1;` — provably a no-op for every batch ≤ 8192 (where `seq_len` was already ≥ 1), and for
+    larger batches it lets the sequence be built with the minimum valid length so the run proceeds
+    to the real SLO/capacity check instead of aborting. Verified batches 8193/9000/15000 now
+    terminate on a legitimate SLO violation or capacity rejection rather than the assert. Same bug
+    *class* as the sibling worktree's activation-overflow fixes (`BUGS_FIXES.md` T2), but a distinct
+    site (scheduler metadata construction, not the activation-size formula). **Impact on the paper
+    comparison:** materially changed U7's HBF+/CONV+ shape (the old monotonic-growth-to-2149 anchor
+    was partly the crash capping the search at 8192; post-fix the per-GPU batch peaks at 4 GPU and
+    declines to an SRAM-bound ceiling by 16 GPU — a much closer match to the paper's flat/SRAM-bound
+    curve; see `PAPER_INCONSISTENCIES.md` U7).
+
+28. **GQA "current-token k,v" activation term used `num_heads` where the projection produces
+    `num_kv_heads` — an over-count of the resident k/v footprint.** `src/model/footprint.h`'s
+    `peakIntermediateBytes` GQA-base branch (~line 190) sized the current decode step's freshly
+    projected key/value tensors as `batch_per_dp * 2.0 * head_dim * num_heads / tp`. Under grouped-
+    query attention the k/v projections emit `num_kv_heads` heads, not `num_heads` (confirmed against
+    `src/module/attention.cpp`'s actual k/v tensor shapes) — for llama4_maverick/llama3_405B
+    (`num_heads=128`, `num_kv_heads=8`) this over-counted that one term 16×. **Fix:** `num_heads` →
+    `num_kv_heads` in that term only. Isolated to the GQA-base branch (the MLA `use_absorb` /
+    `compressed_kv` branches never execute it), so it is a **no-op for deepseekV3-style MLA models**.
+    **Numerically inert on every current anchor tested**, for two independent reasons: (a) for
+    llama4_maverick the FFN-phase MoE term dominates `max(attn_phase, ffn_phase)`, so the attention
+    term never binds the scarce-tier gate; (b) for llama3_405B none of the tested SHORT/MID GPU
+    counts are SRAM-bound. Notably this fix makes the HBF+/CONV+ SRAM ceiling *tighter* (moves U7's
+    numbers slightly *further* from the paper's looser reported ceiling), which is itself evidence it
+    is a real correctness fix and not a paper-matching adjustment. Kept regardless of its inertness:
+    the two footprint gates (`peakIntermediateBytes` here and `cluster.cpp`'s Part C) share this one
+    definition, so the term must be correct for any future config where `num_heads != num_kv_heads`
+    and the attention phase does bind.
+
+29. **Optimizer's HBM-path MoE `weight_for_latency` used an unjustified `sparse_ratio` discount that
+    contradicted the live simulator's own per-expert dispatch.** `parallelism_optimizer.cpp`'s
+    latency estimate (Fix 2c) charged routed-expert weight-read bandwidth differently by memory tier:
+    the **flash** branch used the physically-grounded `e_active` model (the number of on-device
+    experts that receive ≥1 token, each streaming its full `k·n` weight), but the **HBM** branch
+    applied `sparse_ratio = top_k / num_routed_expert` to the *per-device* routed weight — at the
+    SHORT anchor this charged the equivalent of ~1 expert's weight where the flash path (same
+    operating point) charges ~16–32. Two independent audits (the second explicitly tasked with
+    refuting the first) agreed it was wrong on its own merits: (a) it contradicted the flash branch
+    for the identical operating point; (b) it contradicted the live simulator's actual dispatch —
+    `ExpertFFN::forward` (`src/module/expert.cpp`) loops per expert, charging each full `k·n` weight
+    via `getLinearMemoryDuration`, skipped only when a device receives zero tokens for that expert;
+    this is memory-tier-agnostic, and there is **no grouped-GEMM / active-row HBM-specific
+    optimization anywhere in the dispatch code**; (c) the "accounts for compute-memory overlap"
+    rationale double-counts — the default `optimizer_latency_model=="max"` already credits overlap via
+    `max(compute, weight_mem)`; (d) the paper (Son et al., §III) frames the HBM-vs-flash distinction
+    as purely a read/write-bandwidth asymmetry, with large-batch benefit coming from amortizing
+    active-expert weight-read across queries — exactly what `e_active` captures and a fixed
+    `sparse_ratio` does not. **Fix:** both tiers now use the `e_active` model (the HBM `else` branch
+    is deleted). **Provably cannot regress dense models** (llama3_405B never enters the
+    `num_routed_expert > 0` block). **Measured before/after on the current binary: byte-identical on
+    every llama4_maverick anchor** — HBM4/8-GPU SHORT (500.0/GPU), MID (158.88/GPU), and LONG across
+    all four SLOs (258/258/264/264 total; TPS/GPU 1401/1401/184/184) are unchanged to full precision.
+    The reason is regime, not coincidence: in the `"max"` latency model these operating points are
+    compute-bound (SHORT/MID) or capacity/SLO-pinned (LONG), so raising the routed-weight estimate
+    ~128× never makes `max(compute, weight_mem)` flip to weight-bound and the ranking/selection is
+    untouched. Applied as a ranking-only correctness/consistency fix (it never gates SLO pass/fail —
+    `checkCapacity` and the live-simulator TPOT remain the only hard/authoritative signals) that
+    unifies the two memory paths and hardens the estimate for any future constants where the weight
+    term would bind; see `PAPER_INCONSISTENCIES.md` U1/U2.

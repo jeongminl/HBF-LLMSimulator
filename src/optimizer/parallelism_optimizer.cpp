@@ -200,13 +200,26 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
         if (e_active < 1.0) e_active = 1.0;
       }
 
-      // Fix 2c: Effective weight for LATENCY.
-      // Flash path (use_flash=true): use E_active-based active expert weight — the simulator
-      //   streams the full weight of every active expert, and page latency makes each op
-      //   sequential, so the active-expert count is the right bandwidth multiplier.
-      // HBM path (use_flash=false): keep the historical sparse-ratio formula that was
-      //   calibrated against HBM timing; it accounts for the compute-memory overlap that
-      //   the "sum" latency model cannot model directly.
+      // Fix 2c: Effective weight for LATENCY — E_active-based active-expert weight for
+      // BOTH memory tiers.
+      // The live simulator dispatches routed experts identically regardless of memory tier
+      // (ExpertFFN::forward loops per active expert, charging each full k·n weight via
+      // getLinearMemoryDuration, skipped only when a device receives zero tokens for that
+      // expert — src/module/expert.cpp / src/hardware/linear_impl.cpp). There is NO
+      // grouped-GEMM / active-row HBM-specific optimization anywhere in the dispatch code,
+      // so the number of active experts whose weight is streamed is the right bandwidth
+      // multiplier for HBM exactly as it is for flash.
+      // The previous HBM branch applied a sparse_ratio = top_k/num_routed discount inherited
+      // from an older "calibrated against HBM timing" formula. It was wrong on its own merits:
+      //   (a) it contradicted this flash branch's E_active model for the identical operating
+      //       point (at the SHORT anchor it charged the weight of ~1 expert vs. flash's ~16-32);
+      //   (b) it contradicted the live simulator's own per-expert dispatch (above);
+      //   (c) the "accounts for compute-memory overlap" rationale double-counts — the default
+      //       optimizer_latency_model=="max" already credits overlap via max(compute, weight_mem);
+      //   (d) the paper (Son et al., §III) frames the HBM-vs-flash distinction as purely a
+      //       read/write-bandwidth asymmetry, with large-batch benefit coming from amortizing
+      //       active-expert weight-read across queries — exactly what E_active captures and a
+      //       fixed sparse_ratio does not. See PAPER_INCONSISTENCIES.md U1/U2.
       double weight_for_latency = weight_per_gpu;  // default: same as capacity weight (non-MoE)
       if (model_config.num_routed_expert > 0 && model_config.top_k > 0) {
         double shared_per_moe_layer = (double)model_config.num_shared_expert *
@@ -217,22 +230,11 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
         double non_routed = layers_per_stage * attn_weights_per_gpu +
                             moe_layers_in_stage * shared_per_moe_layer +
                             non_moe_layers * dense_ffn_per_layer;
-        if (use_flash) {
-          // Flash: E_active experts' full weight streamed sequentially per page-read op.
-          double routed_active = e_active *
-                                 model_config.ffn_way * hidden_dim *
-                                 model_config.expert_intermediate_dim * precision;
-          weight_for_latency = non_routed + moe_layers_in_stage * routed_active;
-        } else {
-          // HBM: historical sparse-ratio formula (top_k/num_routed applied to per-device
-          // routed weight). Use num_routed/devices_per_stage (e_tp_dg cancels, same as
-          // mlp_weights formula above).
-          double sparse_ratio = (double)model_config.top_k / model_config.num_routed_expert;
-          double routed_per_moe_layer = (double)model_config.num_routed_expert / devices_per_stage *
-                                         model_config.ffn_way * hidden_dim *
-                                         model_config.expert_intermediate_dim * precision;
-          weight_for_latency = non_routed + moe_layers_in_stage * routed_per_moe_layer * sparse_ratio;
-        }
+        // E_active experts' full weight streamed sequentially per dispatch op (both tiers).
+        double routed_active = e_active *
+                               model_config.ffn_way * hidden_dim *
+                               model_config.expert_intermediate_dim * precision;
+        weight_for_latency = non_routed + moe_layers_in_stage * routed_active;
       }
 
       // KV cache size. Uses effectiveKvLenSumAllLayers() (model/model_config.h) instead of

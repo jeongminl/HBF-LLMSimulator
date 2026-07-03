@@ -3,12 +3,20 @@ import sys
 import json
 import yaml
 import subprocess
-import glob
-import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BUILD_DIR = os.path.join(SCRIPT_DIR, "build")
 DATA_DIR = os.path.join(SCRIPT_DIR, "data")
+
+# Default pool width for parallelizing independent sweep cells (main() below). Each cell's
+# OWN batch-size search is strictly sequential internally (find_max_batch_size's
+# exponential/binary search issues one ./run at a time) -- only the OUTER loop over
+# independent (model, workload, mem, gpu) cells is parallelized, so N workers means at most
+# N concurrent ./run subprocesses. Leaves headroom (the -2) for the driver process itself;
+# override via the SWEEP_WORKERS env var if this box's core count/memory profile differs.
+DEFAULT_WORKERS = max(1, min((os.cpu_count() or 4) - 2, 18))
+SWEEP_WORKERS = int(os.environ.get("SWEEP_WORKERS", DEFAULT_WORKERS))
 
 # Must match model names with compressed_kv=true (MLA) in model_config.h.
 MLA_MODELS = {"deepseekV3", "deepseekR1"}
@@ -77,7 +85,7 @@ def apply_mla_flags(cfg, model):
     cfg["system"]["optimization"]["use_absorb"] = is_mla
     cfg["system"]["optimization"]["use_flash_mla"] = is_mla
 
-def run_simulation(model, mem_type, num_device, batch_size, input_len, output_len, optimize_parallelism=True, tpot_slo=0.1, distribution=None, mfu_max=None, mfu_m_half=None):
+def run_simulation(model, mem_type, num_device, batch_size, input_len, output_len, optimize_parallelism=True, tpot_slo=0.1, distribution=None, mfu_max=None, mfu_m_half=None, temp_cfg_name="config_temp.yaml", worker_tag=None):
     # mfu_max/mfu_m_half: optional compute-utilization (MFU) override, forwarded to
     # config.yaml's simulation.mfu_max/mfu_m_half (see SystemConfig::mfu_max/mfu_m_half,
     # hardware_config.h). None (default) omits the key entirely, so the C++ binary keeps
@@ -89,6 +97,13 @@ def run_simulation(model, mem_type, num_device, batch_size, input_len, output_le
     # dp is derived here (total_gpus/(tp*pp)) since with an explicit distribution we already
     # know it; when distribution is None, dp/tp/pp/ep are parsed from the optimizer's own
     # "[Parallelism Optimizer] Found optimal configuration" stdout line instead.
+    # temp_cfg_name/worker_tag: I/O-isolation for parallel callers. temp_cfg_name is the
+    # config filename written under BUILD_DIR (defaults to the original shared name, so
+    # sequential/single-process callers are unaffected). worker_tag, when set, additionally
+    # isolates the CSV output directory (see below) so concurrent calls sharing the same
+    # (model, gpu, batch) but different mem_type -- whose CSV filename does NOT encode
+    # mem_type (only processor_type, which this script never varies) -- cannot clobber each
+    # other's CSV file.
     # Load default config
     with open(os.path.join(SCRIPT_DIR, "config.yaml"), "r") as f:
         cfg = yaml.safe_load(f)
@@ -136,12 +151,30 @@ def run_simulation(model, mem_type, num_device, batch_size, input_len, output_le
     if mfu_m_half is not None:
         cfg["simulation"]["mfu_m_half"] = mfu_m_half
 
+    # Suppress the per-op timeboard dump (config.yaml's log.print_log default: on).
+    # Verified cosmetic-only: gates exactly one std::cout-only call
+    # (top_module_graph->print_timeboard(), eval/test.cpp) which is the LAST statement
+    # before main() returns -- strictly after the CSV write and every stdout marker this
+    # function parses below (Total:/PEC_*/optimizer config/OOM markers). No overlap with
+    # anything read here; this only removes the dominant per-op wall-clock cost documented
+    # in BUGS_FIXES.md #3/T3. The on-disk config.yaml itself is untouched (only this
+    # in-memory copy, dumped to the temp config), so a bare `./run config.yaml` is unaffected.
+    cfg["log"]["print_log"] = False
+    if worker_tag is not None:
+        # Isolate this worker's CSV output directory. Required for safe parallelism: the
+        # CSV filename (eval/test.cpp) encodes processor_type, NOT mem_type, so two
+        # concurrent calls differing only in mem_type at the same batch would otherwise
+        # emit the identical path and clobber each other's file.
+        out_dir = f"../data/{worker_tag}/"
+        cfg["log"]["output_directory"] = out_dir
+        os.makedirs(os.path.join(DATA_DIR, worker_tag), exist_ok=True)
+
     # Save temp config inside build
-    temp_cfg_path = os.path.join(BUILD_DIR, "config_temp.yaml")
+    temp_cfg_path = os.path.join(BUILD_DIR, temp_cfg_name)
     with open(temp_cfg_path, "w") as f:
         yaml.safe_dump(cfg, f)
 
-    cmd = ["./run", "config_temp.yaml"]
+    cmd = ["./run", temp_cfg_name]
     try:
         res = subprocess.run(cmd, cwd=BUILD_DIR, capture_output=True, text=True, timeout=1800)
         stdout = res.stdout + "\n" + res.stderr
@@ -155,13 +188,23 @@ def run_simulation(model, mem_type, num_device, batch_size, input_len, output_le
 
         # Parse total simulation time.  cluster.cpp also emits "Total: X.XXXeGB"
         # memory-size lines; skip those by rejecting values containing letters.
+        # cluster.cpp additionally prints the exact CSV output path as the line
+        # immediately following the numeric "Total: " line (unconditionally on the
+        # success path) -- capture it here instead of globbing data/ afterward (see
+        # csv_file below): safer (globbing an entire directory for "the newest file"
+        # is a race under concurrent callers) and strictly equivalent (the CSV name is
+        # a pure deterministic function of config params, no randomness/timestamp).
         total_time_ns = None
-        for line in stdout.split("\n"):
+        raw_csv_line = None
+        lines = stdout.split("\n")
+        for i, line in enumerate(lines):
             if line.startswith("Total: "):
                 raw = line[len("Total: "):].strip()
                 if raw and not any(c.isalpha() for c in raw):
                     try:
                         total_time_ns = float(raw)
+                        if i + 1 < len(lines):
+                            raw_csv_line = lines[i + 1].strip()
                     except ValueError:
                         pass
         if total_time_ns is None:
@@ -195,19 +238,18 @@ def run_simulation(model, mem_type, num_device, batch_size, input_len, output_le
                 except Exception:
                     pass
 
-        # Find the newly generated or modified CSV file
-        csv_files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
+        # Resolve the CSV path printed by the binary (see comment above). It's printed
+        # relative to BUILD_DIR (the binary runs with cwd=BUILD_DIR), e.g. "../data/....csv"
+        # -- normalize against BUILD_DIR, which is algebraically identical to DATA_DIR/<name>
+        # (BUILD_DIR/../data == DATA_DIR). No fallback to a directory scan: the printed line
+        # is unconditionally guaranteed once a numeric "Total: " was already found (both are
+        # only reachable after cluster.cpp's export code has run); a silent glob fallback
+        # would reintroduce the exact shared-directory race this replaces. If the expected
+        # line is somehow missing, leave csv_file as None -- parse_csv_breakdown already
+        # degrades gracefully for a missing/None path, same as today's "no CSV found" case.
         csv_file = None
-        newest_time = 0
-        current_time = time.time()
-        for f in csv_files:
-            try:
-                mtime = os.path.getmtime(f)
-                if mtime > newest_time and (current_time - mtime) < 15:
-                    newest_time = mtime
-                    csv_file = f
-            except:
-                pass
+        if raw_csv_line:
+            csv_file = os.path.normpath(os.path.join(BUILD_DIR, raw_csv_line))
 
         # Fallback: if dp still unknown (e.g. optimize_parallelism was False without an
         # explicit distribution -- shouldn't happen in this script, but guard anyway),
@@ -220,7 +262,7 @@ def run_simulation(model, mem_type, num_device, batch_size, input_len, output_le
     except Exception as e:
         return {"success": False, "reason": str(e), "stdout": ""}
 
-def run_analytic_sweep(model, mem_type, num_device, input_len, output_len, tpot_slo=0.1):
+def run_analytic_sweep(model, mem_type, num_device, input_len, output_len, tpot_slo=0.1, temp_cfg_name="config_temp.yaml"):
     """Fast, in-process (no discrete-event simulation) batch-size search using ONLY
     the analytic max()-model, via eval/test.cpp's analytic_sweep_only mode (which
     calls ParallelismOptimizer::Optimize() repeatedly -- capacity/SRAM are hard
@@ -252,14 +294,18 @@ def run_analytic_sweep(model, mem_type, num_device, input_len, output_len, tpot_
     cfg["simulation"]["output_len"] = output_len
     cfg["system"]["tpot_slo"] = tpot_slo
     cfg["system"]["analytic_sweep_only"] = True
+    # Cosmetic-only suppression, same justification as run_simulation's identical line
+    # (the analytic-sweep-only path returns before ever reaching the gated print call
+    # anyway, so this is a no-op here in practice; kept for uniformity/future-proofing).
+    cfg["log"]["print_log"] = False
 
-    temp_cfg_path = os.path.join(BUILD_DIR, "config_temp.yaml")
+    temp_cfg_path = os.path.join(BUILD_DIR, temp_cfg_name)
     with open(temp_cfg_path, "w") as f:
         yaml.safe_dump(cfg, f)
 
     result = {"max_batch": 0, "cap_batch": 0, "cap_feasible_at_1": False,
               "tp": None, "pp": None, "ep": None, "dp": None}
-    cmd = ["./run", "config_temp.yaml"]
+    cmd = ["./run", temp_cfg_name]
     try:
         res = subprocess.run(cmd, cwd=BUILD_DIR, capture_output=True, text=True, timeout=120)
         stdout = res.stdout + "\n" + res.stderr
@@ -315,7 +361,7 @@ def classify_failure(fail_info):
         return "slo"
     return "unknown"
 
-def find_max_batch_size(model, mem_type, num_device, input_len, output_len, tpot_slo=0.1, mfu_max=None, mfu_m_half=None):
+def find_max_batch_size(model, mem_type, num_device, input_len, output_len, tpot_slo=0.1, mfu_max=None, mfu_m_half=None, temp_cfg_name="config_temp.yaml", worker_tag=None):
     # mfu_max/mfu_m_half: forwarded only to the simulator-verification calls (verify()
     # below), not to run_analytic_sweep -- the analytic phase is a heuristic seed only
     # (F1) and find_max_batch_size already reconciles analytic/simulator disagreement
@@ -350,7 +396,8 @@ def find_max_batch_size(model, mem_type, num_device, input_len, output_len, tpot
     # max_b failed -- "sram"/"flash"/"slo"/"unknown". Used only for Fig. 3's
     # SRAM-bound hatching (paper convention); callers not plotting Fig. 3 can
     # discard it.
-    analytic = run_analytic_sweep(model, mem_type, num_device, input_len, output_len, tpot_slo)
+    analytic = run_analytic_sweep(model, mem_type, num_device, input_len, output_len, tpot_slo,
+                                   temp_cfg_name=temp_cfg_name)
     b_analytic = analytic["max_batch"]
 
     # Tracks the tightest known failing verify() call across this whole search,
@@ -359,7 +406,8 @@ def find_max_batch_size(model, mem_type, num_device, input_len, output_len, tpot
 
     def verify(b, distribution=None):
         res = run_simulation(model, mem_type, num_device, b, input_len, output_len, True, tpot_slo,
-                              distribution=distribution, mfu_max=mfu_max, mfu_m_half=mfu_m_half)
+                              distribution=distribution, mfu_max=mfu_max, mfu_m_half=mfu_m_half,
+                              temp_cfg_name=temp_cfg_name, worker_tag=worker_tag)
         if not res["success"]:
             last_fail["reason"] = res.get("reason")
             last_fail["stdout"] = res.get("stdout", "")
@@ -485,6 +533,29 @@ def find_max_batch_size(model, mem_type, num_device, input_len, output_len, tpot
             high = mid - 1
 
     return max_b, max_tpot, last_csv, last_pec_kv, last_pec_cap, dp, classify_failure(last_fail)
+
+def _run_cell(spec):
+    """Picklable top-level worker for ProcessPoolExecutor (main(), below): runs ONE
+    independent find_max_batch_size call for the cell described by `spec` (a plain dict --
+    picklable). Isolates its own temp config filename and CSV output directory via a
+    PID-derived tag (see run_simulation's temp_cfg_name/worker_tag) so concurrent workers
+    can never collide on config_temp.yaml or on a CSV filename (which encodes
+    processor_type, not mem_type -- see run_simulation's worker_tag comment).
+
+    Deliberately does NOT do any of the per-cell post-processing (tps/norm_batch/norm_tps/
+    breakdown parsing, result-dict construction, or printing) that main() does for a
+    sequential call -- that all happens in the main process after collecting every future's
+    result, in canonical spec order, so parallel vs. sequential execution is provably
+    behavior-identical: this function computes exactly what a direct find_max_batch_size
+    call would, nothing more, just relocated to a worker process.
+    """
+    worker_tag = f"w{os.getpid()}"
+    temp_cfg_name = f"config_temp_{worker_tag}.yaml"
+    max_b, tpot, csv_path, pec_kv, pec_cap, dp, bound_reason = find_max_batch_size(
+        spec["model"], spec["mem"], spec["gpu"], spec["in_len"], spec["out_len"],
+        spec.get("slo", 0.1), temp_cfg_name=temp_cfg_name, worker_tag=worker_tag)
+    return {**spec, "max_b": max_b, "tpot": tpot, "csv_path": csv_path,
+            "pec_kv": pec_kv, "pec_cap": pec_cap, "dp": dp, "bound_reason": bound_reason}
 
 def parse_csv_breakdown(csv_path):
     if not csv_path or not os.path.exists(csv_path):
@@ -865,13 +936,30 @@ def main():
 
     # Gather baselines first (8 GPU, HBM4, slo=0.1); cached and reused in the
     # main sweep to avoid re-running the same simulation.
-    baselines = {}
+    #
+    # Parallelized across a process pool: each (model, workload) baseline cell is fully
+    # independent (find_max_batch_size depends only on its own scalar arguments -- no
+    # shared mutable state read/written between cells other than this dict, which each
+    # worker doesn't touch at all). This must fully complete (pool `with`-block exit joins
+    # every submitted future) before the main sweep starts, since the main sweep reads
+    # `baselines`. Provably behavior-identical to the old sequential loop: _run_cell computes
+    # exactly what a direct find_max_batch_size call would; all post-processing (tps/
+    # max_b_per_gpu/dict construction/printing) happens here in the main process, unchanged
+    # from before, just reading each cell's result from a future instead of a direct call.
+    baselines = {model: {} for model in models}
     print("--- GATHERING BASELINES (8 GPU HBM4) ---")
-    for model in models:
-        baselines[model] = {}
-        for wl_name, (in_len, out_len) in workloads.items():
-            max_b, tpot, csv_file, pec_kv, pec_cap, dp, bound_reason = find_max_batch_size(
-                model, "HBM4", 8, in_len, out_len, 0.1)
+    baseline_specs = [
+        {"model": model, "wl_name": wl_name, "mem": "HBM4", "gpu": 8,
+         "in_len": in_len, "out_len": out_len, "slo": 0.1}
+        for model in models
+        for wl_name, (in_len, out_len) in workloads.items()
+    ]
+    with ProcessPoolExecutor(max_workers=min(SWEEP_WORKERS, len(baseline_specs))) as pool:
+        futures = [pool.submit(_run_cell, spec) for spec in baseline_specs]
+        for fut in as_completed(futures):
+            r = fut.result()
+            model, wl_name = r["model"], r["wl_name"]
+            max_b, tpot, dp = r["max_b"], r["tpot"], r["dp"]
             # Per-GPU metrics divide by the TOTAL GPU count, not dp -- matches
             # this project's TPS definition ("... / Number of GPUs") and
             # the paper's cross-GPU-count normalization (a DP replica still consumes
@@ -885,70 +973,103 @@ def main():
                 "max_batch_per_gpu": max_b_per_gpu,
                 "tps": tps,
                 "tpot": tpot,
-                "csv_file": csv_file,
-                "pec_kv_bytes": pec_kv,
-                "pec_capacity": pec_cap,
-                "bound_reason": bound_reason,
+                "csv_file": r["csv_path"],
+                "pec_kv_bytes": r["pec_kv"],
+                "pec_capacity": r["pec_cap"],
+                "bound_reason": r["bound_reason"],
             }
             print(f"Baseline {model} {wl_name}: Max Batch/GPU = {max_b_per_gpu:.1f} (total {max_b}, dp={dp}), TPS/GPU = {tps:.2f}")
+    # Pool joined (all baseline futures resolved) -- safe to read `baselines` below.
 
     results = []
 
+    # Main sweep, same parallelization pattern. Canonical (model, workload, mem, gpu)
+    # iteration order is built up front as `sweep_specs`; HBM4/8-GPU cells are pulled from
+    # the baseline cache exactly as before (never resubmitted to the pool -- avoids
+    # recomputing what gather-baselines already computed). The remaining cells are
+    # submitted to the pool; a future's completion (out-of-order, printed as it happens)
+    # is separate from `results` assembly, which iterates `sweep_specs` in canonical order
+    # afterward -- so `results`' order and content are identical to the old sequential run
+    # regardless of which cell's subprocess happened to finish first.
     print("\n--- RUNNING ALL SWEEPS ---")
-    for model in models:
-        for wl_name, (in_len, out_len) in workloads.items():
-            for mem in mem_types:
-                for gpu in gpus:
-                    print(f"Running {model} | {wl_name} | {mem} | {gpu} GPUs...")
+    sweep_specs = [
+        {"model": model, "wl_name": wl_name, "in_len": in_len, "out_len": out_len,
+         "mem": mem, "gpu": gpu, "slo": 0.1}
+        for model in models
+        for wl_name, (in_len, out_len) in workloads.items()
+        for mem in mem_types
+        for gpu in gpus
+    ]
 
-                    # HBM4/8-GPU result was already gathered as the baseline;
-                    # pull from cache to avoid a duplicate simulation.
-                    if mem == "HBM4" and gpu == 8:
-                        bl = baselines[model][wl_name]
-                        max_b      = bl["max_batch"]
-                        max_b_per_gpu = bl["max_batch_per_gpu"]
-                        tpot       = bl["tpot"]
-                        csv_path   = bl["csv_file"]
-                        last_pec_kv = bl["pec_kv_bytes"]
-                        last_pec_cap = bl["pec_capacity"]
-                        bound_reason = bl["bound_reason"]
-                    else:
-                        max_b, tpot, csv_path, last_pec_kv, last_pec_cap, dp, bound_reason = find_max_batch_size(
-                            model, mem, gpu, in_len, out_len, 0.1)
-                        max_b_per_gpu = max_b / gpu
+    def _spec_key(s):
+        return (s["model"], s["wl_name"], s["mem"], s["gpu"])
 
-                    tps = max_b / (tpot * gpu) if tpot > 0 else 0.0
+    to_submit = [s for s in sweep_specs if not (s["mem"] == "HBM4" and s["gpu"] == 8)]
+    cell_results = {}  # spec key -> _run_cell's returned dict
+    with ProcessPoolExecutor(max_workers=min(SWEEP_WORKERS, max(1, len(to_submit)))) as pool:
+        fut_to_key = {pool.submit(_run_cell, spec): _spec_key(spec) for spec in to_submit}
+        for fut in as_completed(fut_to_key):
+            key = fut_to_key[fut]
+            r = fut.result()
+            cell_results[key] = r
+            print(f"Completed {r['model']} | {r['wl_name']} | {r['mem']} | {r['gpu']} GPUs "
+                  f"-> Max Batch/GPU: {(r['max_b'] / r['gpu']):.1f}, TPOT: {r['tpot']:.4f}s")
+    # Pool joined -- assemble `results` in canonical order (identical to sequential output).
 
-                    # Normalization: batch-size normalizes per-GPU values (total/GPU-count) --
-                    # GPU count can differ between the baseline (fixed at 8) and this config,
-                    # so normalizing raw totals would be wrong whenever it does.
-                    base_max_batch_per_gpu = baselines[model][wl_name]["max_batch_per_gpu"]
-                    base_tps = baselines[model][wl_name]["tps"]
+    for spec in sweep_specs:
+        model, wl_name, mem, gpu = spec["model"], spec["wl_name"], spec["mem"], spec["gpu"]
+        in_len, out_len = spec["in_len"], spec["out_len"]
 
-                    norm_batch = max_b_per_gpu / base_max_batch_per_gpu if base_max_batch_per_gpu > 0 else 0.0
-                    norm_tps = tps / base_tps if base_tps > 0 else 0.0
+        # HBM4/8-GPU result was already gathered as the baseline;
+        # pull from cache to avoid a duplicate simulation.
+        if mem == "HBM4" and gpu == 8:
+            bl = baselines[model][wl_name]
+            max_b      = bl["max_batch"]
+            max_b_per_gpu = bl["max_batch_per_gpu"]
+            tpot       = bl["tpot"]
+            csv_path   = bl["csv_file"]
+            last_pec_kv = bl["pec_kv_bytes"]
+            last_pec_cap = bl["pec_capacity"]
+            bound_reason = bl["bound_reason"]
+        else:
+            r = cell_results[_spec_key(spec)]
+            max_b, tpot, csv_path, last_pec_kv, last_pec_cap, bound_reason = (
+                r["max_b"], r["tpot"], r["csv_path"], r["pec_kv"], r["pec_cap"], r["bound_reason"])
+            max_b_per_gpu = max_b / gpu
 
-                    # Breakdown parse
-                    breakdown = parse_csv_breakdown(csv_path) if csv_path else None
+        tps = max_b / (tpot * gpu) if tpot > 0 else 0.0
 
-                    results.append({
-                        "model": model,
-                        "workload": wl_name,
-                        "memory": mem,
-                        "gpus": gpu,
-                        "max_batch": max_b,
-                        "max_batch_per_gpu": max_b_per_gpu,
-                        "tps": tps,
-                        "tpot": tpot,
-                        "norm_batch": norm_batch,
-                        "norm_tps": norm_tps,
-                        "breakdown": breakdown,
-                        "csv_path": csv_path,
-                        "pec_kv_bytes": last_pec_kv,
-                        "pec_capacity": last_pec_cap,
-                        "bound_reason": bound_reason,
-                    })
-                    print(f"  -> Max Batch/GPU: {max_b_per_gpu:.1f} (Norm: {norm_batch:.2f}), TPS/GPU: {tps:.2f} (Norm: {norm_tps:.2f})")
+        # Normalization: batch-size normalizes per-GPU values (total/GPU-count) --
+        # GPU count can differ between the baseline (fixed at 8) and this config,
+        # so normalizing raw totals would be wrong whenever it does.
+        base_max_batch_per_gpu = baselines[model][wl_name]["max_batch_per_gpu"]
+        base_tps = baselines[model][wl_name]["tps"]
+
+        norm_batch = max_b_per_gpu / base_max_batch_per_gpu if base_max_batch_per_gpu > 0 else 0.0
+        norm_tps = tps / base_tps if base_tps > 0 else 0.0
+
+        # Breakdown parse
+        breakdown = parse_csv_breakdown(csv_path) if csv_path else None
+
+        results.append({
+            "model": model,
+            "workload": wl_name,
+            "memory": mem,
+            "gpus": gpu,
+            "max_batch": max_b,
+            "max_batch_per_gpu": max_b_per_gpu,
+            "tps": tps,
+            "tpot": tpot,
+            "norm_batch": norm_batch,
+            "norm_tps": norm_tps,
+            "breakdown": breakdown,
+            "csv_path": csv_path,
+            "pec_kv_bytes": last_pec_kv,
+            "pec_capacity": last_pec_cap,
+            "bound_reason": bound_reason,
+        })
+        print(f"{model} | {wl_name} | {mem} | {gpu} GPUs -> Max Batch/GPU: {max_b_per_gpu:.1f} "
+              f"(Norm: {norm_batch:.2f}), TPS/GPU: {tps:.2f} (Norm: {norm_tps:.2f})")
 
     # SLO Sensitivity Sweeps (LONG Workload only)
     print("\n--- RUNNING SLO SENSITIVITY SWEEPS (LONG Workload) ---")
@@ -960,8 +1081,20 @@ def main():
     # so 1-2 GPU points would have an infeasible/undefined baseline.
     sensitivity_gpus = SENSITIVITY_GPUS
 
-    # Gather sensitivity baselines (HBM4, 8 GPU) per SLO.
-    # slo=0.1 / LONG workload was already gathered as the main baseline.
+    # Gather sensitivity baselines (HBM4, 8 GPU) per SLO. slo=0.1/LONG was already
+    # gathered as the main baseline; the remaining (model, slo!=0.1) cells are
+    # independent -- same parallelization pattern as the main sweep above.
+    sens_baseline_specs = [
+        {"model": model, "slo": slo, "mem": "HBM4", "gpu": 8,
+         "in_len": long_in, "out_len": long_out}
+        for model in models for slo in slos if slo != 0.1
+    ]
+    sens_baseline_results = {}
+    with ProcessPoolExecutor(max_workers=min(SWEEP_WORKERS, max(1, len(sens_baseline_specs)))) as pool:
+        futs = {pool.submit(_run_cell, spec): (spec["model"], spec["slo"]) for spec in sens_baseline_specs}
+        for fut in as_completed(futs):
+            sens_baseline_results[futs[fut]] = fut.result()
+
     sens_baselines = {}
     for model in models:
         sens_baselines[model] = {}
@@ -972,8 +1105,8 @@ def main():
                 tpot  = bl["tpot"]
                 tps   = bl["tps"]
             else:
-                max_b, tpot, _, _, _, dp, _ = find_max_batch_size(
-                    model, "HBM4", 8, long_in, long_out, slo)
+                r = sens_baseline_results[(model, slo)]
+                max_b, tpot = r["max_b"], r["tpot"]
                 max_b_per_gpu = max_b / 8
                 tps = max_b / (tpot * 8) if tpot > 0 else 0.0
             sens_baselines[model][slo] = {
@@ -983,70 +1116,107 @@ def main():
             }
             print(f"SLO Sensitivity Baseline {model} SLO {slo}: Max Batch/GPU = {max_b_per_gpu:.1f}, TPS/GPU = {tps:.2f}")
 
-    for model in models:
-        for mem in mem_types:
-            for gpu in sensitivity_gpus:
-                for slo in slos:
-                    # HBM4/8-GPU/slo=0.1 is the main LONG baseline — reuse it.
-                    if mem == "HBM4" and gpu == 8 and slo == 0.1:
-                        bl = baselines[model]["LONG"]
-                        max_b_per_gpu = bl["max_batch_per_gpu"]
-                        tps = bl["tps"]
-                    else:
-                        print(f"Sensitivity Sweep: {model} | {mem} | {gpu} GPUs | SLO {slo}s...")
-                        max_b, tpot, _, _, _, dp, _ = find_max_batch_size(
-                            model, mem, gpu, long_in, long_out, slo)
-                        max_b_per_gpu = max_b / gpu
-                        tps = max_b / (tpot * gpu) if tpot > 0 else 0.0
+    # Main sensitivity sweep, same parallelization pattern as the main sweep: canonical
+    # spec list built up front, HBM4/8-GPU/slo=0.1 cache-pulled (never resubmitted), the
+    # rest submitted to the pool, then assembled in canonical order afterward.
+    sens_specs = [
+        {"model": model, "mem": mem, "gpu": gpu, "slo": slo,
+         "in_len": long_in, "out_len": long_out}
+        for model in models for mem in mem_types for gpu in sensitivity_gpus for slo in slos
+    ]
 
-                    base_max_batch_per_gpu = sens_baselines[model][slo]["max_batch_per_gpu"]
-                    base_tps = sens_baselines[model][slo]["tps"]
+    def _sens_key(s):
+        return (s["model"], s["mem"], s["gpu"], s["slo"])
 
-                    norm_batch = max_b_per_gpu / base_max_batch_per_gpu if base_max_batch_per_gpu > 0 else 0.0
-                    norm_tps = tps / base_tps if base_tps > 0 else 0.0
+    sens_to_submit = [s for s in sens_specs if not (s["mem"] == "HBM4" and s["gpu"] == 8 and s["slo"] == 0.1)]
+    sens_cell_results = {}
+    with ProcessPoolExecutor(max_workers=min(SWEEP_WORKERS, max(1, len(sens_to_submit)))) as pool:
+        fut_to_key = {pool.submit(_run_cell, spec): _sens_key(spec) for spec in sens_to_submit}
+        for fut in as_completed(fut_to_key):
+            key = fut_to_key[fut]
+            sens_cell_results[key] = fut.result()
+            r = sens_cell_results[key]
+            print(f"Completed Sensitivity Sweep: {r['model']} | {r['mem']} | {r['gpu']} GPUs | SLO {r['slo']}s "
+                  f"-> Max Batch/GPU: {(r['max_b'] / r['gpu']):.1f}")
 
-                    slo_results.append({
-                        "model": model,
-                        "memory": mem,
-                        "gpus": gpu,
-                        "slo": slo,
-                        "max_batch_per_gpu": max_b_per_gpu,
-                        "tps": tps,
-                        "norm_batch": norm_batch,
-                        "norm_tps": norm_tps
-                    })
-                    if not (mem == "HBM4" and gpu == 8 and slo == 0.1):
-                        print(f"  -> Max Batch/GPU: {max_b_per_gpu:.1f} (Norm: {norm_batch:.2f}), TPS/GPU: {tps:.2f} (Norm: {norm_tps:.2f})")
+    for spec in sens_specs:
+        model, mem, gpu, slo = spec["model"], spec["mem"], spec["gpu"], spec["slo"]
+        # HBM4/8-GPU/slo=0.1 is the main LONG baseline — reuse it.
+        if mem == "HBM4" and gpu == 8 and slo == 0.1:
+            bl = baselines[model]["LONG"]
+            max_b_per_gpu = bl["max_batch_per_gpu"]
+            tps = bl["tps"]
+        else:
+            r = sens_cell_results[_sens_key(spec)]
+            max_b, tpot = r["max_b"], r["tpot"]
+            max_b_per_gpu = max_b / gpu
+            tps = max_b / (tpot * gpu) if tpot > 0 else 0.0
+
+        base_max_batch_per_gpu = sens_baselines[model][slo]["max_batch_per_gpu"]
+        base_tps = sens_baselines[model][slo]["tps"]
+
+        norm_batch = max_b_per_gpu / base_max_batch_per_gpu if base_max_batch_per_gpu > 0 else 0.0
+        norm_tps = tps / base_tps if base_tps > 0 else 0.0
+
+        slo_results.append({
+            "model": model,
+            "memory": mem,
+            "gpus": gpu,
+            "slo": slo,
+            "max_batch_per_gpu": max_b_per_gpu,
+            "tps": tps,
+            "norm_batch": norm_batch,
+            "norm_tps": norm_tps
+        })
+        if not (mem == "HBM4" and gpu == 8 and slo == 0.1):
+            print(f"{model} | {mem} | {gpu} GPUs | SLO {slo}s -> Max Batch/GPU: {max_b_per_gpu:.1f} "
+                  f"(Norm: {norm_batch:.2f}), TPS/GPU: {tps:.2f} (Norm: {norm_tps:.2f})")
 
     # Offline-PEC data gathering (Fig. 7's "offline" bars). Online PEC for the
     # same scope is already derivable from `results` (0.1s SLO), but offline
     # (SLO=86400, i.e. no rate limit) isn't probed anywhere else -- the SLO
     # sensitivity sweep above only covers the LONG workload, and Fig. 7 needs
-    # {SHORT,MID,LONG} x gpu{1,8,16} x {HBF,HBF+}.
+    # {SHORT,MID,LONG} x gpu{1,8,16} x {HBF,HBF+}. Fully independent cells, no
+    # cache-hit branch needed -- simplest of the three parallelized loops.
     print("\n--- GATHERING OFFLINE PEC DATA (Fig. 7) ---")
+    pec_specs = [
+        {"model": model, "wl_name": wl_name, "in_len": workloads[wl_name][0],
+         "out_len": workloads[wl_name][1], "gpu": gpu, "mem": mem, "slo": 86400.0}
+        for model in models
+        for wl_name in PEC_WORKLOADS
+        for gpu in PEC_GPUS
+        for mem in PEC_MEM_TYPES
+    ]
+    pec_cell_results = {}
+    with ProcessPoolExecutor(max_workers=min(SWEEP_WORKERS, max(1, len(pec_specs)))) as pool:
+        fut_to_key = {pool.submit(_run_cell, spec): (spec["model"], spec["wl_name"], spec["gpu"], spec["mem"])
+                      for spec in pec_specs}
+        for fut in as_completed(fut_to_key):
+            key = fut_to_key[fut]
+            r = fut.result()
+            pec_cell_results[key] = r
+            print(f"Completed Offline PEC: {r['model']} | {r['wl_name']} | {r['mem']} | {r['gpu']} GPUs "
+                  f"-> Max Batch: {r['max_b']}")
+
     pec_results = []
-    for model in models:
-        for wl_name in PEC_WORKLOADS:
-            in_len, out_len = workloads[wl_name]
-            for gpu in PEC_GPUS:
-                for mem in PEC_MEM_TYPES:
-                    print(f"Offline PEC: {model} | {wl_name} | {mem} | {gpu} GPUs...")
-                    max_b, tpot, _, pec_kv, pec_cap, dp, _ = find_max_batch_size(
-                        model, mem, gpu, in_len, out_len, 86400.0)
-                    row = {
-                        "model": model,
-                        "workload": wl_name,
-                        "memory": mem,
-                        "gpus": gpu,
-                        "max_batch": max_b,
-                        "tpot": tpot,
-                        "pec_kv_bytes": pec_kv,
-                        "pec_capacity": pec_cap,
-                    }
-                    pec_results.append(row)
-                    pec_info = compute_pec(row)
-                    pec_str = f"{pec_info['pec']:.1f}" if pec_info else "N/A"
-                    print(f"  -> Offline Max Batch: {max_b}, 3yr PEC: {pec_str}")
+    for spec in pec_specs:
+        key = (spec["model"], spec["wl_name"], spec["gpu"], spec["mem"])
+        r = pec_cell_results[key]
+        row = {
+            "model": spec["model"],
+            "workload": spec["wl_name"],
+            "memory": spec["mem"],
+            "gpus": spec["gpu"],
+            "max_batch": r["max_b"],
+            "tpot": r["tpot"],
+            "pec_kv_bytes": r["pec_kv"],
+            "pec_capacity": r["pec_cap"],
+        }
+        pec_results.append(row)
+        pec_info = compute_pec(row)
+        pec_str = f"{pec_info['pec']:.1f}" if pec_info else "N/A"
+        print(f"{spec['model']} | {spec['wl_name']} | {spec['mem']} | {spec['gpu']} GPUs "
+              f"-> Offline Max Batch: {r['max_b']}, 3yr PEC: {pec_str}")
 
     # Generate Markdown Report — written to the project root alongside this script.
     report_path = os.path.join(SCRIPT_DIR, "experiment_results.md")

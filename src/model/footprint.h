@@ -187,7 +187,7 @@ inline double peakIntermediateBytes(const ModelConfig& model,
                   (batch_per_dp * model.qk_rope_head_dim) +                  // 0 for non-MLA
                   (batch_per_dp * (3.0 * model.qk_rope_head_dim + model.head_dim) *
                    model.num_heads / tp) +                                   // q proj(+rope) out
-                  (batch_per_dp * 2.0 * model.head_dim * model.num_heads / tp) +  // current-token k,v out
+                  (batch_per_dp * 2.0 * model.head_dim * model.num_kv_heads / tp) +  // current-token k,v out
                   (batch_per_dp * model.num_heads * model.head_dim / tp) +   // attn context out
                   (batch_per_dp * hidden_dim)) * precision;                  // out proj out
   }

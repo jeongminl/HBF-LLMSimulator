@@ -114,7 +114,15 @@ Exit code 0 = success; 1 = OOM (capacity or SRAM limit exceeded).
 python3 run_experiments.py
 ```
 
-Simulation CSV outputs go to `data/`. The sweep script invokes the optimizer, binary-searches for max batch, then runs the final simulation and extracts metrics.
+Simulation CSV outputs go to `data/` (each concurrent worker writes to its own `data/w<pid>/`
+subdirectory during a sweep — see below). The sweep script invokes the optimizer, binary-searches
+for max batch, then runs the final simulation and extracts metrics.
+
+Independent sweep cells (each `model`×`workload`×`memory_type`×`gpu_count` combination) run
+concurrently via a process pool — each cell's own batch-size search stays sequential internally.
+Defaults to `min(cpu_count - 2, 18)` workers; override with `SWEEP_WORKERS=<n> python3
+run_experiments.py`. Parallelizing does not change any reported metric — see `CHANGES.md` item 29
+for the correctness argument and verification.
 
 See the source paper (`Exploring_High-Bandwidth_Flash_for_Modern_LLM_Inference_Opportunities_and_Challenges.pdf`, in this repo) for the complete hardware and simulation specification — the ground truth this simulator implements.
 

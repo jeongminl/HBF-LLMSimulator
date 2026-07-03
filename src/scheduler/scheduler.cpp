@@ -258,6 +258,14 @@ BatchedSequence::Ptr Scheduler::getMaxMetadata(int num_expert, int top_k,
   BatchedSequence::Ptr sequences_metadata =
       BatchedSequence::Create(num_expert, top_k, scheduler);
   int seq_len = num_max_batched_token / batch_size_per_dp;
+  // Same bug class as the committed T3 fix (BUGS_FIXES.md #3): integer division
+  // floors to 0 once batch_size_per_dp > num_max_batched_token (8192, hardcoded at
+  // eval/test.cpp's Scheduler::Create call), which makes Sequence::Create(0, 0)
+  // trip sequence.cpp's assertTrue(input_len > 0, ...) -> process exit. run_experiments.py
+  // classifies that crash as "OOM/Crash" (indistinguishable from a real capacity OOM),
+  // so the batch search reads batch_size_per_dp=8192 as a spurious hard ceiling for any
+  // cell whose true ceiling is actually higher. No-op below the wall (seq_len>=1 already).
+  if (seq_len < 1) seq_len = 1;
   for (int seq_idx = 0; seq_idx < batch_size_per_dp; seq_idx++) {
     Sequence::Ptr seq = Sequence::Create(seq_len, seq_len);
     seq->num_process_token = seq_len;
