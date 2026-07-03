@@ -227,12 +227,12 @@ SHORT sweep (batch/GPU, bound):
 
 | llama4/HBF+ | 1 | 2 | 4 | 8 | 16 | paper |
 |---|---|---|---|---|---|---|
-| A (current) | 823 slo | 1593 slo | 2004 slo | 2170 slo | (converging†) | 854.7 FLAT, ✕ sram |
+| A (current) | 823 slo | 1593 slo | 2004 slo | 2170 slo | 1745 slo | 854.7 FLAT, ✕ sram |
 | B (variant) | 823 slo | 906 sram | 906 sram | 906 sram | 777 sram | |
 
-† the A-side 16-GPU search was still bisecting `TP=8/DP=2` at ~1,315-1,560/GPU when this was
-written — already well above both B (777) and the paper (854.7), so the shape conclusion (A grows,
-paper flat) is settled regardless of the exact figure; it will be appended when converged.
+(A's 16-GPU winner is `TP=4/PP=1/DP=4` at 27,916 total; the 8→16 decline is inter-node comm cost
+eating the SLO budget, not an SRAM ceiling — every A cell is slo-bound, 2-2.5x above the paper's
+flat SRAM-marked bar.)
 
 llama4/CONV+: A = B = 52/48/116/352/457 per GPU, all slo (paper 54.3/54.3/173.9/390.1/477.5 —
 growth shape ✓; the score charge never binds on CONV+, whose SLO binds far below the SRAM
