@@ -198,10 +198,21 @@ inline double peakIntermediateBytes(const ModelConfig& model,
 
   double ffn_moe = 0.0;
   if (has_moe_layer && model.num_routed_expert > 0) {
-    ffn_moe = (num_routed_expert_per_device + model.num_shared_expert) *
+    // Routed experts see expert_batch_size tokens each (global average per
+    // routed expert); the SHARED expert is dense — every token in the
+    // per-device batch flows through it (expert.cpp:204 passes the full
+    // input), so it must be charged at batch_per_dp, not expert_batch_size
+    // (a 16x under-count for maverick at 8 GPUs). Its gate/silu/up widths are
+    // TP-sharded at runtime (built on the ne_tp group), hence the /tp.
+    double routed_act = num_routed_expert_per_device *
         (2.0 * (expert_batch_size * model.expert_intermediate_dim) +  // gate proj + silu out
          expert_batch_size * model.expert_intermediate_dim +          // up proj out
-         expert_batch_size * hidden_dim) * precision;                 // down proj out
+         expert_batch_size * hidden_dim);                             // down proj out
+    double shared_act = model.num_shared_expert *
+        (2.0 * (batch_per_dp * model.expert_intermediate_dim / tp) +  // gate proj + silu out
+         batch_per_dp * model.expert_intermediate_dim / tp +          // up proj out
+         batch_per_dp * hidden_dim);                                  // down proj out
+    ffn_moe = (routed_act + shared_act) * precision;
   }
   double ffn_dense = 0.0;
   if (has_dense_layer) {
