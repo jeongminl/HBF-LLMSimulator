@@ -18,8 +18,11 @@ Usage:
 
 Outputs:
     - error_rates_detail.csv   one row per matched value, with error rate
-    - Printed summary: average error rate per figure, and per "data group"
-      within each figure (e.g. Figure 6 -> TPS Ratio vs Batch Ratio).
+    - error_rates_by_figure.png   grouped bar chart of median & max error
+      rate per figure
+    - Printed summary: average/median/max error rate per figure, and per
+      "data group" within each figure (e.g. Figure 6 -> TPS Ratio vs Batch
+      Ratio).
 """
 import argparse
 import re
@@ -217,12 +220,72 @@ def compare_fig7(paper_df, sim_df):
 
 
 # --------------------------------------------------------------------------
+# Plotting
+# --------------------------------------------------------------------------
+# Reference palette (see dataviz skill, references/palette.md): two
+# non-adjacent categorical slots for good CVD separation.
+MEDIAN_COLOR = "#2a78d6"  # slot 1, blue
+MAX_COLOR = "#eb6834"  # slot 8, orange
+MUTED_INK = "#898781"
+AXIS_INK = "#c3c2b7"
+GRIDLINE = "#e1e0d9"
+PRIMARY_INK = "#0b0b0b"
+
+
+def plot_error_rates(per_figure, out_path):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    figures = list(per_figure.index)
+    medians = per_figure["median_error_%"].tolist()
+    maxes = per_figure["max_error_%"].tolist()
+
+    x = range(len(figures))
+    width = 0.36
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    bars_med = ax.bar(
+        [i - width / 2 for i in x], medians, width, label="Median error %",
+        color=MEDIAN_COLOR, zorder=3,
+    )
+    bars_max = ax.bar(
+        [i + width / 2 for i in x], maxes, width, label="Max error %",
+        color=MAX_COLOR, zorder=3,
+    )
+
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(figures, color=PRIMARY_INK)
+    ax.set_ylabel("Error rate (%)", color=PRIMARY_INK)
+    ax.set_title("Paper vs. Simulator Error Rate by Figure", color=PRIMARY_INK)
+
+    ax.yaxis.grid(True, color=GRIDLINE, linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)
+    for spine_name, spine in ax.spines.items():
+        if spine_name in ("top", "right"):
+            spine.set_visible(False)
+        else:
+            spine.set_color(AXIS_INK)
+    ax.tick_params(colors=MUTED_INK)
+
+    for bars in (bars_med, bars_max):
+        ax.bar_label(bars, fmt="%.1f", padding=2, color=MUTED_INK, fontsize=9)
+
+    ax.legend(frameon=False, labelcolor=PRIMARY_INK)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+# --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--details", action="store_true", help="print every matched pair")
     ap.add_argument("--out", default="error_rates_detail.csv")
+    ap.add_argument("--plot-out", default="error_rates_by_figure.png")
     args = ap.parse_args()
 
     paper_tables = parse_markdown_tables(PAPER_MD)
@@ -277,25 +340,33 @@ def main():
     print()
 
     print("=" * 70)
-    print("AVERAGE ERROR RATE PER FIGURE")
+    print("AVERAGE / MEDIAN / MAX ERROR RATE PER FIGURE")
     print("=" * 70)
-    per_figure = scored.groupby("figure")["error_rate"].agg(["mean", "median", "count"])
+    per_figure = scored.groupby("figure")["error_rate"].agg(["mean", "median", "max", "count"])
     per_figure["mean"] = (per_figure["mean"] * 100).round(2)
     per_figure["median"] = (per_figure["median"] * 100).round(2)
-    per_figure.columns = ["mean_error_%", "median_error_%", "n"]
+    per_figure["max"] = (per_figure["max"] * 100).round(2)
+    per_figure.columns = ["mean_error_%", "median_error_%", "max_error_%", "n"]
     print(per_figure.to_string())
     print()
 
     print("=" * 70)
-    print("AVERAGE ERROR RATE PER DATA GROUP WITHIN EACH FIGURE")
+    print("AVERAGE / MEDIAN / MAX ERROR RATE PER DATA GROUP WITHIN EACH FIGURE")
     print("=" * 70)
-    per_group = scored.groupby(["figure", "group"])["error_rate"].agg(["mean", "median", "count"])
+    per_group = scored.groupby(["figure", "group"])["error_rate"].agg(["mean", "median", "max", "count"])
     per_group["mean"] = (per_group["mean"] * 100).round(2)
     per_group["median"] = (per_group["median"] * 100).round(2)
-    per_group.columns = ["mean_error_%", "median_error_%", "n"]
+    per_group["max"] = (per_group["max"] * 100).round(2)
+    per_group.columns = ["mean_error_%", "median_error_%", "max_error_%", "n"]
     print(per_group.to_string())
     print()
     print(f"Full per-value detail written to: {args.out}")
+
+    try:
+        plot_error_rates(per_figure, REPO_ROOT / args.plot_out)
+        print(f"Median/max error rate chart written to: {args.plot_out}")
+    except ImportError:
+        print("matplotlib not importable; skipping chart generation")
 
 
 if __name__ == "__main__":

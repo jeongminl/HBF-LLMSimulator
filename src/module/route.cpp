@@ -84,8 +84,7 @@ std::vector<int> getIdxHigh(std::vector<int> list, SystemConfig config) {
 
   // getIdxHighOptimal handles any list size correctly (per-expert, not
   // grouped-by-4); fall back to it instead of aborting when the EP split
-  // yields an expert-per-device count that isn't a multiple of 4
-  // (BUGS_HIDDEN_BY_FLAGS #6).
+  // yields an expert-per-device count that isn't a multiple of 4.
   if (list.size() % 4 != 0) {
     return getIdxHighOptimal(list, config);
   }
@@ -201,11 +200,10 @@ Route::Route(std::string& prefix, std::string& name, int num_expert_per_device,
       num_expert_per_device(num_expert_per_device) {
   
  int num_expert = device->model_config.num_routed_expert;
- int hidden_dim = device->model_config.hidden_dim;
- std::vector<int> shape = {hidden_dim, num_expert};
-  Tensor::Ptr expert_input = Tensor::Create(
-    "route_weight", shape, "weight", device, device->model_config.precision_byte);
-  add_tensor(expert_input);
+  // NOTE: this module records no weight tensor. The router/gating projection
+  // ({hidden_dim, num_expert}) is recorded by ExpertFFN (expert.cpp's gate_fn
+  // ColumnParallelLinear); recording it here too would double-count the physical
+  // router weight (+1.31 MB per MoE layer) in Cluster::checkMemorySize's footprint.
 
   // initializing expert_input //
   for (int expert_idx = 0; expert_idx < num_expert; expert_idx++) {

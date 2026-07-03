@@ -513,25 +513,32 @@ Tensor::Ptr PipelineStage::forward(const Tensor::Ptr input,
 
   // Propagate elapsed time to the destination stage's device. A token cannot
   // begin stage (k+1)'s compute before stage k's output has physically arrived,
-  // so dst's clock must never read earlier than src's send-complete time
-  // (src's device_time, just bumped above, already includes comm_time). Without
-  // this, dst_rank's own status.device_time independently accumulates only its
-  // own local layer work from 0 every iteration, never inheriting the upstream
-  // stages' elapsed time -- this PipelineStage module is the only cross-device
-  // hop in the decode critical path (AllReduce/MoEScatter are constructed with
-  // sync=true and go through ModuleGraph::sync_devices()'s max-and-broadcast,
-  // but their device_list only ever spans one pp-stage's TP/EP group, never a
-  // stage boundary; MoEGather is sync=false like PipelineStage but never spans
-  // a stage boundary either. PipelineStage is the only module whose device_list
-  // crosses stages, and it is sync=false, so no other mechanism reconciles
-  // this). Confirmed empirically (not just by code inspection): for
-  // llama4_maverick/HBM4/8-GPU/SHORT at TP=1/PP=8, the last stage's device_time
-  // is ~21ms without this line vs. ~164ms with it -- the latter tracks almost
-  // exactly 8 sequential per-stage times (~20.5ms each), confirming
-  // un-propagated PP severely under-counts true per-token latency.
+  // and in autoregressive decode the stages of one token pass are strictly
+  // sequential (a request's token t+1 cannot enter stage 0 before token t
+  // leaves the last stage, and even micro-batch pipelining leaves the
+  // steady-state rate at batch / sum-of-stages) -- so the destination's clock
+  // must end at src's send-complete time PLUS the destination's own stage work.
+  //
+  // This is an ADDITION of the upstream cumulative time, not a max() bump.
+  // Every device's clock is reset to 0 at the start of each iteration
+  // (Cluster::run -> restartModuleGraph -> reset_status), so at this moment
+  // dst's device_time holds exactly its own locally-accumulated stage work
+  // (plus any upstream time already chained in by an earlier stage's
+  // PipelineStage -- devices execute in rank order = pipeline-stage order, so
+  // upstream bumps land before this stage's own PipelineStage runs).
+  //
+  // Addition is exact for both device-execution orderings the round-robin
+  // scheduler (Cluster::run) produces: when dst has not yet run (tp==1, no
+  // intra-stage sync blocks it, so devices drain in rank = pipeline order) it
+  // contributes 0 and stages serialize; when dst has already accumulated its
+  // stage work (tp>=2, per-layer AllReduce advances all stages in lock-step) it
+  // contributes that work on top of the upstream time. Either way the destination
+  // clock ends at src's send-complete time plus its own stage work. Serialization
+  // is the correct decode accounting (autoregressive dependency; steady-state rate
+  // is batch / sum-of-stages regardless of micro-batch pipelining). See CHANGES.md
+  // items 22/35.
   Device::Ptr dst_device = device->cluster->get_device(dst_rank);
-  dst_device->status.device_time =
-      std::max(dst_device->status.device_time, device->status.device_time);
+  dst_device->status.device_time += device->status.device_time;
 
   return output;
 }

@@ -72,6 +72,15 @@ int main(int argc, char *argv[]) {
   else if(config["system"]["nvlink_gen"].as<int>() == 5){
     system_config.device_ict_bandwidth = 900.0 * 1000 * 1000 * 1000; // B/s NVLink 5th Gen (B100, B200)
     system_config.device_ict_latency = 0.8 * 1000; // ns
+  }
+  else if(config["system"]["nvlink_gen"].as<int>() == 6){
+    // NVLink 6th Gen (Rubin): 3.6 TB/s bidirectional = 1,800 GB/s per direction.
+    // This file's convention is UNIDIRECTIONAL (gen 4 above = 450 GB/s = H100's
+    // NVLink4 per-direction rate), and it matches the paper's own SS-III spec for
+    // its Rubin-based systems verbatim: "NVLink (1,800 GB/s) for intra-node GPU
+    // communication".
+    system_config.device_ict_bandwidth = 1800.0 * 1000 * 1000 * 1000; // B/s
+    system_config.device_ict_latency = 0.8 * 1000; // ns
   }else{
     fail("Not support NVLink generation");
   }
@@ -290,7 +299,7 @@ int main(int argc, char *argv[]) {
     system_config.mfu_m_half = config["simulation"]["mfu_m_half"].as<double>();
   }
 
-  // ---- Analytic-only batch-size sweep (F1 fix) -----------------------------
+  // ---- Analytic-only batch-size sweep --------------------------------------
   // Find the largest batch B for which SOME parallelism config satisfies
   // capacity/SRAM (checkCapacity, inside Optimize()) AND the analytic
   // max()-model estimated latency is <= SLO -- using ONLY in-process Optimize()
@@ -314,9 +323,9 @@ int main(int argc, char *argv[]) {
     int seq_len = input_len + output_len;
 
     // capacity_feasible: the ONLY hard, exact constraint (GPU memory capacity + the
-    // SRAM/intermediate-data limit) -- Optimize() never sets oom for latency (see F1 fix
-    // in parallelism_optimizer.cpp), so !out.oom here means purely "some parallelism
-    // config's weights+KV+activation footprint fits."
+    // SRAM/intermediate-data limit) -- Optimize() never sets oom for latency (latency
+    // is ranking-only in parallelism_optimizer.cpp), so !out.oom here means purely
+    // "some parallelism config's weights+KV+activation footprint fits."
     auto capacity_feasible = [&](int b, ParallelConfig& out) -> bool {
       out = ParallelismOptimizer::Optimize(model_config, system_config, total_gpus, b, seq_len, tpot_slo_ms);
       return !out.oom;
@@ -409,6 +418,129 @@ int main(int argc, char *argv[]) {
     return 0;
   }
 
+  // ---- Per-config analytic listing (paper §III objective) --------------------
+  // For the paper's stated objective -- "each evaluated system selects the
+  // parallelism configuration that maximizes the achievable system throughput
+  // subject to all constraints" -- the sweep needs, PER capacity-feasible
+  // parallelism config, that config's own analytic capacity ceiling and
+  // SLO-latency hint, so it can run a simulator-verified max-batch search per
+  // config and take the argmax-TPS winner (run_experiments.py). This mode emits
+  // exactly that and exits; no Scheduler/Cluster is constructed.
+  // Markers:
+  //   ANALYTIC_CAP_FEASIBLE_AT_1: 0|1   (same semantic as analytic_sweep_only:
+  //                                      can SOME config serve total batch 1 --
+  //                                      i.e. a dp==1 config fits at batch 1)
+  //   ANALYTIC_NUM_CONFIGS: <n>
+  //   ANALYTIC_CONFIG: tp=<t> pp=<p> ep=<e> dp=<d> cap_batch=<Bc>
+  //       slo_hint_batch=<Bh> est_lat_min_ms=<Lmin> est_lat_hint_ms=<Lhint>
+  // Batches are TOTAL batch sizes (multiples of the config's own dp).
+  bool analytic_configs_only = false;
+  if (config["system"]["analytic_configs_only"]) {
+    analytic_configs_only = config["system"]["analytic_configs_only"].as<bool>();
+  }
+  if (analytic_configs_only) {
+    int total_gpus = num_node * num_device;
+    double tpot_slo_ms = 100.0;
+    if (config["system"]["tpot_slo"]) {
+      tpot_slo_ms = config["system"]["tpot_slo"].as<double>() * 1000.0;
+    }
+    int seq_len = input_len + output_len;
+
+    // Structural tuple list (gates only; batch-divisibility deliberately off --
+    // each config is probed at multiples of its own dp below).
+    std::vector<ParallelConfig> tuples = ParallelismOptimizer::EnumerateCandidates(
+        model_config, system_config, total_gpus, /*batch_size=*/1, seq_len,
+        /*require_batch_divisible=*/false);
+
+    auto eval_at = [&](const ParallelConfig& t, long long total_batch) {
+      return ParallelismOptimizer::EvaluateConfig(
+          model_config, system_config, total_gpus, t.tp, t.pp, t.dp, t.ep,
+          (int)total_batch, seq_len);
+    };
+
+    bool cap_feasible_at_1 = false;
+    for (const auto& t : tuples) {
+      if (t.dp == 1 && !eval_at(t, 1).oom) { cap_feasible_at_1 = true; break; }
+    }
+    std::cout << "ANALYTIC_CAP_FEASIBLE_AT_1: " << (cap_feasible_at_1 ? 1 : 0)
+              << std::endl;
+
+    struct ConfigLine {
+      int tp, pp, ep, dp;
+      long long cap_batch, slo_hint_batch;
+      double est_lat_min_ms, est_lat_hint_ms;
+    };
+    std::vector<ConfigLine> lines;
+
+    for (const auto& t : tuples) {
+      const long long dp = t.dp;
+      // Feasibility floor: this config's smallest legal batch is dp (1/replica).
+      ParallelConfig at_min = eval_at(t, dp);
+      if (at_min.oom) continue;  // capacity-infeasible even at min batch
+      double est_lat_min = at_min.estimated_latency_ms;
+
+      // Capacity ceiling in k (batch = k*dp): capacity footprint is monotone in
+      // batch, so bracket-then-bisect. 2^30 total-batch guard mirrors the
+      // analytic_sweep_only mode's infinite-loop guard.
+      long long k_cap = 1;
+      long long k_fail = -1;
+      for (long long k = 2; k * dp <= (1LL << 30); k *= 2) {
+        if (eval_at(t, k * dp).oom) { k_fail = k; break; }
+        k_cap = k;
+      }
+      if (k_fail > 0) {
+        long long lo = k_cap + 1, hi = k_fail - 1;
+        while (lo <= hi) {
+          long long mid = lo + (hi - lo) / 2;
+          if (!eval_at(t, mid * dp).oom) { k_cap = mid; lo = mid + 1; }
+          else { hi = mid - 1; }
+        }
+      }
+
+      // SLO hint: largest k <= k_cap whose analytic latency estimate clears the
+      // SLO. The estimate is monotone nondecreasing in batch (compute, KV-read
+      // and comm payload all scale with batch), so bisect. This is a SEARCH
+      // SEED ONLY -- the live simulator remains the sole SLO arbiter, and the
+      // Python side probes above the hint when the hint itself verifies.
+      long long k_hint = 1;
+      double est_lat_hint = est_lat_min;
+      ParallelConfig at_cap = eval_at(t, k_cap * dp);
+      if (at_cap.estimated_latency_ms <= tpot_slo_ms) {
+        k_hint = k_cap;
+        est_lat_hint = at_cap.estimated_latency_ms;
+      } else {
+        long long lo = 1, hi = k_cap - 1;
+        while (lo <= hi) {
+          long long mid = lo + (hi - lo) / 2;
+          ParallelConfig at_mid = eval_at(t, mid * dp);
+          if (at_mid.estimated_latency_ms <= tpot_slo_ms) {
+            k_hint = mid;
+            est_lat_hint = at_mid.estimated_latency_ms;
+            lo = mid + 1;
+          } else {
+            hi = mid - 1;
+          }
+        }
+        // est_lat_min may itself exceed the SLO; k_hint stays 1 (probe once --
+        // the estimate is a heuristic, never a rejection by itself).
+      }
+
+      lines.push_back({t.tp, t.pp, t.ep, (int)dp, k_cap * dp, k_hint * dp,
+                       est_lat_min, est_lat_hint});
+    }
+
+    std::cout << "ANALYTIC_NUM_CONFIGS: " << lines.size() << std::endl;
+    for (const auto& L : lines) {
+      std::cout << "ANALYTIC_CONFIG: tp=" << L.tp << " pp=" << L.pp
+                << " ep=" << L.ep << " dp=" << L.dp
+                << " cap_batch=" << L.cap_batch
+                << " slo_hint_batch=" << L.slo_hint_batch
+                << " est_lat_min_ms=" << L.est_lat_min_ms
+                << " est_lat_hint_ms=" << L.est_lat_hint_ms << std::endl;
+    }
+    return 0;
+  }
+
   // Part E: hold predictions outside the if(optimize_parallelism) scope so
   // checkMemorySize and the latency harness can access them.
   ParallelConfig opt_pred;
@@ -425,10 +557,9 @@ int main(int argc, char *argv[]) {
     opt_pred = opt;
     have_opt_pred = true;
     if (opt.oom) {
-      // opt.oom now ONLY reflects true capacity/SRAM infeasibility (the F1 fix
-      // removed the analytic-latency SLO gate from Optimize() -- estimated
+      // opt.oom reflects ONLY true capacity/SRAM infeasibility -- estimated
       // latency is a ranking heuristic only; the simulator that runs below is
-      // the sole SLO arbiter). Emit an "Out of Memory" marker and exit non-zero
+      // the sole SLO arbiter. Emit an "Out of Memory" marker and exit non-zero
       // so the batch-size sweep treats this as a hard failure instead of
       // silently continuing with pp=1.
       std::cout << "[Parallelism Optimizer] Out of Memory: no parallelism configuration "
@@ -458,7 +589,7 @@ int main(int argc, char *argv[]) {
   model_config.use_absorb =
       config["system"]["optimization"]["use_absorb"].as<bool>();
 
-  // F6 fix: compressed_kv/use_absorb/use_flash_mla are MLA-specific optimizations.
+  // compressed_kv/use_absorb/use_flash_mla are MLA-specific optimizations.
   // config.yaml's system.optimization block is not model-aware (its defaults are
   // tuned for MLA models like deepseekV3) -- blindly applying it here would force
   // MLA-only code paths (KV-cache sizing, KV-write sizing, activation footprint)
@@ -669,7 +800,7 @@ int main(int argc, char *argv[]) {
           std::cout << msg << std::endl;
         }
       }
-      // Directional divergence audit (F1): the batch-size search (run_experiments.py)
+      // Directional divergence audit: the batch-size search (run_experiments.py)
       // relies on the analytic max()-model estimate consistently UNDER-estimating the
       // simulator's measured latency -- that's what guarantees the analytic search
       // never silently skips a batch the simulator would have accepted (analytic

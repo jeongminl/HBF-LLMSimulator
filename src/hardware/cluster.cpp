@@ -96,11 +96,8 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
   int num_total_device = device->config.num_device * device->config.num_node;
   // devices_per_stage = devices sharing ONE pipeline stage's expert allotment
   // (total_gpus / pp), matching parallelism_optimizer.cpp's `devices_per_stage`
-  // (its weight term at parallelism_optimizer.cpp:123 already divides by this,
-  // not by num_total_device). Dividing by num_total_device here instead was an
-  // 8x undercount for degenerate one-device-per-stage configs (e.g. maverick's
-  // PP=8/EP=1: devices_per_stage=1, so this used to compute 128/8=16 "experts
-  // per device" instead of the correct 128/1=128) -- see BUGS.md/CHANGES.md.
+  // (its weight term at parallelism_optimizer.cpp:123 divides by this, not by
+  // num_total_device).
   int devices_per_stage = num_total_device / device->model_config.pp_dg;
   // Use double: Maverick top_k=1/num_routed=128 gives expert_batch_size=0 as int
   // below batch 128, zeroing all MoE-FFN activation terms in the live-sim gate.
@@ -137,7 +134,7 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
       // Every product below leads with a (double) cast on batch_size_per_dp so the
       // whole left-to-right multiply chain evaluates in double -- with realistic
       // input_len (thousands) and num_heads (128), the equivalent all-int expression
-      // overflows INT_MAX before ever reaching a double operand (BUGS_HIDDEN_BY_FLAGS #2).
+      // overflows INT_MAX before ever reaching a double operand.
       activation_size =
         ((double)batch_size_per_dp * input_len * hidden_dim + // input seqeunces (or tokens)
         (double)batch_size_per_dp * input_len * q_lora_rank + // c_q
@@ -162,7 +159,7 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
         device->model_config.precision_byte;
     }
     else{ // base
-      // Same double-cast fix as the absorb branch above (BUGS_HIDDEN_BY_FLAGS #2).
+      // Same double-cast chain as the absorb branch above (avoids INT_MAX overflow).
       activation_size =
         ((double)batch_size_per_dp * input_len * hidden_dim + // input seqeunces (or tokens)
         (double)batch_size_per_dp * input_len * q_lora_rank + // c_q
@@ -199,11 +196,10 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
   std::cout << "Total: " << size / 1024.0 / 1024 / 1024 << "GB" << std::endl;
 
   // ---- Part C: generalised activation-scarce-tier check ---------------------
-  // Previously only fired for num_hbm_stacks==0 (logic SRAM).  Now also checks
-  // activation against the HBM-stack capacity when num_hbm_stacks>0, using the
-  // same scarceTierActivationLimit() helper shared with the optimizer.
-  // This is side-effect-free: only sets out_of_memory / fail(), never mutates
-  // batch size (the mem_cap_limit batch-shrink path at :289 is unchanged).
+  // Checks activation against the scarce tier -- logic SRAM when num_hbm_stacks==0,
+  // else the HBM-stack capacity -- using the scarceTierActivationLimit() helper
+  // shared with the optimizer. Side-effect-free: only sets out_of_memory / fail(),
+  // never mutates batch size (the mem_cap_limit batch-shrink path at :289 is separate).
   if (hasScarceTier(config)) {
     double act_limit = scarceTierActivationLimit(config);
     // Use the analytic per-decode-step activation peak for both MLA and non-MLA models.
@@ -215,6 +211,28 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
     // and is the same metric used by the optimizer's checkCapacity gate, so the two gates
     // are consistent for the decode-mode path that all current sweeps use.
     double act_val = activation_size;
+
+    // Diagnostic (never gates): paper-style score-inclusive footprint and the
+    // per-GPU batch ceiling it would imply if it WERE the gate -- logged so
+    // sweeps can compare both SRAM accountings without changing any reported
+    // metric. See footprint.h::scoreInclusiveIntermediateBytes and
+    // PAPER_INCONSISTENCIES.md U7.
+    if (config.decode_mode && batch_size_per_dp > 0) {
+      double diag_act = scoreInclusiveIntermediateBytes(
+          device->model_config, batch_size_per_dp, ne_tp_dg, expert_batch_size,
+          num_routed_expert_per_device,
+          device->model_config.num_routed_expert > 0,
+          hasDenseFfnLayer(device->model_config),
+          (double)device->model_config.input_len +
+              device->model_config.output_len);
+      double per_seq = diag_act / batch_size_per_dp;
+      double ceiling_per_gpu = (per_seq > 0)
+          ? (act_limit / per_seq) * scheduler->dp_degree / num_total_device
+          : 0.0;
+      std::cout << "SRAM_DIAG_SCORE_INCLUSIVE_ACT_BYTES: " << diag_act << std::endl;
+      std::cout << "SRAM_DIAG_CEILING_BATCH_PER_GPU: " << ceiling_per_gpu << std::endl;
+    }
+
     if (act_val > act_limit) {
       out_of_memory = true;
       std::string tier = (config.hbf_config.num_hbm_stacks > 0) ? "HBM" : "Logic SRAM";
@@ -283,6 +301,15 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
   double size_for_capacity_gate = hasScarceTier(config) ? (size - activation_size) : size;
   if (size_for_capacity_gate > config.memory_capacity) {
     out_of_memory = true;
+    // Descriptive marker for the sweep's bound_reason classifier
+    // (run_experiments.py::classify_failure). Without it, a forced-distribution
+    // run that trips THIS gate only ever prints the generic "Out of Memory:"
+    // line (test.cpp), which classifies as "unknown" instead of a capacity
+    // bound. Wording matches classify_failure's expected substrings.
+    std::cout << (hasScarceTier(config) ? "Flash capacity exceeded"
+                                        : "HBM capacity exceeded")
+              << ": weight+kv " << size_for_capacity_gate / 1e9 << "GB > "
+              << config.memory_capacity / 1e9 << "GB" << std::endl;
     if (config.exit_out_of_memory) {
       return true;
     } else if (config.mem_cap_limit == true){
@@ -673,8 +700,7 @@ std::vector<Stat> Cluster::runIterationSumGenSplit(int iter,
       stat.time = std::max(total_time, sum_machine_time) + time;
       stat.latency = time;
 
-      // Populate energy/batch/breakdown fields like the gen branch above --
-      // previously left zeroed for every prefill row (BUGS_HIDDEN_BY_FLAGS #4).
+      // Populate energy/batch/breakdown fields like the gen branch above.
       // setStat() leaves stat.latency untouched on the disagg+hasSumSeq() path
       // (see its own branching), so this does not override the value set above.
       std::vector<energy_nJ> total_energy = getTotalEnergy();

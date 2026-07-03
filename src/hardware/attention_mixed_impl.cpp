@@ -121,7 +121,11 @@ ExecStatus AttentionMixedExecutionGPU(Device_Ptr device,
                             ((config.use_hbf && config.hbf_config.num_flash_stacks > 0) ? config.hbf_config.flash_read_bandwidth : memory_bandwidth) / exec_status.total_duration;
 
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
-    time_ns kv_write = getKVWriteDuration(config, num_seq, num_kv_heads, head_dim, input->precision_byte, device->model_config.compressed_kv, layer_info.kv_lora_rank, layer_info.qk_rope_head_dim, device->model_config.input_len, device->model_config.output_len, layer_info.local_attention_window);
+    // Program latency amortized across this stage's per-layer write stream --
+    // see getKVWriteDuration's program_latency_amortize_calls doc.
+    int layers_per_stage = device->model_config.num_layers /
+        (device->model_config.pp_dg > 0 ? device->model_config.pp_dg : 1);
+    time_ns kv_write = getKVWriteDuration(config, num_seq, num_kv_heads, head_dim, input->precision_byte, device->model_config.compressed_kv, layer_info.kv_lora_rank, layer_info.qk_rope_head_dim, device->model_config.input_len, device->model_config.output_len, layer_info.local_attention_window, layers_per_stage);
     time_ns unhidden_write = std::max((time_ns)0, kv_write - total_compute_duration);
     exec_status.total_duration += unhidden_write;
     exec_status.kv_write_duration = unhidden_write;

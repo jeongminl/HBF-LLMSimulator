@@ -28,6 +28,9 @@ MLA_MODELS = {"deepseekV3", "deepseekR1"}
 # --figures-only, without main()'s local variables in scope).
 # ---------------------------------------------------------------------------
 MODELS = ["llama3_405B", "llama4_maverick"]
+# Short display names used only in figure group labels, matching the paper's
+# own "Llama3"/"Llama4" bold model-group labels in Figs. 3-7.
+MODEL_DISPLAY = {"llama3_405B": "Llama3", "llama4_maverick": "Llama4"}
 WORKLOADS = {
     "SHORT": (1660, 373),
     "MID": (5900, 499),
@@ -44,11 +47,16 @@ SLOS = [0.05, 0.1, 0.2, 86400.0]  # Offline represents 24 hours
 PEC_WORKLOADS = ["SHORT", "MID", "LONG"]
 PEC_GPUS = [1, 8, 16]
 PEC_MEM_TYPES = ["HBF", "HBF+"]
-# Fig. 3/4 x-axis ordering: pairs each flash config next to its conservative
-# counterpart (HBM4, then CONV/HBF, then CONV+/HBF+), matching the paper's own
-# Fig. 3 bar ordering. Distinct from MEM_TYPES (which drives the sweep loop and
-# the Markdown report's table order, left unchanged).
-FIG_MEM_ORDER = ["HBM4", "CONV", "HBF", "CONV+", "HBF+"]
+# Fig. 3/4 x-axis ordering: HBM4, then both conservative configs (CONV,
+# CONV+), then both HBF configs (HBF, HBF+) -- matches the paper's own Fig. 3
+# bar ordering exactly (verified against the paper's figure). Distinct from
+# MEM_TYPES (which drives the sweep loop and the Markdown report's table
+# order, left unchanged).
+FIG_MEM_ORDER = ["HBM4", "CONV", "CONV+", "HBF", "HBF+"]
+# Fig. 4's own legend/line order is different from Fig. 3's bar order in the
+# paper (HBM4, HBF, HBF+, CONV, CONV+ -- flash configs grouped together
+# before the conservative baselines).
+FIG4_MEM_ORDER = ["HBM4", "HBF", "HBF+", "CONV", "CONV+"]
 
 # ---------------------------------------------------------------------------
 # Optional plotting deps. Imported once at module load so a missing install
@@ -65,21 +73,60 @@ except ImportError:
     HAVE_PLOTTING = False
 
 if HAVE_PLOTTING:
-    GPU_COLORS = {1: "#c6dbef", 2: "#9ecae1", 4: "#6baed6", 8: "#3182bd", 16: "#08519c"}
+    # Colors below are sampled directly from the paper's own Figs. 3-7 (400 DPI
+    # render of the PDF, legend-swatch pixel sampling) so the replications use
+    # the paper's own palette rather than matplotlib defaults.
+    GPU_COLORS = {1: "#595959", 2: "#5b7ab0", 4: "#99b487", 8: "#eabfa7", 16: "#f2e9d3"}
+    SRAM_BOUND_COLOR = "#e48e37"
     FIG_MEM_STYLE = {
-        "HBM4":  {"color": "#1f77b4", "marker": "D"},
-        "HBF":   {"color": "#2ca02c", "marker": "^"},
-        "HBF+":  {"color": "#d62728", "marker": "o"},
-        "CONV":  {"color": "#7f7f7f", "marker": "v"},
-        "CONV+": {"color": "#ff7f0e", "marker": "s"},
+        "HBM4":  {"color": "#ed7d31", "edge": "#843c0c", "marker": "D"},
+        "HBF":   {"color": "#9cc680", "edge": "#385723", "marker": "^"},
+        "HBF+":  {"color": "#548235", "edge": "#243816", "marker": "o"},
+        "CONV":  {"color": "#8faadc", "edge": "#203864", "marker": "^"},
+        "CONV+": {"color": "#2f5597", "edge": "#1b3157", "marker": "o"},
     }
+    FIG5_COLORS = {
+        "attention": "#4472c4", "ffn": "#f4b183", "kv_write": "#7c7c7c",
+        "communication": "#ffe699", "others": "#6fad46",
+    }
+    FIG6_BATCH_COLORS = {"HBM4": "#f4b183", "HBF": "#e2f0d9", "HBF+": "#92ae7d"}
+    FIG7_COLORS = {
+        ("HBF", "online"): "#e2f1da", ("HBF+", "online"): "#a9d28e",
+        ("HBF", "offline"): "#6fad46", ("HBF+", "offline"): "#385723",
+    }
+    FIG7_EDGE = "#172c51"
+
+    # ------------------------------------------------------------------
+    # Shared layout helpers for the paper's "nested categorical axis"
+    # style: one combined panel per figure (not one subplot per model),
+    # with leaf ticks for the innermost category and 1-3 rows of centered
+    # group labels (workload/memory/model) below the axis, separated by
+    # vertical divider lines that run from the top of the plot down
+    # through the label rows they group.
+    # ------------------------------------------------------------------
+    def _label_row(ax, spans, depth, bold=False, fontsize=9, rowlabel=None, base=-0.09, step=0.11):
+        trans = ax.get_xaxis_transform()
+        y = base - depth * step
+        for start, end, label in spans:
+            ax.text((start + end) / 2, y, label, transform=trans, ha="center", va="top",
+                     fontsize=fontsize, fontweight="bold" if bold else "normal", clip_on=False)
+        if rowlabel:
+            ax.text(-0.008, y, rowlabel, transform=ax.transAxes, ha="right", va="top",
+                     fontsize=fontsize, fontweight="bold", clip_on=False)
+
+    def _dividers(ax, xs, label_depth, linewidth=0.8, base=-0.09, step=0.11):
+        trans = ax.get_xaxis_transform()
+        y_bottom = base - label_depth * step - 0.03
+        for x in xs:
+            ax.plot([x, x], [1.0, y_bottom], transform=trans, color="black",
+                     linewidth=linewidth, clip_on=False, zorder=15)
 
 def apply_mla_flags(cfg, model):
-    # F6 defense-in-depth: config.yaml's system.optimization block defaults
-    # compressed_kv/use_absorb/use_flash_mla to "on" (tuned for MLA models like
-    # deepseekV3). eval/test.cpp now derives these from the model preset's
-    # q_lora_rank as the primary fix, but set them explicitly here too so this
-    # script never depends on the C++ binary's model-preset-aware correction.
+    # config.yaml's system.optimization block defaults compressed_kv/use_absorb/
+    # use_flash_mla to "on" (tuned for MLA models like deepseekV3). eval/test.cpp
+    # also derives these from the model preset's q_lora_rank, but set them explicitly
+    # here too so this script never depends on the C++ binary's model-preset-aware
+    # derivation.
     is_mla = model in MLA_MODELS
     cfg["system"]["optimization"]["compressed_kv"] = is_mla
     cfg["system"]["optimization"]["use_absorb"] = is_mla
@@ -156,9 +203,9 @@ def run_simulation(model, mem_type, num_device, batch_size, input_len, output_le
     # (top_module_graph->print_timeboard(), eval/test.cpp) which is the LAST statement
     # before main() returns -- strictly after the CSV write and every stdout marker this
     # function parses below (Total:/PEC_*/optimizer config/OOM markers). No overlap with
-    # anything read here; this only removes the dominant per-op wall-clock cost documented
-    # in BUGS_FIXES.md #3/T3. The on-disk config.yaml itself is untouched (only this
-    # in-memory copy, dumped to the temp config), so a bare `./run config.yaml` is unaffected.
+    # anything read here; this only removes the dominant per-op wall-clock cost. The
+    # on-disk config.yaml itself is untouched (only this in-memory copy, dumped to the
+    # temp config), so a bare `./run config.yaml` is unaffected.
     cfg["log"]["print_log"] = False
     if worker_tag is not None:
         # Isolate this worker's CSV output directory. Required for safe parallelism: the
@@ -218,6 +265,7 @@ def run_simulation(model, mem_type, num_device, batch_size, input_len, output_le
         # model dimensions, precision, and flash capacity).
         pec_kv_bytes = None
         pec_capacity = None
+        sram_diag_ceiling = None  # score-inclusive SRAM ceiling, diagnostic only (see cluster.cpp)
         dp = known_dp
         for line in stdout.split("\n"):
             if line.startswith("PEC_KV_BYTES_PER_TOKEN: "):
@@ -228,6 +276,11 @@ def run_simulation(model, mem_type, num_device, batch_size, input_len, output_le
             elif line.startswith("PEC_FLASH_CAPACITY_BYTES: "):
                 try:
                     pec_capacity = float(line.split(": ", 1)[1])
+                except Exception:
+                    pass
+            elif line.startswith("SRAM_DIAG_CEILING_BATCH_PER_GPU: "):
+                try:
+                    sram_diag_ceiling = float(line.split(": ", 1)[1])
                 except Exception:
                     pass
             elif dp is None and line.startswith("[Parallelism Optimizer] Found optimal configuration:"):
@@ -258,7 +311,8 @@ def run_simulation(model, mem_type, num_device, batch_size, input_len, output_le
             dp = total_gpus
 
         return {"success": True, "tpot": tpot, "csv_file": csv_file, "stdout": stdout,
-                "pec_kv_bytes": pec_kv_bytes, "pec_capacity": pec_capacity, "dp": dp}
+                "pec_kv_bytes": pec_kv_bytes, "pec_capacity": pec_capacity, "dp": dp,
+                "sram_diag_ceiling": sram_diag_ceiling}
     except Exception as e:
         return {"success": False, "reason": str(e), "stdout": ""}
 
@@ -272,12 +326,12 @@ def run_analytic_sweep(model, mem_type, num_device, input_len, output_len, tpot_
     estimate), "cap_feasible_at_1": whether capacity/SRAM alone (ignoring latency) is
     satisfiable at B=1 -- distinguishes a genuine capacity infeasibility (max_batch==0 AND
     cap_feasible_at_1==False, no simulator run can rescue it) from a pure analytic-latency
-    rejection (max_batch==0 AND cap_feasible_at_1==True, the simulator must still be asked
-    per the audit's F1 finding), "tp"/"pp"/"ep"/"dp": the winning config, if any.
+    rejection (max_batch==0 AND cap_feasible_at_1==True, the simulator must still be asked),
+    "tp"/"pp"/"ep"/"dp": the winning config, if any.
 
     IMPORTANT: this is a SEARCH HEURISTIC ONLY. The caller (find_max_batch_size) MUST
     verify the result with run_simulation() before reporting any batch size or metric --
-    the simulator's measured tpot is the sole SLO arbiter (F1)."""
+    the simulator's measured tpot is the sole SLO arbiter."""
     with open(os.path.join(SCRIPT_DIR, "config.yaml"), "r") as f:
         cfg = yaml.safe_load(f)
 
@@ -334,6 +388,63 @@ def run_analytic_sweep(model, mem_type, num_device, input_len, output_len, tpot_
     except Exception:
         return result
 
+def run_analytic_configs(model, mem_type, num_device, input_len, output_len, tpot_slo=0.1, temp_cfg_name="config_temp.yaml"):
+    """Per-config analytic listing via eval/test.cpp's analytic_configs_only mode,
+    supporting the paper's SS-III objective ("each evaluated system selects the
+    parallelism configuration that maximizes the achievable system throughput
+    subject to all constraints"): for EVERY capacity-feasible (tp, pp, ep, dp)
+    parallelism config, returns that config's own analytic capacity ceiling and
+    SLO-latency hint so find_max_batch_size can run a simulator-verified
+    max-batch search per config and report the argmax-TPS winner.
+
+    Returns {"cap_feasible_at_1": bool, "configs": [ {tp, pp, ep, dp, cap_batch,
+    slo_hint_batch, est_lat_min_ms, est_lat_hint_ms}, ... ]}. Batch values are
+    TOTAL batches (multiples of that config's dp). All analytic values are
+    SEARCH SEEDS/BOUNDS ONLY -- the simulator remains the sole SLO arbiter.
+    """
+    with open(os.path.join(SCRIPT_DIR, "config.yaml"), "r") as f:
+        cfg = yaml.safe_load(f)
+
+    cfg["model"]["model_name"] = model
+    cfg["system"]["memory_type"] = mem_type
+    apply_mla_flags(cfg, model)
+    if num_device == 16:
+        cfg["system"]["num_node"] = 2
+        cfg["system"]["num_device"] = 8
+    else:
+        cfg["system"]["num_node"] = 1
+        cfg["system"]["num_device"] = num_device
+    cfg["simulation"]["input_len"] = input_len
+    cfg["simulation"]["output_len"] = output_len
+    cfg["system"]["tpot_slo"] = tpot_slo
+    cfg["system"]["analytic_configs_only"] = True
+    cfg["log"]["print_log"] = False
+
+    temp_cfg_path = os.path.join(BUILD_DIR, temp_cfg_name)
+    with open(temp_cfg_path, "w") as f:
+        yaml.safe_dump(cfg, f)
+
+    result = {"cap_feasible_at_1": False, "configs": []}
+    cmd = ["./run", temp_cfg_name]
+    try:
+        res = subprocess.run(cmd, cwd=BUILD_DIR, capture_output=True, text=True, timeout=300)
+        stdout = res.stdout + "\n" + res.stderr
+        for line in stdout.split("\n"):
+            if line.startswith("ANALYTIC_CAP_FEASIBLE_AT_1: "):
+                result["cap_feasible_at_1"] = line.split(": ", 1)[1].strip() == "1"
+            elif line.startswith("ANALYTIC_CONFIG: "):
+                fields = {}
+                try:
+                    for tok in line[len("ANALYTIC_CONFIG: "):].split():
+                        k, v = tok.split("=", 1)
+                        fields[k] = float(v) if "ms" in k else int(v)
+                    result["configs"].append(fields)
+                except Exception:
+                    pass
+        return result
+    except Exception:
+        return result
+
 def classify_failure(fail_info):
     """Classify why the tightest known failing batch probe failed, for Fig. 3's
     SRAM-bound hatching (the paper hatches Fig. 3 bars whose batch size is capped
@@ -362,46 +473,45 @@ def classify_failure(fail_info):
     return "unknown"
 
 def find_max_batch_size(model, mem_type, num_device, input_len, output_len, tpot_slo=0.1, mfu_max=None, mfu_m_half=None, temp_cfg_name="config_temp.yaml", worker_tag=None):
-    # mfu_max/mfu_m_half: forwarded only to the simulator-verification calls (verify()
-    # below), not to run_analytic_sweep -- the analytic phase is a heuristic seed only
-    # (F1) and find_max_batch_size already reconciles analytic/simulator disagreement
-    # via its fallback search branches, so an MFU-unaware analytic seed just costs a
-    # few extra simulator calls to converge, never an incorrect result.
-    # F1: the batch-size search is split into a cheap ANALYTIC phase (one fast
-    # in-process sweep inside the C++ binary, no simulation spawned per probed
-    # batch -- see run_analytic_sweep) that bounds the search, followed by a
-    # SIMULATOR VERIFICATION phase that is the sole source of truth for every
-    # reported batch size and metric. Preserves the spec's two-phase shape
-    # (Phase 1 bounds / Phase 2 exact-integer binary search) -- Phase 1 now runs
-    # analytically; Phase 2 is a small number of simulator calls near the
-    # boundary, with graceful fallback to a full simulator-driven search if the
-    # analytic estimate turns out to diverge from the simulator's measurement.
+    # Paper SS-III objective: "each evaluated system selects the parallelism
+    # configuration that maximizes the achievable system throughput subject to all
+    # constraints" (SLO, GPU-memory capacity, on-die SRAM). This function therefore
+    # searches PER parallelism config -- every capacity-feasible (tp, pp, ep, dp)
+    # gets its own simulator-verified max-batch search (over multiples of its own
+    # dp; within a FIXED config feasibility is monotone in batch: capacity footprint
+    # and measured tpot are both nondecreasing, and there is no batch%dp
+    # config-switching) -- and the cell reports the config with the highest verified
+    # TPS = batch / (tpot * total_gpus): its batch AND tpot become the cell's
+    # operating point. See CHANGES.md item 31.
     #
-    # Returns (max_b, max_tpot, csv, pec_kv, pec_cap, dp, bound_reason). max_b is the
-    # RAW TOTAL/global batch (across all dp replicas) -- exactly what the C++/sim
-    # layer works with internally (scheduler.cpp: batch_size_per_dp =
-    # total_batch_size/dp_degree; parallelism_optimizer.cpp: batch_size_per_gpu =
-    # batch_size/dp) and what the TPS/PEC formulas in main() already correctly
-    # treat as a total (dividing by GPU count). Callers computing a PER-GPU batch
-    # size (Metric 1/4's "Max Per-GPU Batch Size") must divide by the TOTAL GPU
-    # COUNT used in the experiment, NOT the returned dp -- matches this project's
-    # TPS definition ("... / Number of GPUs") and the paper's own published
-    # anchors (e.g. 1555/8=194.4 vs. the paper's stated 194 for llama3
-    # HBM4/8-GPU/SHORT). Dividing by dp instead penalizes a memory system for using DP
-    # *more* effectively (more independent replicas = more total capacity from the same
-    # hardware) -- see CHANGES.md for the investigation that corrected this (previously
-    # "P1b"). Returned dp is still needed by callers for other purposes (e.g. distribution
-    # passthrough), just not for this division.
-    # bound_reason (new): classify_failure()'s verdict on why the batch just above
-    # max_b failed -- "sram"/"flash"/"slo"/"unknown". Used only for Fig. 3's
-    # SRAM-bound hatching (paper convention); callers not plotting Fig. 3 can
-    # discard it.
-    analytic = run_analytic_sweep(model, mem_type, num_device, input_len, output_len, tpot_slo,
-                                   temp_cfg_name=temp_cfg_name)
-    b_analytic = analytic["max_batch"]
+    # mfu_max/mfu_m_half: forwarded only to the simulator-verification calls, not
+    # to the analytic listing -- the analytic phase is a heuristic seed/bound only;
+    # the simulator's measured tpot is the sole SLO arbiter.
+    #
+    # Returns (max_b, max_tpot, csv, pec_kv, pec_cap, dp, bound_reason); every field
+    # describes the throughput-winning config's operating point. max_b is the RAW
+    # TOTAL/global batch (across all dp replicas); per-GPU batch = max_b / TOTAL GPU
+    # COUNT (not / dp), matching the TPS definition.
+    # bound_reason: classify_failure()'s verdict on the WINNING config's own
+    # boundary (the failing probe just above its max batch) -- "sram"/"flash"/
+    # "slo"/"unknown". Used for Fig. 3's SRAM-bound hatching.
+    #
+    # Pruning: configs are simulated in descending analytic-TPS order; once one
+    # config's verified TPS is in hand, any config whose analytic-TPS upper bound
+    # cannot beat it is skipped without simulation. The bound is seed_tps =
+    # slo_hint_batch / (est_lat_hint * G): under the estimate<=measured invariant
+    # (audited by test.cpp's OVERESTIMATE warning), any sim-feasible batch b satisfies
+    # est_lat(b) <= tpot(b) <= SLO, hence b <= slo_hint_batch, and TPS(b) =
+    # b/(tpot(b)*G) <= b/(est_lat(b)*G), which is nondecreasing in b (est_lat has
+    # constant terms), so it is maximized at the hint. Set HBF_DISABLE_CONFIG_PRUNING=1
+    # to simulate every feasible config (validation / provable-argmax mode).
+    listing = run_analytic_configs(model, mem_type, num_device, input_len, output_len,
+                                   tpot_slo, temp_cfg_name=temp_cfg_name)
 
-    # Tracks the tightest known failing verify() call across this whole search,
-    # for classify_failure() at every return site below.
+    total_gpus = num_device
+
+    # Tracks the tightest known failing verify() call across the whole cell, for
+    # classify_failure() at the no-winner return sites below.
     last_fail = {"reason": None, "stdout": ""}
 
     def verify(b, distribution=None):
@@ -417,122 +527,146 @@ def find_max_batch_size(model, mem_type, num_device, input_len, output_len, tpot
         dp = res.get("dp") or 1
         return b, res["tpot"], res.get("csv_file"), res.get("pec_kv_bytes"), res.get("pec_capacity"), dp
 
-    # BOUNDARY_WINDOW/probe_window: guards every search step below (exponential
-    # doubling, and both binary searches) against a NON-MONOTONICITY artifact where
-    # one probed batch happens to be the single integer in a divisibility cycle
-    # (batch_size % dp == 0, parallelism_optimizer.cpp) that routes the live
-    # optimizer to a WORSE parallelism config than its neighbors -- confirmed
-    # empirically while investigating PAPER_INCONSISTENCIES.md's U8 (llama4_
-    # maverick/HBF+/16-GPU/offline): b=9292 is divisible by 4 (TP=1/PP=4/DP=4
-    # selected, feasible up to ~10947); b=9293 is divisible by neither 4 nor 2, so
-    # only TP=4/PP=4/DP=1 (ceiling ~8192) remains divisibility-eligible and fails
-    # there, even though b=9296 (divisible by 4 again) succeeds with TP=1 same as
-    # b=9292. A single probe cannot distinguish this from a genuine ceiling, so
-    # every step scans a window before concluding infeasibility.
-    # Window size: a fixed 8 (sized to the TP degrees (<=8) this codebase's model
-    # presets actually use) only guarantees catching the next value divisible by
-    # some dp <= 8. Now that the optimizer ranks by throughput rather than
-    # argmin(latency) (parallelism_optimizer.cpp), dp is no longer implicitly
-    # biased toward small dp/large pp by a latency-minimizing objective and can be
-    # chosen up to the full GPU count -- the worst-case gap between consecutive
-    # multiples of dp is dp-1, so the window must cover up to num_device-1 to
-    # guarantee catching a hit for ANY legal dp at this GPU count.
-    BOUNDARY_WINDOW = max(num_device, 8)
+    def per_config_max_batch(c):
+        """Simulator-verified max batch for ONE forced config.
+        Returns (best_b, best_res, cfg_fail): best_b == 0 if even the minimum
+        batch (dp) fails. cfg_fail is the last failing probe of THIS config (its
+        own boundary), for bound_reason classification. Feasibility is monotone
+        in batch within a fixed config, so plain bisection over multiples of dp."""
+        dist = {"tp": c["tp"], "pp": c["pp"], "ep": c["ep"]}
+        dp = max(c["dp"], 1)
+        cfg_fail = {"reason": None, "stdout": ""}
 
-    def probe_window(b_start):
-        """Scan [b_start, b_start+BOUNDARY_WINDOW] for the first successful verify().
-        Returns (b_found, res) on success, or (None, last res) if the whole window fails."""
-        res_local = None
-        for offset in range(0, BOUNDARY_WINDOW + 1):
-            b_try = b_start + offset
-            res_local = verify(b_try)
-            if res_local["success"]:
-                return b_try, res_local
-        return None, res_local
+        def v(b):
+            res = verify(b, distribution=dist)
+            if not res["success"]:
+                cfg_fail["reason"] = res.get("reason")
+                cfg_fail["stdout"] = res.get("stdout", "")
+            return res
 
-    def analytic_distribution():
-        if analytic["tp"] is None or analytic["pp"] is None or analytic["ep"] is None:
-            return None
-        return {"tp": analytic["tp"], "pp": analytic["pp"], "ep": analytic["ep"]}
+        k_cap = max(c["cap_batch"] // dp, 1)
+        k_hint = min(max(c["slo_hint_batch"] // dp, 1), k_cap)
 
-    if b_analytic <= 0:
-        if not analytic["cap_feasible_at_1"]:
-            # Genuine capacity/SRAM infeasibility even at B=1 -- exact, analytic-only
-            # constraint; no simulator run can change this (audit F1: this branch is the
-            # legitimate analytic rejection, unlike a pure-latency-estimate one).
+        res_hint = v(k_hint * dp)
+        if not res_hint["success"]:
+            # Analytic hint over-shot the simulator: bisect downward in [1, k_hint-1].
+            best_k, best_res = 0, None
+            lo, hi = 1, k_hint - 1
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                r = v(mid * dp)
+                if r["success"]:
+                    best_k, best_res = mid, r
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            return best_k * dp, best_res, cfg_fail
+
+        best_k, best_res = k_hint, res_hint
+
+        # Jump straight to the analytic capacity ceiling (post weight-parity it
+        # tracks the simulator's recorded footprint to <0.01%). If the ceiling
+        # fails in the simulator, the true boundary lies inside (k_hint, k_cap):
+        # bisect and return (a failure above best_k is then established).
+        if k_cap > k_hint:
+            res_cap = v(k_cap * dp)
+            if res_cap["success"]:
+                best_k, best_res = k_cap, res_cap
+            else:
+                lo, hi = k_hint + 1, k_cap - 1
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    r = v(mid * dp)
+                    if r["success"]:
+                        best_k, best_res = mid, r
+                        lo = mid + 1
+                    else:
+                        hi = mid - 1
+                return best_k * dp, best_res, cfg_fail
+
+        # Upward probe past the verified point: the analytic bounds are heuristics
+        # in BOTH directions (the latency estimate can over-estimate -- the
+        # est<=measured invariant is audited, not guaranteed), so exponentially
+        # widen the step until a probe fails, then bisect the final gap.
+        gap = 1
+        while True:
+            k_try = best_k + gap
+            r = v(k_try * dp)
+            if r["success"]:
+                best_k, best_res = k_try, r
+                gap *= 2
+            else:
+                lo, hi = best_k + 1, k_try - 1
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    r2 = v(mid * dp)
+                    if r2["success"]:
+                        best_k, best_res = mid, r2
+                        lo = mid + 1
+                    else:
+                        hi = mid - 1
+                break
+        return best_k * dp, best_res, cfg_fail
+
+    configs = listing["configs"]
+    if not configs:
+        if not listing["cap_feasible_at_1"]:
+            # Genuine capacity/SRAM infeasibility at every config's minimum batch --
+            # exact, analytic-only constraint; no simulator run can change it.
             return 0, 0.0, None, None, None, 1, "unknown"
-        # Audit F1 fix: capacity was fine at B=1, only the analytic LATENCY ESTIMATE
-        # rejected it. The estimate must never itself be the final word (the optimizer/
-        # simulator separation-of-concerns principle) -- ask the real simulator before
-        # declaring this combo infeasible.
+        # Defensive: marker says batch 1 fits but no config line was parsed. Ask
+        # the simulator directly (optimizer picks the config) rather than declare
+        # infeasibility from a parse gap.
         res1 = verify(1)
         if not res1["success"]:
             return 0, 0.0, None, None, None, 1, classify_failure(last_fail)
         b, tpot, csv, kv, cap, dp = unpack(1, res1)
         return b, tpot, csv, kv, cap, dp, classify_failure(last_fail)
 
-    # Skip the redundant in-process Optimize() re-derivation for the analytically-known
-    # batch/boundary checks by passing the discovered config through explicitly.
-    dist = analytic_distribution()
+    # Simulate likely winners first (descending analytic TPS at the SLO hint) so
+    # the pruning bound bites early. seed_tps doubles as the config's analytic
+    # TPS upper bound (see the pruning derivation in the docstring above).
+    for c in configs:
+        est_hint_s = max(c["est_lat_hint_ms"] / 1000.0, 1e-9)
+        c["seed_tps"] = c["slo_hint_batch"] / est_hint_s / total_gpus
+    configs.sort(key=lambda c: c["seed_tps"], reverse=True)
 
-    res = verify(b_analytic, distribution=dist)
-    if res["success"]:
-        max_b, max_tpot, last_csv, last_pec_kv, last_pec_cap, dp = unpack(b_analytic, res)
+    prune = os.environ.get("HBF_DISABLE_CONFIG_PRUNING") != "1"
 
-        # Boundary safety check: confirm batches just above b_analytic truly fail
-        # (both the analytic model under-estimating latency, and the divisibility-
-        # cycle non-monotonicity described above at probe_window's definition).
-        b_probe, boundary_res = probe_window(b_analytic + 1)
-        if b_probe is None:
-            return max_b, max_tpot, last_csv, last_pec_kv, last_pec_cap, dp, classify_failure(last_fail)
+    best = None  # {"tps", "b", "res", "bound_reason", "config"}
+    legacy_global_max_b = 0  # global max batch across all configs, logged for comparison only
+    pruned = 0
+    for c in configs:
+        if prune and best is not None and c["seed_tps"] <= best["tps"]:
+            pruned += 1
+            continue
+        b_star, res_star, cfg_fail = per_config_max_batch(c)
+        if b_star <= 0 or res_star is None:
+            continue
+        legacy_global_max_b = max(legacy_global_max_b, b_star)
+        tps = b_star / (res_star["tpot"] * total_gpus)
+        if best is None or tps > best["tps"]:
+            best = {"tps": tps, "b": b_star, "res": res_star,
+                    "bound_reason": classify_failure(cfg_fail), "config": c}
 
-        b_success = b_probe
-        max_b, max_tpot, last_csv, last_pec_kv, last_pec_cap, dp = unpack(b_success, boundary_res)
+    if best is None:
+        # Every analytically-feasible config failed even its minimum batch in the
+        # simulator. Final fallback: one optimizer-picked run at batch 1.
+        res1 = verify(1)
+        if not res1["success"]:
+            return 0, 0.0, None, None, None, 1, classify_failure(last_fail)
+        b, tpot, csv, kv, cap, dp = unpack(1, res1)
+        return b, tpot, csv, kv, cap, dp, classify_failure(last_fail)
 
-        b = b_success * 2
-        while True:
-            b_next, res2 = probe_window(b)
-            if b_next is not None:
-                b_success = b_next
-                max_b, max_tpot, last_csv, last_pec_kv, last_pec_cap, dp = unpack(b_next, res2)
-                b = b_next * 2
-            else:
-                b_fail = b
-                break
-
-        low, high = b_success + 1, b_fail - 1
-        while low <= high:
-            mid = (low + high) // 2
-            mid_found, res2 = probe_window(mid)
-            if mid_found is not None:
-                max_b, max_tpot, last_csv, last_pec_kv, last_pec_cap, dp = unpack(mid_found, res2)
-                low = mid_found + 1
-            else:
-                high = mid - 1
-
-        return max_b, max_tpot, last_csv, last_pec_kv, last_pec_cap, dp, classify_failure(last_fail)
-
-    # Analytic estimate under-shot reality: the simulator found b_analytic itself
-    # infeasible. Binary-search DOWNWARD with the simulator to pinpoint the true
-    # max. b=1 is the base case: if even that fails, this combo is infeasible.
-    # No pre-known config for these smaller candidates, so let the optimizer re-derive.
-    res1 = verify(1)
-    if not res1["success"]:
-        return 0, 0.0, None, None, None, 1, classify_failure(last_fail)
-
-    max_b, max_tpot, last_csv, last_pec_kv, last_pec_cap, dp = unpack(1, res1)
-
-    low, high = 2, b_analytic - 1
-    while low <= high:
-        mid = (low + high) // 2
-        mid_found, res2 = probe_window(mid)
-        if mid_found is not None:
-            max_b, max_tpot, last_csv, last_pec_kv, last_pec_cap, dp = unpack(mid_found, res2)
-            low = mid_found + 1
-        else:
-            high = mid - 1
-
-    return max_b, max_tpot, last_csv, last_pec_kv, last_pec_cap, dp, classify_failure(last_fail)
+    w = best["config"]
+    diag = best["res"].get("sram_diag_ceiling")
+    diag_str = f", sram_diag_ceiling_per_gpu={diag:.1f}" if diag else ""
+    print(f"[config-search] {model}/{mem_type}/{num_device}gpu slo={tpot_slo}: winner "
+          f"tp={w['tp']} pp={w['pp']} ep={w['ep']} dp={w['dp']} batch={best['b']} "
+          f"tps_per_gpu={best['tps']:.1f} (configs={len(configs)}, pruned={pruned}, "
+          f"legacy_global_max_batch={max(legacy_global_max_b, best['b'])}{diag_str})")
+    b, tpot, csv, kv, cap, dp = unpack(best["b"], best["res"])
+    return b, tpot, csv, kv, cap, dp, best["bound_reason"]
 
 def _run_cell(spec):
     """Picklable top-level worker for ProcessPoolExecutor (main(), below): runs ONE
@@ -659,21 +793,39 @@ def _fmt_compact(v):
     return f"{v:.1f}"
 
 def _fig3_per_gpu_batch(results, baselines, out_path):
-    """Fig. 3 replication: per-GPU batch size under 0.1s TPOT SLO. One panel per
-    (model, workload); within a panel, one overlaid bar per memory config
-    encoding GPU count as nested rectangles (largest GPU count drawn first/
-    behind, so each GPU count's top edge stays visible -- the paper's "top of
-    each colored segment = max value at that GPU count" convention). A GPU
-    count whose value doesn't exceed the running max for smaller GPU counts is
-    omitted entirely (paper: "subsumed by the preceding segment"). HBF+/CONV+
-    bars are hatched where the batch is SRAM-bound (bound_reason=="sram")."""
-    fig, axes = plt.subplots(len(MODELS), len(WORKLOADS), figsize=(18, 9), squeeze=False)
-    x = np.arange(len(FIG_MEM_ORDER))
+    """Fig. 3 replication: per-GPU batch size under 0.1s TPOT SLO. Single
+    combined panel matching the paper's own layout: x-axis nests Model >
+    Workload > MemConfig (order HBM4, CONV, CONV+, HBF, HBF+), with GPU count
+    encoded as nested bar segments (largest GPU count drawn first/behind, so
+    each GPU count's top edge stays visible -- the paper's "top of each
+    colored segment = max value at that GPU count" convention). A GPU count
+    whose value doesn't exceed the running max for smaller GPU counts is
+    omitted entirely ("subsumed by the preceding segment"). HBF+/CONV+ bars
+    that are SRAM-bound get the paper's orange X marker. Each workload
+    group's own 8-GPU HBM4 batch size (the normalization base) is called out
+    with a red arrow, exactly as in the paper."""
+    fig, ax = plt.subplots(figsize=(16, 5.2))
+    bar_width = 0.85
+    wl_spans, model_spans = [], []
+    wl_dividers, model_dividers = [], []
+    xticks, xlabels = [], []
+    xpos = 0.0
     for mi, model in enumerate(MODELS):
+        if mi > 0:
+            xpos += 2.0
+            model_dividers.append(xpos - 1.0)
+        model_start = xpos
         for wi, wl in enumerate(WORKLOADS.keys()):
-            ax = axes[mi][wi]
+            if wi > 0:
+                xpos += 1.0
+                wl_dividers.append(xpos - 0.5)
+            wl_start = xpos
             base = baselines[model][wl]["max_batch_per_gpu"]
-            for xi, mem in enumerate(FIG_MEM_ORDER):
+            hbm4_x, hbm4_top = None, 0.0
+            for mem in FIG_MEM_ORDER:
+                xi = xpos
+                xticks.append(xi)
+                xlabels.append(mem)
                 rows_by_gpu = {}
                 for gpu in GPUS:
                     row = next((r for r in results if r["model"] == model and r["workload"] == wl
@@ -688,80 +840,148 @@ def _fig3_per_gpu_batch(results, baselines, out_path):
                     if v > running_max:
                         visible.append((gpu, row))
                         running_max = v
-                top_val = None
+                top_norm, sram_bound = 0.0, False
                 for gpu, row in reversed(visible):
                     norm_v = row["max_batch_per_gpu"] / base if base > 0 else 0.0
-                    hatch = "///" if (mem in ("HBF+", "CONV+") and row.get("bound_reason") == "sram") else None
-                    ax.bar(xi, norm_v, color=GPU_COLORS[gpu], hatch=hatch,
+                    ax.bar(xi, norm_v, width=bar_width, color=GPU_COLORS[gpu],
                            edgecolor="black", linewidth=0.4, zorder=20 - gpu)
-                    if top_val is None:
-                        top_val = (norm_v, row["max_batch_per_gpu"])
-                if top_val is not None:
-                    ax.text(xi, top_val[0] + 0.03, _fmt_compact(top_val[1]),
-                            ha="center", va="bottom", fontsize=7)
-            ax.set_xticks(x)
-            ax.set_xticklabels(FIG_MEM_ORDER, rotation=0, fontsize=8)
-            ax.set_title(f"{model} / {wl}", fontsize=9)
-            if wi == 0:
-                ax.set_ylabel("Per-GPU batch size\n(norm. to 8-GPU HBM4)")
-    gpu_handles = [plt.Rectangle((0, 0), 1, 1, color=GPU_COLORS[g]) for g in GPUS]
-    sram_handle = plt.Rectangle((0, 0), 1, 1, facecolor="white", edgecolor="black", hatch="///")
+                    top_norm = max(top_norm, norm_v)
+                    if mem in ("HBF+", "CONV+") and row.get("bound_reason") == "sram":
+                        sram_bound = True
+                if sram_bound:
+                    ax.plot(xi, top_norm + 0.15, marker="X", color=SRAM_BOUND_COLOR,
+                            markeredgecolor="black", markeredgewidth=0.7, markersize=12, zorder=40)
+                if mem == "HBM4":
+                    hbm4_x, hbm4_top = xi, top_norm
+                xpos += 1.0
+            ax.annotate(_fmt_compact(base), xy=(hbm4_x, hbm4_top),
+                        xytext=(hbm4_x - 0.9, hbm4_top + 1.3),
+                        color="#c00000", fontsize=8.5, fontweight="bold",
+                        arrowprops=dict(arrowstyle="->", color="#c00000", lw=1.1))
+            wl_spans.append((wl_start, xpos - 1.0, wl))
+        model_spans.append((model_start, xpos - 1.0, MODEL_DISPLAY.get(model, model)))
+    ax.set_xticks(xticks)
+    ax.set_xticklabels(xlabels, rotation=90, fontsize=7.5)
+    ax.set_xlim(-0.7, xpos - 0.3)
+    ax.set_ylabel("Per-GPU batch size\n(norm. to 8-GPU HBM4)")
+    ax.yaxis.grid(True, color="#e6e6e6", linewidth=0.7, zorder=0)
+    ax.set_axisbelow(True)
+    _label_row(ax, wl_spans, depth=1, fontsize=9, base=-0.20, step=0.11)
+    _label_row(ax, model_spans, depth=2, bold=True, fontsize=10, base=-0.20, step=0.11)
+    _dividers(ax, wl_dividers, label_depth=1, linewidth=0.7, base=-0.20, step=0.11)
+    _dividers(ax, model_dividers, label_depth=2, linewidth=1.3, base=-0.20, step=0.11)
+    gpu_handles = [plt.Rectangle((0, 0), 1, 1, facecolor=GPU_COLORS[g], edgecolor="black", linewidth=0.4)
+                   for g in GPUS]
+    sram_handle = plt.Line2D([0], [0], marker="X", color="none", markerfacecolor=SRAM_BOUND_COLOR,
+                              markeredgecolor="black", markersize=10, linewidth=0)
     fig.legend(gpu_handles + [sram_handle], [f"{g} GPU" for g in GPUS] + ["SRAM bound"],
-               loc="upper center", ncol=len(GPUS) + 1, fontsize=8, bbox_to_anchor=(0.5, 1.03))
-    fig.suptitle("Fig. 3 replication: Per-GPU batch size under 0.1s TPOT SLO", y=1.07)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+               loc="upper center", ncol=len(GPUS) + 1, fontsize=8, bbox_to_anchor=(0.5, 1.02))
+    fig.suptitle("Fig. 3 replication: Per-GPU batch size under 0.1s TPOT SLO", y=1.14)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.3)
     plt.close(fig)
 
 def _fig4_throughput(results, baselines, out_path):
-    """Fig. 4 replication: per-GPU TPS across GPU counts, one line per memory
-    config, one panel per (model, workload), normalized to 8-GPU HBM4."""
-    fig, axes = plt.subplots(len(MODELS), len(WORKLOADS), figsize=(18, 9), squeeze=False)
+    """Fig. 4 replication: per-GPU TPS, single combined panel matching the
+    paper's layout: x-axis nests Model > Workload > GPU count (1,2,4,8,16),
+    with one line per memory config crossing each workload group's five
+    GPU-count positions. Each workload group's own 8-GPU HBM4 TPS (the
+    normalization base) is called out with a red arrow, exactly as in the
+    paper."""
+    fig, ax = plt.subplots(figsize=(16, 5.2))
+    wl_spans, model_spans = [], []
+    wl_dividers, model_dividers = [], []
+    xticks, xlabels = [], []
+    xpos = 0.0
     for mi, model in enumerate(MODELS):
+        if mi > 0:
+            xpos += 2.0
+            model_dividers.append(xpos - 1.0)
+        model_start = xpos
         for wi, wl in enumerate(WORKLOADS.keys()):
-            ax = axes[mi][wi]
+            if wi > 0:
+                xpos += 1.0
+                wl_dividers.append(xpos - 0.5)
+            wl_start = xpos
             anchor = baselines[model][wl]["tps"]
-            for mem in FIG_MEM_ORDER:
+            gpu_x = {}
+            for gi, gpu in enumerate(GPUS):
+                gpu_x[gpu] = xpos + gi
+                xticks.append(xpos + gi)
+                xlabels.append(str(gpu))
+            hbm4_pt = None
+            for mem in FIG4_MEM_ORDER:
                 xs, ys = [], []
                 for gpu in GPUS:
                     row = next((r for r in results if r["model"] == model and r["workload"] == wl
                                 and r["memory"] == mem and r["gpus"] == gpu), None)
                     if row is not None and row["max_batch"] > 0:
-                        xs.append(gpu)
+                        xs.append(gpu_x[gpu])
                         ys.append(row["norm_tps"])
+                        if mem == "HBM4" and gpu == 8:
+                            hbm4_pt = (gpu_x[gpu], row["norm_tps"])
                 style = FIG_MEM_STYLE[mem]
-                ax.plot(xs, ys, marker=style["marker"], color=style["color"], label=mem,
-                        linewidth=1.5, markersize=5)
-            ax.set_xscale("log", base=2)
-            ax.set_xticks(GPUS)
-            ax.set_xticklabels(GPUS)
-            ax.set_title(f"{model} / {wl}\n(w/ 8 GPUs HBM4: {_fmt_compact(anchor)} tok/s/GPU)", fontsize=8)
-            if wi == 0:
-                ax.set_ylabel("Per-GPU TPS\n(norm. to 8-GPU HBM4)")
-    axes[0][0].legend(loc="upper left", fontsize=7)
-    fig.suptitle("Fig. 4 replication: System throughput", y=1.02)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+                ax.plot(xs, ys, marker=style["marker"], color=style["color"],
+                        markeredgecolor=style["edge"], markeredgewidth=0.6,
+                        linewidth=1.6, markersize=6, zorder=10)
+            if hbm4_pt is not None:
+                ax.annotate(_fmt_compact(anchor), xy=hbm4_pt,
+                            xytext=(hbm4_pt[0] - 1.2, hbm4_pt[1] + 0.32),
+                            color="#c00000", fontsize=8.5, fontweight="bold",
+                            arrowprops=dict(arrowstyle="->", color="#c00000", lw=1.1))
+            wl_spans.append((wl_start, xpos + len(GPUS) - 1, wl))
+            xpos += len(GPUS)
+        model_spans.append((model_start, xpos - 1.0, MODEL_DISPLAY.get(model, model)))
+    ax.set_xticks(xticks)
+    ax.set_xticklabels(xlabels, fontsize=7.5)
+    ax.set_xlim(-0.7, xpos - 0.3)
+    ax.set_ylabel("Per-GPU TPS\n(norm. to 8-GPU HBM4)")
+    ax.yaxis.grid(True, color="#e6e6e6", linewidth=0.7, zorder=0)
+    ax.set_axisbelow(True)
+    ax.text(-0.008, -0.03, "# GPUs", transform=ax.transAxes, ha="right", va="top",
+            fontsize=8, fontweight="bold", clip_on=False)
+    _label_row(ax, wl_spans, depth=1, fontsize=9, base=-0.09, step=0.11)
+    _label_row(ax, model_spans, depth=2, bold=True, fontsize=10, base=-0.09, step=0.11)
+    _dividers(ax, wl_dividers, label_depth=1, linewidth=0.7, base=-0.09, step=0.11)
+    _dividers(ax, model_dividers, label_depth=2, linewidth=1.3, base=-0.09, step=0.11)
+    handles = [plt.Line2D([0], [0], color=FIG_MEM_STYLE[m]["color"], marker=FIG_MEM_STYLE[m]["marker"],
+                          markeredgecolor=FIG_MEM_STYLE[m]["edge"], linewidth=1.6, markersize=7, label=m)
+               for m in FIG4_MEM_ORDER]
+    fig.legend(handles=handles, loc="upper center", ncol=len(FIG4_MEM_ORDER), fontsize=8.5,
+               bbox_to_anchor=(0.5, 1.02))
+    fig.suptitle("Fig. 4 replication: System throughput", y=1.12)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.3)
     plt.close(fig)
 
 def _fig5_breakdown(results, out_path):
-    """Fig. 5 replication: stacked runtime-fraction bars for {MID,LONG} x
-    {HBM4,HBF+} x GPU in {4,8,16}, one panel per model -- the paper's exact
-    Fig. 5 scope."""
-    fig, axes = plt.subplots(1, len(MODELS), figsize=(14, 6), squeeze=False)
+    """Fig. 5 replication: stacked runtime-fraction bars, single combined
+    panel matching the paper's layout: x-axis nests Model > Memory
+    {HBM4,HBF+} > Workload {MID,LONG} > GPU {4,8,16} -- the paper's exact
+    Fig. 5 scope and nesting order."""
+    fig, ax = plt.subplots(figsize=(15, 5.4))
     components = ["attention", "ffn", "kv_write", "communication", "others"]
     comp_labels = ["Attention", "FFN", "KV Write", "Communication", "Others"]
-    comp_colors = ["#4c72b0", "#dd8452", "#c44e52", "#8172b2", "#ccb974"]
+    comp_colors = [FIG5_COLORS[c] for c in components]
     fig5_wls = ["MID", "LONG"]
     fig5_mems = ["HBM4", "HBF+"]
+    xticks, xlabels = [], []
+    wl_spans, mem_spans, model_spans = [], [], []
+    wl_dividers, mem_dividers, model_dividers = [], [], []
+    xpos = 0.0
     for mi, model in enumerate(MODELS):
-        ax = axes[0][mi]
-        xpos = 0.0
-        xticks, xlabels = [], []
-        group_bounds = []
-        for wl in fig5_wls:
-            group_start = xpos
-            for mem in fig5_mems:
+        if mi > 0:
+            xpos += 2.0
+            model_dividers.append(xpos - 1.0)
+        model_start = xpos
+        for mj, mem in enumerate(fig5_mems):
+            if mj > 0:
+                xpos += 1.0
+                mem_dividers.append(xpos - 0.5)
+            mem_start = xpos
+            for wi, wl in enumerate(fig5_wls):
+                if wi > 0:
+                    xpos += 1.0
+                    wl_dividers.append(xpos - 0.5)
+                wl_start = xpos
                 for gpu in BREAKDOWN_GPUS:
                     row = next((r for r in results if r["model"] == model and r["workload"] == wl
                                 and r["memory"] == mem and r["gpus"] == gpu), None)
@@ -769,126 +989,177 @@ def _fig5_breakdown(results, out_path):
                     bottom = 0.0
                     if fracs is not None:
                         for comp, color in zip(components, comp_colors):
-                            ax.bar(xpos, fracs[comp] * 100, bottom=bottom, color=color, width=0.8)
+                            ax.bar(xpos, fracs[comp] * 100, bottom=bottom, color=color,
+                                   width=0.85, edgecolor="black", linewidth=0.3, zorder=10)
                             bottom += fracs[comp] * 100
                     xticks.append(xpos)
                     xlabels.append(str(gpu))
                     xpos += 1.0
-                xpos += 0.6  # gap between mem sub-groups
-            group_bounds.append((group_start, xpos - 0.6, wl))
-            xpos += 1.0  # gap between workload groups
-        ax.set_xticks(xticks)
-        ax.set_xticklabels(xlabels, fontsize=7)
-        for start, end, wl in group_bounds:
-            ax.text((start + end) / 2, -12, wl, ha="center", fontsize=8)
-        ax.set_ylim(0, 100)
-        ax.set_title(model, fontsize=9)
-        if mi == 0:
-            ax.set_ylabel("TPOT breakdown [%]")
-    handles = [plt.Rectangle((0, 0), 1, 1, color=c) for c in comp_colors]
-    fig.legend(handles, comp_labels, loc="upper center", ncol=len(components), fontsize=8,
-               bbox_to_anchor=(0.5, 1.06))
+                wl_spans.append((wl_start, xpos - 1.0, wl))
+            mem_spans.append((mem_start, xpos - 1.0, mem))
+        model_spans.append((model_start, xpos - 1.0, MODEL_DISPLAY.get(model, model)))
+    ax.set_xticks(xticks)
+    ax.set_xticklabels(xlabels, fontsize=7.5)
+    ax.set_xlim(-0.7, xpos - 0.3)
+    ax.set_ylim(0, 100)
+    ax.set_ylabel("TPOT breakdown [%]")
+    ax.text(-0.008, -0.03, "# GPUs", transform=ax.transAxes, ha="right", va="top",
+            fontsize=8, fontweight="bold", clip_on=False)
+    _label_row(ax, wl_spans, depth=1, fontsize=8.5, base=-0.09, step=0.10)
+    _label_row(ax, mem_spans, depth=2, fontsize=9, base=-0.09, step=0.10)
+    _label_row(ax, model_spans, depth=3, bold=True, fontsize=10, base=-0.09, step=0.10)
+    _dividers(ax, wl_dividers, label_depth=1, linewidth=0.6, base=-0.09, step=0.10)
+    _dividers(ax, mem_dividers, label_depth=2, linewidth=0.9, base=-0.09, step=0.10)
+    _dividers(ax, model_dividers, label_depth=3, linewidth=1.3, base=-0.09, step=0.10)
+    handles = [plt.Rectangle((0, 0), 1, 1, facecolor=c, edgecolor="black", linewidth=0.3) for c in comp_colors]
+    fig.legend(handles, comp_labels, loc="upper center", ncol=len(components), fontsize=8.5,
+               bbox_to_anchor=(0.5, 1.02))
     fig.suptitle("Fig. 5 replication: Runtime breakdown under 0.1s TPOT SLO", y=1.12)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.3)
     plt.close(fig)
 
 def _fig6_slo_sensitivity(slo_results, out_path):
-    """Fig. 6 replication: per-GPU batch size (bars, right axis) and per-GPU
-    TPS (lines, left axis) across TPOT SLOs, for {HBM4,HBF,HBF+} within GPU
-    groups {4,8,16}, one panel per model, LONG workload only (matches the
-    sweep's own scope)."""
-    fig, axes = plt.subplots(1, len(MODELS), figsize=(14, 6), squeeze=False)
+    """Fig. 6 replication: per-GPU TPS (lines, left axis) and per-GPU batch
+    size (bars, right axis), single combined panel matching the paper's
+    layout: x-axis nests Model > GPU {4,8,16} > TPOT SLO {0.05,0.1,0.2,
+    offline}, for {HBM4,HBF,HBF+}, LONG workload only (matches the sweep's
+    own scope)."""
+    fig, ax = plt.subplots(figsize=(15, 5.6))
+    ax2 = ax.twinx()
+    ax.set_zorder(ax2.get_zorder() + 1)
+    ax.patch.set_visible(False)
     fig6_mems = ["HBM4", "HBF", "HBF+"]
-    width = 0.25
+    bar_width = 0.26
+    offsets = [-0.28, 0.0, 0.28]
+    gpu_spans, model_spans = [], []
+    gpu_dividers, model_dividers = [], []
+    xticks, xlabels = [], []
+    line_pts = {model: {mem: ([], []) for mem in fig6_mems} for model in MODELS}
+    xpos = 0.0
     for mi, model in enumerate(MODELS):
-        ax = axes[0][mi]
-        ax2 = ax.twinx()
-        xpos = 0.0
-        xticks, xlabels = [], []
-        for gpu in SENSITIVITY_GPUS:
-            base_x = xpos
-            line_pts = {mem: ([], []) for mem in fig6_mems}
-            for si, slo in enumerate(SLOS):
+        if mi > 0:
+            xpos += 2.0
+            model_dividers.append(xpos - 1.0)
+        model_start = xpos
+        for gi, gpu in enumerate(SENSITIVITY_GPUS):
+            if gi > 0:
+                xpos += 1.0
+                gpu_dividers.append(xpos - 0.5)
+            gpu_start = xpos
+            for slo in SLOS:
+                leaf_x = xpos
+                xticks.append(leaf_x)
+                xlabels.append("offline" if slo > 1000 else str(slo))
                 for bi, mem in enumerate(fig6_mems):
                     row = next((r for r in slo_results if r["model"] == model and r["memory"] == mem
                                 and r["gpus"] == gpu and r["slo"] == slo), None)
                     if row is None:
                         continue
-                    bar_x = base_x + si * (len(fig6_mems) * width + 0.3) + bi * width
-                    ax2.bar(bar_x, row["norm_batch"], width=width,
-                            color=FIG_MEM_STYLE[mem]["color"], alpha=0.5)
-                    line_pts[mem][0].append(bar_x)
-                    line_pts[mem][1].append(row["norm_tps"])
-            for mem in fig6_mems:
-                xs, ys = line_pts[mem]
-                if xs:
-                    ax.plot(xs, ys, marker=FIG_MEM_STYLE[mem]["marker"],
-                            color=FIG_MEM_STYLE[mem]["color"], linewidth=1.2, markersize=5)
-            group_width = len(SLOS) * (len(fig6_mems) * width + 0.3)
-            xticks.append(base_x + group_width / 2)
-            xlabels.append(f"{gpu} GPU")
-            xpos += group_width + 0.8
-        ax.set_xticks(xticks)
-        ax.set_xticklabels(xlabels)
-        ax.set_title(model, fontsize=9)
-        ax.set_ylabel("Per-GPU TPS (norm.)")
-        ax2.set_ylabel("Per-GPU batch size (norm.)")
-    handles = [plt.Line2D([0], [0], color=FIG_MEM_STYLE[m]["color"], marker=FIG_MEM_STYLE[m]["marker"],
-                          label=f"{m} TPS") for m in fig6_mems]
-    handles += [plt.Rectangle((0, 0), 1, 1, color=FIG_MEM_STYLE[m]["color"], alpha=0.5,
-                              label=f"{m} Batch") for m in fig6_mems]
-    fig.legend(handles=handles, loc="upper center", ncol=3, fontsize=7, bbox_to_anchor=(0.5, 1.1))
+                    bar_x = leaf_x + offsets[bi]
+                    ax2.bar(bar_x, row["norm_batch"], width=bar_width,
+                            color=FIG6_BATCH_COLORS[mem], edgecolor="black", linewidth=0.3, zorder=5)
+                    line_pts[model][mem][0].append(leaf_x)
+                    line_pts[model][mem][1].append(row["norm_tps"])
+                xpos += 1.0
+            gpu_spans.append((gpu_start, xpos - 1.0, f"{gpu}"))
+        model_spans.append((model_start, xpos - 1.0, MODEL_DISPLAY.get(model, model)))
+    for model in MODELS:
+        for mem in fig6_mems:
+            xs, ys = line_pts[model][mem]
+            if xs:
+                style = FIG_MEM_STYLE[mem]
+                ax.plot(xs, ys, marker=style["marker"], color=style["color"],
+                        markeredgecolor=style["edge"], markeredgewidth=0.6,
+                        linewidth=1.6, markersize=6, zorder=20)
+    ax.set_xticks(xticks)
+    ax.set_xticklabels(xlabels, rotation=90, fontsize=7)
+    ax.set_xlim(-0.7, xpos - 0.3)
+    ax.set_ylabel("Per-GPU TPS (norm.)")
+    ax2.set_ylabel("Per-GPU batch size (norm.)")
+    ax.text(-0.008, -0.24, "SLO", transform=ax.transAxes, ha="right", va="top",
+            fontsize=8, fontweight="bold", clip_on=False)
+    _label_row(ax, gpu_spans, depth=1, fontsize=9, rowlabel="# GPUs", base=-0.22, step=0.12)
+    _label_row(ax, model_spans, depth=2, bold=True, fontsize=10, base=-0.22, step=0.12)
+    _dividers(ax, gpu_dividers, label_depth=1, linewidth=0.7, base=-0.22, step=0.12)
+    _dividers(ax, model_dividers, label_depth=2, linewidth=1.3, base=-0.22, step=0.12)
+    tps_handles = [plt.Line2D([0], [0], color=FIG_MEM_STYLE[m]["color"], marker=FIG_MEM_STYLE[m]["marker"],
+                              markeredgecolor=FIG_MEM_STYLE[m]["edge"], linewidth=1.6, markersize=7, label=m)
+                   for m in fig6_mems]
+    batch_handles = [plt.Rectangle((0, 0), 1, 1, facecolor=FIG6_BATCH_COLORS[m], edgecolor="black",
+                                   linewidth=0.3, label=m) for m in fig6_mems]
+    leg1 = fig.legend(handles=tps_handles, loc="upper center", ncol=3, fontsize=8,
+                       bbox_to_anchor=(0.3, 1.02), title="TPS", title_fontsize=8)
+    fig.add_artist(leg1)
+    fig.legend(handles=batch_handles, loc="upper center", ncol=3, fontsize=8,
+               bbox_to_anchor=(0.72, 1.02), title="Batch", title_fontsize=8)
     fig.suptitle("Fig. 6 replication: SLO sensitivity (LONG workload)", y=1.16)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.3)
     plt.close(fig)
 
 def _fig7_pec(results, pec_results, out_path):
-    """Fig. 7 replication: required 3-year PEC for {HBF,HBF+} x {online,offline}
-    across workloads {SHORT,MID,LONG} and GPU counts {1,8,16}, one panel per
-    model, log-scale Y with the SLC PEC limit (1e5) marked. Online PEC comes
-    from the main sweep's `results` (0.1s SLO); offline comes from the
+    """Fig. 7 replication: required 3-year PEC, single combined panel
+    matching the paper's layout: x-axis nests Model > Workload {SHORT,MID,
+    LONG} > GPU {1,8,16}, with 4 clustered bars per GPU count ({HBF,HBF+} x
+    {online,offline}). Linear Y in units of 10^3 PEC (matching the paper's
+    own axis), with the SLC PEC limit (100 == 1e5) marked in red. Online PEC
+    comes from the main sweep's `results` (0.1s SLO); offline comes from the
     dedicated `pec_results` gathering pass (24h/no-limit SLO)."""
-    fig, axes = plt.subplots(1, len(MODELS), figsize=(14, 6), squeeze=False)
+    fig, ax = plt.subplots(figsize=(15, 5.4))
     series = [("HBF", "online"), ("HBF+", "online"), ("HBF", "offline"), ("HBF+", "offline")]
-    series_colors = {
-        ("HBF", "online"): "#2ca02c", ("HBF+", "online"): "#d62728",
-        ("HBF", "offline"): "#98df8a", ("HBF+", "offline"): "#ff9896",
-    }
+    bar_width = 0.20
+    offsets = [-0.33, -0.11, 0.11, 0.33]
+    wl_spans, model_spans = [], []
+    wl_dividers, model_dividers = [], []
+    xticks, xlabels = [], []
+    xpos = 0.0
     for mi, model in enumerate(MODELS):
-        ax = axes[0][mi]
-        xpos = 0.0
-        xticks, xlabels = [], []
-        for wl in PEC_WORKLOADS:
+        if mi > 0:
+            xpos += 2.0
+            model_dividers.append(xpos - 1.0)
+        model_start = xpos
+        for wi, wl in enumerate(PEC_WORKLOADS):
+            if wi > 0:
+                xpos += 1.0
+                wl_dividers.append(xpos - 0.5)
+            wl_start = xpos
             for gpu in PEC_GPUS:
-                group_start = xpos
-                for mem, mode in series:
+                leaf_x = xpos
+                xticks.append(leaf_x)
+                xlabels.append(str(gpu))
+                for si, (mem, mode) in enumerate(series):
                     src = results if mode == "online" else pec_results
                     row = next((r for r in src if r["model"] == model and r["workload"] == wl
                                 and r["memory"] == mem and r["gpus"] == gpu), None)
                     pec_info = compute_pec(row)
-                    val = pec_info["pec"] if pec_info else 0.0
-                    ax.bar(xpos, max(val, 1.0), color=series_colors[(mem, mode)], width=0.8)
-                    xpos += 1.0
-                xticks.append((group_start + xpos - 1.0) / 2.0)
-                xlabels.append(str(gpu))
-                xpos += 1.0  # gap between GPU-count groups
-            xpos += 1.5  # gap between workload groups
-        ax.set_xticks(xticks)
-        ax.set_xticklabels(xlabels, fontsize=7)
-        ax.axhline(1e5, color="black", linestyle="--", linewidth=1)
-        ax.set_yscale("log")
-        ax.set_title(model, fontsize=9)
-        ax.set_ylabel("3-year PEC (log scale)")
-    handles = [plt.Rectangle((0, 0), 1, 1, color=c) for c in series_colors.values()]
-    labels = [f"{m} ({mode})" for (m, mode) in series_colors.keys()]
-    handles.append(plt.Line2D([0], [0], color="black", linestyle="--"))
-    labels.append("SLC PEC limit")
-    fig.legend(handles, labels, loc="upper center", ncol=5, fontsize=7, bbox_to_anchor=(0.5, 1.08))
-    fig.suptitle("Fig. 7 replication: Required PEC under different operating scenarios", y=1.14)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+                    val = (pec_info["pec"] if pec_info else 0.0) / 1000.0
+                    ax.bar(leaf_x + offsets[si], val, width=bar_width,
+                           color=FIG7_COLORS[(mem, mode)], edgecolor=FIG7_EDGE, linewidth=0.4, zorder=10)
+                xpos += 1.0
+            wl_spans.append((wl_start, xpos - 1.0, wl))
+        model_spans.append((model_start, xpos - 1.0, MODEL_DISPLAY.get(model, model)))
+    ax.set_xticks(xticks)
+    ax.set_xticklabels(xlabels, fontsize=8)
+    ax.set_xlim(-0.7, xpos - 0.3)
+    ax.set_ylabel("3-year PEC ($10^3$)")
+    ax.yaxis.grid(True, color="#e6e6e6", linewidth=0.7, zorder=0)
+    ax.set_axisbelow(True)
+    ax.axhline(100, color="#c00000", linewidth=1.4, zorder=25)
+    ax.annotate("SLC PEC limit", xy=(0.4, 100), xycoords="data",
+                xytext=(0.02, 0.82), textcoords="axes fraction",
+                color="#c00000", fontsize=9, fontweight="bold",
+                arrowprops=dict(arrowstyle="->", color="#c00000", lw=1.3))
+    ax.text(-0.008, -0.03, "# GPUs", transform=ax.transAxes, ha="right", va="top",
+            fontsize=8, fontweight="bold", clip_on=False)
+    _label_row(ax, wl_spans, depth=1, fontsize=9, base=-0.09, step=0.11)
+    _label_row(ax, model_spans, depth=2, bold=True, fontsize=10, base=-0.09, step=0.11)
+    _dividers(ax, wl_dividers, label_depth=1, linewidth=0.7, base=-0.09, step=0.11)
+    _dividers(ax, model_dividers, label_depth=2, linewidth=1.3, base=-0.09, step=0.11)
+    handles = [plt.Rectangle((0, 0), 1, 1, facecolor=FIG7_COLORS[k], edgecolor=FIG7_EDGE, linewidth=0.4)
+               for k in series]
+    labels = [f"{m} ({mode})" for (m, mode) in series]
+    fig.legend(handles, labels, loc="upper center", ncol=4, fontsize=8.5, bbox_to_anchor=(0.5, 1.02))
+    fig.suptitle("Fig. 7 replication: Required PEC under different operating scenarios", y=1.12)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.3)
     plt.close(fig)
 
 def generate_figures(data):
@@ -897,8 +1168,12 @@ def generate_figures(data):
     computed by main()'s sweep (and persisted to experiment_data.json -- see
     --figures-only for standalone re-rendering without re-running the sweep).
 
-    Known fidelity gaps vs. the paper's own figures (not chased): exact
-    color/marker/font/spacing match to the paper's plotting style.
+    Each figure matches the paper's own layout: a single combined panel (not
+    one subplot per model) with a nested categorical x-axis (Model > Workload
+    > ... > leaf category) and colors sampled directly from the paper's own
+    figures (400 DPI PDF render, legend-swatch pixel sampling) -- see the
+    GPU_COLORS/FIG_MEM_STYLE/FIG5_COLORS/FIG6_BATCH_COLORS/FIG7_COLORS tables
+    above. Remaining fidelity gaps: exact font and fine-grained spacing.
     """
     if not HAVE_PLOTTING:
         print("generate_figures: matplotlib/numpy not importable; skipping figure "
@@ -942,10 +1217,10 @@ def main():
     # shared mutable state read/written between cells other than this dict, which each
     # worker doesn't touch at all). This must fully complete (pool `with`-block exit joins
     # every submitted future) before the main sweep starts, since the main sweep reads
-    # `baselines`. Provably behavior-identical to the old sequential loop: _run_cell computes
+    # `baselines`. Provably behavior-identical to a sequential loop: _run_cell computes
     # exactly what a direct find_max_batch_size call would; all post-processing (tps/
-    # max_b_per_gpu/dict construction/printing) happens here in the main process, unchanged
-    # from before, just reading each cell's result from a future instead of a direct call.
+    # max_b_per_gpu/dict construction/printing) happens here in the main process,
+    # reading each cell's result from a future instead of a direct call.
     baselines = {model: {} for model in models}
     print("--- GATHERING BASELINES (8 GPU HBM4) ---")
     baseline_specs = [
@@ -964,8 +1239,7 @@ def main():
             # this project's TPS definition ("... / Number of GPUs") and
             # the paper's cross-GPU-count normalization (a DP replica still consumes
             # real GPU hardware; dividing by dp instead of GPU count penalizes a
-            # config for using DP *more* effectively). See find_max_batch_size's
-            # docstring and CHANGES.md for the investigation that corrected this.
+            # config for using DP *more* effectively). See CHANGES.md item 15.
             tps = max_b / (tpot * 8) if tpot > 0 else 0.0
             max_b_per_gpu = max_b / 8
             baselines[model][wl_name] = {
@@ -985,12 +1259,12 @@ def main():
 
     # Main sweep, same parallelization pattern. Canonical (model, workload, mem, gpu)
     # iteration order is built up front as `sweep_specs`; HBM4/8-GPU cells are pulled from
-    # the baseline cache exactly as before (never resubmitted to the pool -- avoids
-    # recomputing what gather-baselines already computed). The remaining cells are
-    # submitted to the pool; a future's completion (out-of-order, printed as it happens)
-    # is separate from `results` assembly, which iterates `sweep_specs` in canonical order
-    # afterward -- so `results`' order and content are identical to the old sequential run
-    # regardless of which cell's subprocess happened to finish first.
+    # the baseline cache (never resubmitted to the pool -- avoids recomputing what
+    # gather-baselines already computed). The remaining cells are submitted to the pool;
+    # a future's completion (out-of-order, printed as it happens) is separate from
+    # `results` assembly, which iterates `sweep_specs` in canonical order afterward -- so
+    # `results`' order and content are identical to a sequential run regardless of which
+    # cell's subprocess happened to finish first.
     print("\n--- RUNNING ALL SWEEPS ---")
     sweep_specs = [
         {"model": model, "wl_name": wl_name, "in_len": in_len, "out_len": out_len,
@@ -1257,9 +1531,9 @@ def main():
         f.write("\n")
 
         # 3. Performance Breakdown (Figure 5)
-        # P2: matches the paper's Fig. 5 GPU-count scope {4, 8, 16} (previously only 8),
-        # since the paper uses multiple GPU counts to show how the breakdown shifts
-        # (e.g. communication/attention fraction) as GPU count increases.
+        # Matches the paper's Fig. 5 GPU-count scope {4, 8, 16}, since the paper uses
+        # multiple GPU counts to show how the breakdown shifts (e.g. communication/
+        # attention fraction) as GPU count increases.
         breakdown_gpus = BREAKDOWN_GPUS
         f.write("## 3. Runtime Performance Breakdown (Figure 5 Replication)\n\n")
         f.write("Fractions of decode execution time spent on key components under a 0.1s TPOT SLO:\n\n")
@@ -1281,9 +1555,9 @@ def main():
 
         f.write("\n")
 
-        # 4. SLO Sensitivity Analysis (Figure 6) — P2: matches the paper's GPU-count
-        # scope {4, 8, 16} (previously swept/reported the full 1-16 range, which
-        # included GPU counts where the HBM4 normalization baseline is infeasible).
+        # 4. SLO Sensitivity Analysis (Figure 6) — matches the paper's GPU-count
+        # scope {4, 8, 16}; GPU counts outside this range include ones where the
+        # HBM4 normalization baseline is infeasible.
         f.write("## 4. SLO Sensitivity Analysis (Figure 6 Replication)\n\n")
         gpu_headers = " | ".join(f"{g} GPU" for g in sensitivity_gpus)
         f.write(f"| Model | Memory | SLO | Metric | {gpu_headers} |\n")

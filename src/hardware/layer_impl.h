@@ -33,10 +33,8 @@ inline time_ns getLinearMemoryDuration(const SystemConfig& config, double m, dou
     // an unusually small SRAM capacity or high page latency), the residual is exposed
     // per chunk too. Under every current preset's constants, chunk transfer time at
     // full SRAM capacity exceeds the page latency, so this reduces to exactly one
-    // exposed page latency regardless of weight size or chunk count -- numerically
-    // identical to the old flat one-latency-per-op charge, but now structurally
-    // consistent with (and correct if config constants ever change relative to) the
-    // KV-read model instead of being a special-cased exemption from it.
+    // exposed page latency regardless of weight size or chunk count; the chunked form
+    // keeps it consistent with the KV-read model and correct if config constants change.
     double weight_sram_capacity = (double)hbf.sram_per_stack_bytes * hbf.num_flash_stacks;
     int weight_num_chunks = (weight_sram_capacity > 0)
         ? (int)std::ceil((double)weight_size / weight_sram_capacity) : 1;
@@ -123,7 +121,20 @@ inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric 
   return 0;
 }
 
-inline time_ns getKVWriteDuration(const SystemConfig& config, int num_seq, int num_kv_heads, int head_dim, int precision, bool compressed_kv, int kv_lora_rank, int qk_rope_head_dim, int input_len, int output_len, int local_attention_window = 0) {
+// program_latency_amortize_calls: number of per-layer calls whose writes together
+// form ONE contiguous flash write stream per decode iteration (= attention layers
+// per pipeline stage on this device). The KV write is fire-and-forget: no layer
+// blocks on program completion (call sites only charge the unhidden remainder
+// after overlapping with the attention kernel's own compute), and successive
+// layers' admitted-KV writes queue back-to-back into the same flash write path,
+// whose aggregate flash_write_bandwidth already reflects sustained multi-plane
+// program throughput. So the 100-us page-program latency is a pipeline-fill/tail
+// cost of the per-iteration stream, exposed ONCE per stream -- not once per layer.
+// Each call therefore charges program_latency / amortize_calls so the per-layer
+// hiding at the call sites composes while the per-iteration total exposes exactly
+// one program latency. Default 1 charges the full program latency per call, for
+// call sites that model a standalone write burst.
+inline time_ns getKVWriteDuration(const SystemConfig& config, int num_seq, int num_kv_heads, int head_dim, int precision, bool compressed_kv, int kv_lora_rank, int qk_rope_head_dim, int input_len, int output_len, int local_attention_window = 0, int program_latency_amortize_calls = 1) {
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
     auto& hbf = config.hbf_config;
     double num_new_queries = (double)num_seq / (output_len > 0 ? output_len : 1);
@@ -131,11 +142,9 @@ inline time_ns getKVWriteDuration(const SystemConfig& config, int num_seq, int n
     // (attn_chunk_size), never the full input_len -- matches the cap already
     // applied to the KV-READ path (see this file's getAttentionMemoryDuration
     // callers, e.g. attention_gen_impl.cpp's local_attention_window usage) and
-    // the capacity path's effectiveKvLen() (model/model_config.h). Without this,
-    // the write path contradicted the capacity path (claiming to write more KV
-    // than the cache is ever sized to hold). window==0 (every non-iRoPE model,
-    // and any call site that hasn't threaded the per-layer window through) is a
-    // no-op: effective_input_len == input_len, byte-identical to before.
+    // the capacity path's effectiveKvLen() (model/model_config.h). window==0 (every
+    // non-iRoPE model, and any call site that hasn't threaded the per-layer window
+    // through) is a no-op: effective_input_len == input_len.
     int effective_input_len = (local_attention_window > 0)
         ? std::min(input_len, local_attention_window) : input_len;
     double kv_write_size = 0;
@@ -144,7 +153,9 @@ inline time_ns getKVWriteDuration(const SystemConfig& config, int num_seq, int n
     } else {
       kv_write_size = 2.0 * num_new_queries * num_kv_heads * head_dim * effective_input_len * precision;
     }
-    double write_time = (kv_write_size / hbf.flash_write_bandwidth * 1e9) + hbf.flash_page_program_latency_ns;
+    int amortize = (program_latency_amortize_calls > 0) ? program_latency_amortize_calls : 1;
+    double write_time = (kv_write_size / hbf.flash_write_bandwidth * 1e9) +
+                        (double)hbf.flash_page_program_latency_ns / amortize;
     return (time_ns)write_time;
   }
   return 0;

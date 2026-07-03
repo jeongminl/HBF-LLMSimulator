@@ -105,15 +105,12 @@ class ModelConfig {
 // Interleaved local/global ("iRoPE") attention helpers -- shared by every call
 // site that computes KV-cache size or KV-read cost, so the peak-batch capacity
 // gate (parallelism_optimizer.cpp / cluster.cpp) and the live decode-phase KV
-// read (attention_gen_impl.cpp) never drift apart. See CHANGES.md for the
-// investigation that added these (llama4_maverick's KV footprint was
-// previously over-counted ~3x at long context by treating every layer as full
-// global attention).
+// read (attention_gen_impl.cpp) never drift apart. See CHANGES.md item 16.
 //
 // `layer` is 0-indexed. With the default attn_chunk_size==0 (every model
 // preset except llama4_maverick/llama4_scout), every layer is global and
-// these all reduce EXACTLY to the pre-existing "every layer sees the full
-// context" formulas -- this is the strict backward-compatibility requirement.
+// these all reduce EXACTLY to the "every layer sees the full context"
+// formulas.
 // ---------------------------------------------------------------------------
 
 // True if `layer` is a full/global ("NoPE") attention layer per Llama-4's
@@ -188,7 +185,7 @@ static ModelConfig deepseekV3 =
 // precision_byte=2 (BF16): matches the paper's explicit "no 1-/2-GPU segments in all HBM4
 // bars" claim, which requires llama3_405B's real footprint to exceed 2x288GB=576GB -- only
 // consistent with native BF16 (~810GB), not FP8 (~405GB, which fits under 576GB and would
-// wrongly show 2-GPU HBM4 as feasible). See fairness-audit plan's P1 investigation.
+// wrongly show 2-GPU HBM4 as feasible). See CHANGES.md item 11.
 static ModelConfig llama3_405B =
     ModelConfig(16384, 128, 126, 128, 8, 131072, 53248, 53248, 1, 2, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 128256, false, false, 0.0,
                 "llama3_405B");
@@ -198,9 +195,8 @@ static ModelConfig llama3_405B =
 // released config.json: attention_chunk_size=8192 explicit, no_rope_layer_interval defaults to
 // 4 and isn't overridden). Only every 4th layer ("NoPE") attends over the full context; the
 // other 3 use a fixed 8192-token local window. See footprint.h/model_config.h's
-// isGlobalAttentionLayer()/effectiveKvLen() and CHANGES.md for why this matters (llama4's KV
-// footprint was previously over-counted ~3x at long context, since every layer was modeled as
-// full-global). Scout's exact config reportedly differs from Maverick's in some fields
+// isGlobalAttentionLayer()/effectiveKvLen() and CHANGES.md item 16.
+// Scout's exact config reportedly differs from Maverick's in some fields
 // (unverified which); applying the same iRoPE constants here for consistency, but note Scout
 // isn't one of the paper's own evaluated models so this is lower-confidence/lower-stakes.
 static ModelConfig llama4_scout = // 16 Expert

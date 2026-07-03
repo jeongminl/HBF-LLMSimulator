@@ -33,6 +33,32 @@ class ParallelismOptimizer {
                                  int batch_size,
                                  int sequence_length,
                                  double tpot_slo_ms = 100.0);
+
+  // Enumerate every structurally-valid (tp, pp, dp, ep) candidate and evaluate
+  // each at batch_size. require_batch_divisible=true additionally applies the
+  // batch % dp == 0 gate (Optimize()'s historical behavior); per-config batch
+  // searches pass false and probe each config only at multiples of its own dp.
+  static std::vector<ParallelConfig> EnumerateCandidates(
+      const ModelConfig& model_config,
+      const SystemConfig& system_config,
+      int total_gpus,
+      int batch_size,
+      int sequence_length,
+      bool require_batch_divisible);
+
+  // Evaluate ONE fixed (tp, pp, dp, ep) candidate at the given batch: fills
+  // oom/oom_reason (capacity/SRAM only), estimated_latency_ms (ranking
+  // heuristic), and the pred_* footprint fields. Callers must pass a
+  // structurally-valid tuple (as produced by EnumerateCandidates' gates).
+  static ParallelConfig EvaluateConfig(const ModelConfig& model_config,
+                                       const SystemConfig& system_config,
+                                       int total_gpus,
+                                       int tp,
+                                       int pp,
+                                       int dp,
+                                       int e_tp_dg,
+                                       int batch_size,
+                                       int sequence_length);
 };
 
 } // namespace llm_system

@@ -4,7 +4,7 @@ model:
 system:
   gpu_gen: Rubin # e.g. A100, H100, B100, B200, Rubin (matches the paper's cited reference GPU)
   memory_type: HBM
-  nvlink_gen: 5
+  nvlink_gen: 6 # NVLink 6 (Rubin): 1,800 GB/s per direction -- the paper's SS-III "NVLink (1,800 GB/s)"
   infiniband_gen: 800
   num_node: 1
   num_device: 8

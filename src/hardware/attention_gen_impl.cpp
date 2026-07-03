@@ -208,7 +208,13 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
     // Only the unhidden portion of KV write extends the critical path.
     // The write can overlap with the attention compute phase (both Scoring and
     // Context).  exec_status.compute_duration accumulates across both phases.
-    time_ns kv_write = getKVWriteDuration(config, num_seq, num_kv_heads, head_dim, input->precision_byte, false, 0, 0, device->model_config.input_len, device->model_config.output_len, layer_info.local_attention_window);
+    // All of this device's attention layers (num_layers / pp stage share) write
+    // their admitted-KV back-to-back each iteration as one flash stream, so the
+    // page-program latency is amortized across those per-layer calls (see
+    // getKVWriteDuration's program_latency_amortize_calls doc).
+    int layers_per_stage = device->model_config.num_layers /
+        (device->model_config.pp_dg > 0 ? device->model_config.pp_dg : 1);
+    time_ns kv_write = getKVWriteDuration(config, num_seq, num_kv_heads, head_dim, input->precision_byte, false, 0, 0, device->model_config.input_len, device->model_config.output_len, layer_info.local_attention_window, layers_per_stage);
     time_ns unhidden_write = std::max((time_ns)0, kv_write - exec_status.compute_duration);
     exec_status.total_duration += unhidden_write;
     exec_status.kv_write_duration = unhidden_write;
@@ -455,14 +461,11 @@ ExecStatus AttentionGenExecutionPIM(Device_Ptr device,
     exec_status += temp;
   }
 
-  // GPU/LOGIC both take total_duration += max(compute, memory) (roofline overlap);
-  // this used to be accumul_memory_duration * opb, inflating PIM decode-attention
-  // latency by roughly the compute/memory ratio (BUGS_HIDDEN_BY_FLAGS #5).
+  // GPU/LOGIC both take total_duration += max(compute, memory) (roofline overlap).
   exec_status.total_duration +=
       std::max(accumul_compute_duration, accumul_memory_duration);
 
-  // Softmax // -- mirrors the GPU/LOGIC softmax compute charge; previously absent,
-  // so PIM/LOGIC silently skipped this time (BUGS_HIDDEN_BY_FLAGS #5).
+  // Softmax // -- mirrors the GPU/LOGIC softmax compute charge.
   for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
     seq = seq_list.at(seq_idx);
 
@@ -523,7 +526,7 @@ ExecStatus AttentionGenExecutionPIM(Device_Ptr device,
     exec_status += temp;
   }
 
-  // Same max(compute, memory) fix as the Scoring section above (BUGS_HIDDEN_BY_FLAGS #5).
+  // Same max(compute, memory) roofline overlap as the Scoring section above.
   exec_status.total_duration +=
       std::max(accumul_compute_duration, accumul_memory_duration);
 
@@ -886,7 +889,11 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
   input->setShape(orig_shape); // restore orig shape of input
 
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
-    time_ns kv_write = getKVWriteDuration(config, num_seq, num_kv_heads, head_dim, input->precision_byte, compressed_kv, layer_info.kv_lora_rank, qk_rope_head_dim, device->model_config.input_len, device->model_config.output_len, layer_info.local_attention_window);
+    // Program latency amortized across this stage's per-layer write stream --
+    // see getKVWriteDuration's program_latency_amortize_calls doc.
+    int layers_per_stage = device->model_config.num_layers /
+        (device->model_config.pp_dg > 0 ? device->model_config.pp_dg : 1);
+    time_ns kv_write = getKVWriteDuration(config, num_seq, num_kv_heads, head_dim, input->precision_byte, compressed_kv, layer_info.kv_lora_rank, qk_rope_head_dim, device->model_config.input_len, device->model_config.output_len, layer_info.local_attention_window, layers_per_stage);
     // Use total compute (Scoring + Context) for overlap; exec_status.compute_duration
     // accumulates across both phases and is correct here.
     time_ns unhidden_write = std::max((time_ns)0, kv_write - exec_status.compute_duration);
@@ -1964,7 +1971,11 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
   input->setShape(orig_shape); // restore orig shape of input
 
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
-    time_ns kv_write = getKVWriteDuration(config, num_seq, num_kv_heads, head_dim, input->precision_byte, true, kv_lora_rank, qk_rope_head_dim, device->model_config.input_len, device->model_config.output_len, layer_info.local_attention_window);
+    // Program latency amortized across this stage's per-layer write stream --
+    // see getKVWriteDuration's program_latency_amortize_calls doc.
+    int layers_per_stage = device->model_config.num_layers /
+        (device->model_config.pp_dg > 0 ? device->model_config.pp_dg : 1);
+    time_ns kv_write = getKVWriteDuration(config, num_seq, num_kv_heads, head_dim, input->precision_byte, true, kv_lora_rank, qk_rope_head_dim, device->model_config.input_len, device->model_config.output_len, layer_info.local_attention_window, layers_per_stage);
     // Use total compute (Scoring + Context) for overlap; exec_status.compute_duration
     // accumulates across both phases and is correct here.
     time_ns unhidden_write = std::max((time_ns)0, kv_write - exec_status.compute_duration);

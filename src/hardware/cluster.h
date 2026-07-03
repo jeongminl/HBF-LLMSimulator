@@ -55,10 +55,7 @@ class Cluster : public std::enable_shared_from_this<Cluster> {
   // the LAST stage of whichever pipeline finishes last already holds the true
   // cumulative critical-path time; taking the max across all devices is a
   // topology-agnostic way to read it back out (correct for pp==1 too, where
-  // it's a no-op equal to get_device(0)'s own value). Replaces the previous
-  // get_device(0)-only read, which under-reported by ~pp x whenever pp>1 --
-  // see CHANGES.md for the empirical confirmation (llama4_maverick/HBM4/
-  // 8-GPU/SHORT at TP=1/PP=8: ~21ms unpropagated vs. ~164ms true).
+  // it's a no-op equal to get_device(0)'s own value).
   time_ns maxDeviceTime();
 
   void set_dependency();

@@ -118,10 +118,9 @@ inline CapacityResult checkCapacity(const SystemConfig& s,
 // SEPARATE per-stack 3.13-MB double-buffer staging pool and is never resident
 // in the intermediate-data pool this function's result is gated against.
 //
-// Mirrors (and replaces, for the scarce-tier gate only) the three decode
-// branches previously duplicated in cluster.cpp:108-176 and
-// parallelism_optimizer.cpp:243-326. Both call sites must use this single
-// definition so the optimizer and simulator gates never drift apart.
+// The single shared definition for the scarce-tier gate: both cluster.cpp and
+// parallelism_optimizer.cpp call it (rather than open-coding the decode branches)
+// so the optimizer and simulator gates never drift apart.
 //
 //   model               - selects MLA-absorb / MLA-compressed-kv / GQA-base,
 //                          and dense vs. MoE FFN shape.
@@ -154,9 +153,8 @@ inline double peakIntermediateBytes(const ModelConfig& model,
   double attn_total;
   if (model.use_absorb) {
     // Query's non-rope output width is qk_nope_head_dim, not head_dim (which is V's
-    // up-projected width, used correctly below in "v_up out") -- dormant on this
-    // model's own preset since deepseekV3 sets qk_nope_head_dim == head_dim == 128,
-    // but was silently wrong for any config where they diverge (BUGS_HIDDEN_BY_FLAGS #7).
+    // up-projected width, used correctly below in "v_up out"). Equal on deepseekV3's
+    // preset (qk_nope_head_dim == head_dim == 128); distinct where a config diverges.
     double common_prefix =
         (batch_per_dp * hidden_dim) +
         (batch_per_dp * model.q_lora_rank) +
@@ -169,7 +167,7 @@ inline double peakIntermediateBytes(const ModelConfig& model,
                   (batch_per_dp * model.num_heads * model.head_dim / tp) +      // v_up out
                   (batch_per_dp * hidden_dim)) * precision;                     // out proj out
   } else if (model.compressed_kv) {
-    // Same qk_nope_head_dim fix as the absorb branch above.
+    // Same qk_nope_head_dim width as the absorb branch above.
     double common_prefix =
         (batch_per_dp * hidden_dim) +
         (batch_per_dp * model.q_lora_rank) +
@@ -207,6 +205,35 @@ inline double peakIntermediateBytes(const ModelConfig& model,
   double ffn_total = std::max(ffn_moe, ffn_dense);
 
   return std::max(attn_total, ffn_total);
+}
+
+// DIAGNOSTIC ONLY -- never gates capacity or batch. Paper-style "score-inclusive"
+// intermediate footprint: peakIntermediateBytes plus the chunked-attention
+// score/softmax working set (2 buffers x heads/tp x min(seq_len, attn_chunk_size)
+// x precision) charged against the SRAM tier the way the paper's tool evidently
+// does (its Fig-3 llama4/SHORT/HBF+ bar is flat & SRAM-marked at ~855 seq/GPU =
+// ~374 KB/seq implied, reachable only with an O(ctx) score charge). A full A/B
+// (worktree ab-score-accounting) showed adopting this as the REAL gate reproduces
+// that one bar but regresses llama4-MID / llama3-MID / llama3-LONG by 2-4x vs the
+// paper -- no context-scaled score charge fits all six HBF+ bars simultaneously --
+// so it is logged for comparison only. See PAPER_INCONSISTENCIES.md U7.
+inline double scoreInclusiveIntermediateBytes(const ModelConfig& model,
+                                              double batch_per_dp,
+                                              int tp,
+                                              double expert_batch_size,
+                                              double num_routed_expert_per_device,
+                                              bool has_moe_layer,
+                                              bool has_dense_layer,
+                                              double seq_len) {
+  double score_len = (model.attn_chunk_size > 0)
+                         ? std::min(seq_len, (double)model.attn_chunk_size)
+                         : seq_len;
+  double score_bytes = 2.0 * batch_per_dp * (model.num_heads / (double)tp) *
+                       score_len * model.precision_byte;
+  return peakIntermediateBytes(model, batch_per_dp, tp, expert_batch_size,
+                               num_routed_expert_per_device, has_moe_layer,
+                               has_dense_layer) +
+         score_bytes;
 }
 
 // True if this model has at least one dense-FFN layer (always true for

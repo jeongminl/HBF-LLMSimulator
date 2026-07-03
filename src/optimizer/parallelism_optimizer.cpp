@@ -5,12 +5,13 @@
 
 namespace llm_system {
 
-ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
-                                             const SystemConfig& system_config,
-                                             int total_gpus,
-                                             int batch_size,
-                                             int sequence_length,
-                                             double tpot_slo_ms) {
+std::vector<ParallelConfig> ParallelismOptimizer::EnumerateCandidates(
+    const ModelConfig& model_config,
+    const SystemConfig& system_config,
+    int total_gpus,
+    int batch_size,
+    int sequence_length,
+    bool require_batch_divisible) {
   std::vector<ParallelConfig> candidates;
 
   // Search space
@@ -37,7 +38,10 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
       // handled by the external sweep (run_flash_only.py) rather than relaxing
       // this constraint (ceil(batch/dp) would diverge from the live-sim's
       // integer floor division and reintroduce a gate mismatch).
-      if (batch_size % dp != 0) continue;
+      // Callers doing a PER-CONFIG batch search (analytic_configs_only mode)
+      // pass require_batch_divisible=false and instead probe each config only
+      // at multiples of its own dp.
+      if (require_batch_divisible && batch_size % dp != 0) continue;
 
       // ---- Expert (tensor) parallelism sweep ----------------------------------
       // EP (= e_tp_dg) is an independent degree of freedom from non-expert TP:
@@ -59,6 +63,27 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
           if ((devices_per_stage / e_tp_dg) > model_config.num_routed_expert)     // expert.cpp:53
             continue;
         }
+
+      candidates.push_back(EvaluateConfig(model_config, system_config, total_gpus,
+                                          tp, pp, dp, e_tp_dg, batch_size,
+                                          sequence_length));
+      }  // expert-parallelism (e_tp_dg) sweep
+    }
+  }
+
+  return candidates;
+}
+
+ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_config,
+                                                    const SystemConfig& system_config,
+                                                    int total_gpus,
+                                                    int tp,
+                                                    int pp,
+                                                    int dp,
+                                                    int e_tp_dg,
+                                                    int batch_size,
+                                                    int sequence_length) {
+      int devices_per_stage = total_gpus / pp;  // = parallel_num seen by ExpertFFN
 
       ParallelConfig config;
       config.tp = tp;
@@ -140,19 +165,12 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
 
       double weight_per_gpu = layers_per_stage * (attn_weights_per_gpu + mlp_weights_per_gpu);
 
-      // Determine how many MoE layers are in this PP stage, using an EXACT per-layer count
-      // (isMoELayer(), shared with llm.cpp's module-construction path -- model/model_config.h)
-      // instead of the old two-pattern approximation. This fixes two bugs in one pass:
-      //   1) first_k_dense handling was gated to `model_name == "deepseekV3"` only, silently
-      //      ignoring it for any other model with first_k_dense>0 (e.g. llama4_maverick/scout).
-      //   2) the expert_freq>1 branch rounded an evenly-averaged count
-      //      (round(total_moe_layers/pp)) instead of counting each stage exactly, which could
-      //      over/under-count a specific stage's MoE-layer weight.
-      // isMoELayer() already honors both first_k_dense and expert_freq for any model, so a
-      // single exact per-stage count replaces both old patterns. We evaluate every stage and
-      // take the HEAVIEST stage's count: this optimizer models one representative PP stage,
-      // and the pipeline throughput / capacity (OOM) gate are both governed by the slowest/
-      // heaviest stage, not an average one.
+      // Number of MoE layers in this PP stage, via an exact per-layer count
+      // (isMoELayer(), shared with llm.cpp's module-construction path -- model/model_config.h,
+      // which honors both first_k_dense and expert_freq for any model). Every stage is evaluated
+      // and the HEAVIEST stage's count taken: this optimizer models one representative PP stage,
+      // and the pipeline throughput / capacity (OOM) gate are both governed by the heaviest stage,
+      // not an average one.
       int moe_layers_in_stage = 0;
       {
         int lps = (int)layers_per_stage;  // num_layers % pp == 0 is enforced above (line 30)
@@ -179,6 +197,33 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
                        + non_moe_in_stage * dense_ffn_per_layer;
       }
 
+      // ---- Parity terms: weights the live simulator RECORDS that the per-layer
+      // sums above omit. Cluster::checkMemorySize gates on device 0's recorded
+      // tensors, so any term missing here lets a batch pass this analytic gate
+      // and then OOM in the live sim (the batch-4001..4095 "crash band",
+      // PAPER_INCONSISTENCIES.md U1 -- the router term alone is that measured
+      // ~0.01% drift: 24 layers x 5120 x 128 x 2B = 31.5 MB for maverick).
+      //   1) MoE router/gate projection: expert.cpp's gate_fn =
+      //      ColumnParallelLinear(hidden, num_routed) on the local device only
+      //      -> replicated per GPU, one per MoE layer.
+      //   2) LayerNorm gammas: 2 per decoder layer (input + post-attention),
+      //      hidden x precision each, replicated (layernorm.cpp).
+      //   3) Embedding / LM head: full {n_vocab, hidden} tensors, NOT TP-sharded
+      //      (embedding.cpp / lm_head.cpp). Embedding lives on pp stage 0 and the
+      //      LM head on the last stage; the live gate checks device 0 == stage 0,
+      //      so mirror stage 0's holdings: embedding always, LM head only when
+      //      pp == 1 (stage 0 is then also the last stage).
+      double router_weight_bytes = (model_config.num_routed_expert > 0)
+          ? moe_layers_in_stage * hidden_dim * model_config.num_routed_expert * precision
+          : 0.0;
+      double layernorm_weight_bytes = layers_per_stage * 2.0 * hidden_dim * precision;
+      double embed_weight_bytes = (double)model_config.n_vocab * hidden_dim * precision;
+      double lm_head_weight_bytes = (pp == 1)
+          ? (double)hidden_dim * model_config.n_vocab * precision
+          : 0.0;
+      weight_per_gpu += router_weight_bytes + layernorm_weight_bytes +
+                        embed_weight_bytes + lm_head_weight_bytes;
+
       // Memory type determination (used both here and in the latency section below).
       bool use_flash = system_config.use_hbf && system_config.hbf_config.num_flash_stacks > 0;
 
@@ -200,7 +245,7 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
         if (e_active < 1.0) e_active = 1.0;
       }
 
-      // Fix 2c: Effective weight for LATENCY — E_active-based active-expert weight for
+      // Effective weight for LATENCY — E_active-based active-expert weight for
       // BOTH memory tiers.
       // The live simulator dispatches routed experts identically regardless of memory tier
       // (ExpertFFN::forward loops per active expert, charging each full k·n weight via
@@ -208,28 +253,24 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
       // expert — src/module/expert.cpp / src/hardware/linear_impl.cpp). There is NO
       // grouped-GEMM / active-row HBM-specific optimization anywhere in the dispatch code,
       // so the number of active experts whose weight is streamed is the right bandwidth
-      // multiplier for HBM exactly as it is for flash.
-      // The previous HBM branch applied a sparse_ratio = top_k/num_routed discount inherited
-      // from an older "calibrated against HBM timing" formula. It was wrong on its own merits:
-      //   (a) it contradicted this flash branch's E_active model for the identical operating
-      //       point (at the SHORT anchor it charged the weight of ~1 expert vs. flash's ~16-32);
-      //   (b) it contradicted the live simulator's own per-expert dispatch (above);
-      //   (c) the "accounts for compute-memory overlap" rationale double-counts — the default
-      //       optimizer_latency_model=="max" already credits overlap via max(compute, weight_mem);
-      //   (d) the paper (Son et al., §III) frames the HBM-vs-flash distinction as purely a
-      //       read/write-bandwidth asymmetry, with large-batch benefit coming from amortizing
-      //       active-expert weight-read across queries — exactly what E_active captures and a
-      //       fixed sparse_ratio does not. See PAPER_INCONSISTENCIES.md U1/U2.
+      // multiplier for HBM exactly as it is for flash. See CHANGES.md item 29 /
+      // PAPER_INCONSISTENCIES.md U1/U2 for the tier-unification rationale.
       double weight_for_latency = weight_per_gpu;  // default: same as capacity weight (non-MoE)
       if (model_config.num_routed_expert > 0 && model_config.top_k > 0) {
         double shared_per_moe_layer = (double)model_config.num_shared_expert *
                                        model_config.ffn_way * hidden_dim *
                                        model_config.expert_intermediate_dim * precision;
         int non_moe_layers = layers_per_stage - moe_layers_in_stage;
-        // Non-routed weight: attention + shared experts + dense-FFN layers (always read)
+        // Non-routed weight: attention + shared experts + dense-FFN layers (always read).
+        // Include the parity weights the sim actually STREAMS each step: router
+        // gate (gate_fn forward runs every MoE layer), LayerNorms, and the LM head
+        // (pp==1). Embedding is recorded for capacity but its forward charges no
+        // memory op (embedding.cpp), so it is excluded from the latency stream.
         double non_routed = layers_per_stage * attn_weights_per_gpu +
                             moe_layers_in_stage * shared_per_moe_layer +
-                            non_moe_layers * dense_ffn_per_layer;
+                            non_moe_layers * dense_ffn_per_layer +
+                            router_weight_bytes + layernorm_weight_bytes +
+                            lm_head_weight_bytes;
         // E_active experts' full weight streamed sequentially per dispatch op (both tiers).
         double routed_active = e_active *
                                model_config.ffn_way * hidden_dim *
@@ -250,8 +291,7 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
           (2.0 * (model_config.num_kv_heads / (double)tp) * model_config.head_dim * precision) *
           batch_size_per_gpu;
       if (model_config.compressed_kv) {
-        // MLA/deepseek: full-global attention only (attn_chunk_size==0), unaffected by this
-        // change -- kept as the pre-existing whole-context formula.
+        // MLA/deepseek: full-global attention only (attn_chunk_size==0) -- whole-context formula.
         kv_cache_per_gpu = layers_per_stage * (model_config.kv_lora_rank + model_config.qk_rope_head_dim) * precision * batch_size_per_gpu * sequence_length;
       }
 
@@ -264,10 +304,8 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
       // stream through a separate double-buffer and are excluded entirely).
       // expert_batch_size: matches cluster.cpp:88 (uses total batch, not
       // per-gpu; gated by expert_freq). num_routed_expert_per_device: matches
-      // cluster.cpp:84, and now divides by devices_per_stage (not total_gpus),
-      // mirroring the weight term's already-correct pattern above (:123) --
-      // dividing by total_gpus was an 8x undercount for degenerate
-      // one-device-per-stage configs (e.g. PP=8/EP=1: devices_per_stage=1).
+      // cluster.cpp:84, and divides by devices_per_stage (the devices sharing one
+      // pipeline stage's expert allotment), mirroring the weight term above (:123).
       double expert_batch_size = (model_config.expert_freq > 0 && model_config.num_routed_expert > 0)
           ? (double)batch_size * model_config.top_k / model_config.num_routed_expert
           : 0.0;
@@ -393,16 +431,13 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
       // retains/writes a bounded KV window (effectiveKvLen caps input_len at
       // attn_chunk_size), matching the KV-READ term above (effectiveKvLenSumAllLayers,
       // line ~246) and the simulator's write cap (hardware/layer_impl.h's
-      // getKVWriteDuration, capped via LayerInfo::local_attention_window). Without this,
-      // the write term contradicted the capacity/read terms (claiming to write more KV
-      // than the cache is ever sized to hold/read back).
+      // getKVWriteDuration, capped via LayerInfo::local_attention_window).
       // unhidden_write = max(0, write - attn_compute) is NONLINEAR in the write size, and
       // attn_compute is identical for every layer (depends on attn_weights_params, not the
-      // write length) -- so the nonlinear clamp must be evaluated PER LAYER and summed, not
+      // write length) -- so the nonlinear clamp is evaluated PER LAYER and summed, not
       // approximated by scaling a single representative layer's write by an average length.
-      // Reduces EXACTLY to the old `unhidden_write * layers_per_stage` when attn_chunk_size==0
-      // (every layer global => effectiveKvLen==input_len for all layers => sum/pp ==
-      // num_layers*unhidden_write/pp == layers_per_stage*unhidden_write).
+      // When attn_chunk_size==0 (every layer global) this reduces to
+      // num_layers*unhidden_write/pp == layers_per_stage*unhidden_write.
       double kv_write_time = 0.0;
       if (use_flash) {
         const auto& hbf = system_config.hbf_config;
@@ -411,8 +446,8 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
 
         // Attention-only compute per layer (the hiding budget). Basis matches the
         // simulator exactly: attention_gen_impl.cpp's unhidden_write overlaps only the
-        // attention kernel's own compute (FFN is a separate kernel) -- see the original
-        // comment below. Identical for every layer, so computed once.
+        // attention kernel's own compute (FFN is a separate kernel). Identical for every
+        // layer, so computed once.
         double attn_flops_per_layer = 2.0 * attn_weights_params * batch_size_per_gpu / tp;
         double single_layer_attn_compute = attn_flops_per_layer /
             (system_config.compute_peak_flops * effectiveMFU(system_config, batch_size_per_gpu)) * 1e9;
@@ -429,8 +464,14 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
                     write_len * precision
               : 2.0 * num_new_queries * (model_config.num_kv_heads / (double)tp) *
                     model_config.head_dim * write_len * precision;
+          // Page-program latency amortized across the stage's per-layer write
+          // stream, mirroring the simulator exactly (getKVWriteDuration's
+          // program_latency_amortize_calls, passed as num_layers/pp at every
+          // attention call site): the per-iteration stream exposes ONE program
+          // tail, not one per layer.
           double single_layer_kv_write = (kv_write_size / hbf.flash_write_bandwidth * 1e9) +
-                                         (double)hbf.flash_page_program_latency_ns;
+                                         (double)hbf.flash_page_program_latency_ns /
+                                             layers_per_stage;
           return std::max(0.0, single_layer_kv_write - single_layer_attn_compute);
         };
 
@@ -508,14 +549,11 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
       // time. A decode token must traverse all `pp` stages SEQUENTIALLY before the
       // next token can begin (no micro-batch-level pipeline overlap is modeled -- one
       // simulator iteration is one full forward pass of the whole batch through every
-      // stage; see PipelineStage::forward's time-propagation fix in communication.cpp
-      // for the live-simulator side of this same correction, and Cluster::
-      // maxDeviceTime() in cluster.cpp for how the live sim now reads the true,
-      // fully-propagated per-token latency instead of stage 0's local time alone).
+      // stage; the live simulator mirrors this via PipelineStage::forward's
+      // time-propagation in communication.cpp and Cluster::maxDeviceTime() in
+      // cluster.cpp, which read the fully-propagated per-token latency across stages).
       // So the true per-token latency is `pp` stages' worth of this per-stage total,
-      // plus (pp-1) inter-stage send/receive hops -- not one stage's total alone,
-      // which is what this estimate computed before this fix (an ~pp x under-count
-      // for pp>1, matching the live simulator's pre-fix bug).
+      // plus (pp-1) inter-stage send/receive hops.
       double stage_latency_ns = total_latency_ns + tp_comm_time + scatter_time;
       double full_pipeline_latency_ns = stage_latency_ns * pp;
 
@@ -546,33 +584,45 @@ ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
       config.pred_act_bytes    = act_size;
       config.pred_total_bytes  = weight_per_gpu + kv_cache_per_gpu + act_size;
 
-      candidates.push_back(config);
-      }  // expert-parallelism (e_tp_dg) sweep
-    }
-  }
+      return config;
+}
 
-  // Find the optimal non-OOM config: rank by THROUGHPUT (batch_size_per_gpu /
-  // estimated_latency_ms), not argmin(latency). Matches the paper's own stated
-  // objective (§III: "selects the parallelism configuration that maximizes the
-  // achievable system throughput subject to ... SLO requirements") rather than
-  // minimizing latency for its own sake once a config is already capacity-feasible.
-  // Deliberately NO added SLO veto here based on estimated_latency_ms: this estimate
-  // is a heuristic that can diverge from the live simulator (this file's own
-  // pp-latency fix above is proof it was systematically wrong until now) -- hard-
-  // gating on it risks discarding a candidate the real simulator would actually
-  // accept. Capacity/SRAM (checked above via checkCapacity) remain the ONLY hard
-  // vetoes; run_experiments.py's verify() against the live simulator remains the
-  // sole SLO arbiter.
+ParallelConfig ParallelismOptimizer::Optimize(const ModelConfig& model_config,
+                                             const SystemConfig& system_config,
+                                             int total_gpus,
+                                             int batch_size,
+                                             int sequence_length,
+                                             double tpot_slo_ms) {
+  (void)tpot_slo_ms;  // SLO is deliberately NOT a gate here -- see ranking comment.
+  std::vector<ParallelConfig> candidates = EnumerateCandidates(
+      model_config, system_config, total_gpus, batch_size, sequence_length,
+      /*require_batch_divisible=*/true);
+
+  // Find the optimal non-OOM config: rank by SYSTEM throughput, which at a fixed
+  // total batch reduces to argmin(estimated_latency_ms). Derivation: every decode
+  // step, the whole system (all DP replicas together) emits `batch_size` tokens in
+  // one step latency L, so system TPS = batch_size / L and per-GPU TPS =
+  // batch_size / (L * total_gpus). Within one Optimize() call, batch_size and
+  // total_gpus are constants across candidates, so argmax TPS == argmin L. This
+  // matches the paper's stated objective (§III: "selects the parallelism
+  // configuration that maximizes the achievable system throughput subject to ...
+  // SLO requirements"). Note the throughput rank uses SYSTEM batch (not batch/dp):
+  // a dp-way config's dp replicas each carry batch/dp and run concurrently, so the
+  // per-replica /dp cancels.
+  //
+  // Deliberately NO SLO veto here based on estimated_latency_ms: this estimate is a
+  // heuristic that can diverge from the live simulator, so hard-gating on it risks
+  // discarding a candidate the real simulator would accept. Capacity/SRAM (checked
+  // above via checkCapacity) remain the ONLY hard vetoes; run_experiments.py's
+  // verify() against the live simulator remains the sole SLO arbiter.
   ParallelConfig optimal_config;
-  double max_throughput = -1.0;
+  double min_latency_ms = -1.0;
   bool found_valid = false;
 
   for (const auto& cand : candidates) {
     if (!cand.oom) {
-      double cand_batch_size_per_gpu = (double)batch_size / cand.dp;
-      double cand_throughput = cand_batch_size_per_gpu / cand.estimated_latency_ms;
-      if (cand_throughput > max_throughput) {
-        max_throughput = cand_throughput;
+      if (!found_valid || cand.estimated_latency_ms < min_latency_ms) {
+        min_latency_ms = cand.estimated_latency_ms;
         optimal_config = cand;
         found_valid = true;
       }
