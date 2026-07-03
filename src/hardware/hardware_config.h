@@ -189,6 +189,18 @@ class SystemConfig {
   // Parsed from config.yaml: system.chunk_size.
   int chunk_size = 0;
 
+  // Length of the per-iteration consecutive weight-read stream on one device
+  // (count of linear weight tensors read back-to-back from flash each decode
+  // step). getLinearMemoryDuration divides the flash page-read PIPELINE-FILL
+  // latency by this count so the fill is exposed ~once per stream, not once
+  // per op (weights have no activation dependency; the staging-SRAM prefetcher
+  // double-buffers across consecutive weight tensors exactly as it does across
+  // chunks within one tensor -- mirror of getKVWriteDuration's
+  // program_latency_amortize_calls). Computed at startup by
+  // weightReadOpsPerIteration (model_config.h) once the final distribution is
+  // known; default 1 = legacy per-op charging.
+  int weight_stream_ops_per_iter = 1;
+
   // Compute-utilization (MFU, Model FLOPs Utilization) derating of GEMM compute time.
   // The inherited roofline model (compute_duration = total_flops/compute_peak_flops) assumes
   // every compute-bound op hits 100% of peak FLOPs, which no real GEMM does (tensor-core

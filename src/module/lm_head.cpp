@@ -17,7 +17,14 @@ LmHead::LmHead(std::string& prefix, std::string& name,
       model_config(model_config) {
   int hidden_dimension = model_config.hidden_dim;
   int n_vocab = model_config.n_vocab;
-  std::vector<int> wgt_shape = {hidden_dimension, n_vocab};
+  // Vocab-parallel sharding across the TP group (Megatron-style column-parallel
+  // logits): each TP rank holds n_vocab/tp columns. Divisor is ne_tp_dg, NOT
+  // device_list.size() (which spans DP replicas here). The cross-rank argmax /
+  // token-id gather this implies is a few bytes per sequence per step --
+  // negligible, so no communication op is added.
+  int tp = (model_config.ne_tp_dg > 0) ? model_config.ne_tp_dg : 1;
+  int vocab_per_rank = (n_vocab + tp - 1) / tp;
+  std::vector<int> wgt_shape = {hidden_dimension, vocab_per_rank};
   std::vector<int> act_shape = {1, hidden_dimension};
 
   Tensor::Ptr LmHead = Tensor::Create("lm_head_wgt", wgt_shape, "weight", device, device->model_config.precision_byte);
@@ -30,7 +37,10 @@ Tensor::Ptr LmHead::forward(const Tensor::Ptr input,
                                BatchedSequence::Ptr sequences_metadata) {
   int m = sequences_metadata->get_process_token();
   int k = model_config.hidden_dim;
-  int n = model_config.n_vocab;
+  // Vocab-parallel: this rank computes logits for its n_vocab/tp shard only
+  // (matches the sharded weight tensor in the constructor).
+  int tp = (model_config.ne_tp_dg > 0) ? model_config.ne_tp_dg : 1;
+  int n = (model_config.n_vocab + tp - 1) / tp;
   int precision = device->model_config.precision_byte;
 
   std::vector<int> shape = {m, n};

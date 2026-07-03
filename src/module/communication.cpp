@@ -2,6 +2,8 @@
 #include "scheduler/scheduler.h"
 #include "hardware/cluster.h"
 
+#include <cmath>
+
 #include "common/assert.h"
 // AllReduce //
 
@@ -28,14 +30,27 @@ Tensor::Ptr AllReduce::forward(const Tensor::Ptr input,
     return output;
   }
 
-  int hop = (device_list.size() - 1) * 2;
-  size /= device_list.size();
+  // All-reduce time = latency term + bandwidth term, modeled SEPARATELY.
+  //
+  // Bandwidth term: the bandwidth-optimal all-reduce volume 2(N-1)/N * size per
+  // link (ring / reduce-scatter + all-gather lower bound) -- unchanged.
+  //
+  // Latency term: 2*ceil(log2(N)) link latencies (recursive-doubling schedule),
+  // NOT the ring's 2(N-1) sequential hops. The paper's reference system is a
+  // DGX Rubin NVL8 whose GPUs are fully connected through NVSwitch, where the
+  // latency-optimal schedule is logarithmic; chaining 2(N-1) fixed hop latencies
+  // produced a batch-independent floor (e.g. 2.8 ms/step for llama3 TP=8) that
+  // contradicts SS-III's "the inter-GPU communication increases almost linearly
+  // with batch size" and Fig. 5's communication shares.
+  int n_ranks = (int)device_list.size();
+  int bw_hops = (n_ranks - 1) * 2;
+  int latency_hops =
+      (n_ranks > 1) ? 2 * (int)std::ceil(std::log2((double)n_ranks)) : 0;
 
-  time_ns one_hop =
-      device->config.device_ict_latency +
-      size / device->config.device_ict_bandwidth * 1000 * 1000 * 1000;
-
-  time_ns total_time = one_hop * hop;
+  time_ns total_time =
+      (time_ns)(latency_hops * device->config.device_ict_latency +
+                (double)bw_hops * ((double)size / n_ranks) /
+                    device->config.device_ict_bandwidth * 1e9);
 
   if (input->parallel_execution && !device->config.communication_hiding) {
     if (input->isPerformHigh()) {

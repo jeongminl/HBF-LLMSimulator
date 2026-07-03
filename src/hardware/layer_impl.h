@@ -40,7 +40,22 @@ inline time_ns getLinearMemoryDuration(const SystemConfig& config, double m, dou
         ? (int)std::ceil((double)weight_size / weight_sram_capacity) : 1;
     if (weight_num_chunks < 1) weight_num_chunks = 1;
     double weight_chunk_transfer_ns = weight_sram_capacity / hbf.flash_read_bandwidth * 1e9;
-    double weight_exposed_latency_ns = (double)hbf.flash_page_read_latency_ns +
+    // Pipeline-fill amortization ACROSS ops: successive weight tensors of one
+    // decode step form a single contiguous flash read stream (no activation
+    // dependency), so the prefetcher hides the fill of op N+1 behind op N's
+    // transfer just as it hides chunk N+1 behind chunk N within one tensor.
+    // Only ~one fill latency is exposed per per-iteration stream; each call
+    // charges its 1/weight_stream_ops_per_iter share (composes exactly like
+    // getKVWriteDuration's program_latency_amortize_calls). The per-chunk
+    // RESIDUAL term below is unchanged -- it models transfer-slower-than-page
+    // stalls inside this op and is 0 under every current preset's constants.
+    // Charging per op instead (the old behavior, amortize==1) over-charged MoE
+    // models by (experts/device x ffn_way x moe_layers) page latencies per
+    // step -- e.g. 2304 x 3us = 6.9 ms for llama4_maverick CONV+ at 4 GPUs.
+    int weight_fill_amortize = (config.weight_stream_ops_per_iter > 0)
+        ? config.weight_stream_ops_per_iter : 1;
+    double weight_exposed_latency_ns =
+        (double)hbf.flash_page_read_latency_ns / weight_fill_amortize +
         (weight_num_chunks - 1) * std::max(0.0, (double)hbf.flash_page_read_latency_ns - weight_chunk_transfer_ns);
     double weight_read_time = (weight_size / hbf.flash_read_bandwidth * 1e9) + weight_exposed_latency_ns;
 

@@ -25,10 +25,35 @@ directly rather than through intermediary docs.
 > names its winner config, measured vs paper numbers, and suspects) and U7's reproduction block.
 > The full-sweep regeneration of `experiment_results.md` is pending (on hold per user).
 
+> **Session note (2026-07-03, second pass): U9 and residuals 2-4 RESOLVED; U5 reclassified as
+> matching.** A four-agent investigation root-caused and fixed (CHANGES.md items 37-40): U9 = the
+> AllReduce ring-latency overcharge (item 37, two agents converged independently); residual-4
+> (CONV+ 4-GPU −33%) = per-op flash page-read latency on the weight stream (item 38); residual-3
+> (llama3 batch anchors) = replicated (un-TP-sharded) embedding/LM-head weights (item 39); U2's
+> ratio residual closed as a by-product (1.145 vs paper 1.15). U5's "miss" dissolved — the
+> current binary matches the paper's OWN 1-GPU bars (the old table below was stale). U7's
+> explanation SURVIVED an adversarial re-audit, strengthened by the "327-is-a-mislabel" finding.
+> Two physically-motivated changes were DELIBERATELY DEFERRED by user decision (score-matrix
+> traffic + MFU pair; steady-state context seeding) — see "Deferred by decision" below.
+
 ## Resolved — see CHANGES.md
 
 Full resolution records (original inconsistency, root cause, fix references, final verified
-numbers) are in `CHANGES.md`'s "Paper-comparison items resolved (2026-07-03)" section.
+numbers) are in `CHANGES.md`'s "Paper-comparison items resolved (2026-07-03)" section and the
+"Paper-comparison fixes, second pass" section (items 37-40).
+
+- **U9** — llama3/HBM4/8-GPU LONG TPS −13%: resolved, AllReduce ring-latency overcharge
+  (CHANGES.md item 37). Post-fix: batch 3.75/GPU (−1.3%), TPS/GPU 138.2 (−5.8%, was −13.0%);
+  comm share 5.4% vs paper Fig-5 5.1%. NOT the KV-read/context suspects originally listed —
+  those were measured matching (attention share 64.9% vs paper 67.5%).
+- **Residual-4** — llama4/CONV+/SHORT 4-GPU −33%: resolved, weight-stream page-latency
+  amortization (item 38). 4-GPU now 189.25/GPU vs paper 173.9 (+8.8%), 8-GPU 383 vs 390.1
+  (−1.8%). The 1/2-GPU bars (59/88 vs printed 54.3/54.3) sit below the figure's line-thickness
+  resolution — reading tolerance, not a divergence (user-confirmed).
+- **Residual-3** — llama3/HBM4 batch anchors −2.4%/−4.7%: resolved, vocab-parallel
+  embedding/LM-head sharding (item 39). SHORT +1.2%, MID +1.4%, LONG −1.3%.
+- **Residual-2** — U2 ratio 1.116 vs paper 1.15: resolved as a by-product of items 37-39:
+  ratio now **1.145** (numerator batch +4.0%, denominator batch +0.6%).
 
 - **U1** — llama4_maverick HBM4/8-GPU SHORT/MID batch anchors ~9-12% high: resolved, see CHANGES.md
   items 30-34 + resolution record (winner TP=2/PP=1/DP=4; SHORT 483.5/GPU ×1.051, MID 153.5/GPU ×1.013).
@@ -43,7 +68,22 @@ numbers) are in `CHANGES.md`'s "Paper-comparison items resolved (2026-07-03)" se
 
 ## Still open
 
-### U9 — llama3_405B/HBM4/8-GPU LONG TPS −13% (batch matches; NEW, opened 2026-07-03)
+### Residual-1 — llama4/HBM4/8-GPU SHORT: batch high / TPS low (only surviving open residual)
+
+Winner `TP=2/PP=1/EP=1/DP=4`. Pre-second-pass: batch +5.1% (483.5/GPU vs 460), TPS −4.9%. The
+comm model prices TP=2 marginally better than the DP-pure layout whose batch (460.0/GPU) equals
+the paper's printed anchor exactly; the fix-37 latency change does NOT alter N=2 (ring == log at
+2 ranks), and fix-39 frees ~1 GB/GPU of vocab weight on this capacity-bound cell, so expect the
+batch side to drift slightly HIGHER — an accepted, documented entanglement (the compensating
+lever is the deferred MFU item below, not comm tuning). Suspects if reopened: MoE cross-replica
+all-to-all volume at dp>1 vs the single attention all-reduce at TP=2 (static audit found the
+ring formula itself correct and the optimizer-vs-live MoE comm drift to be ranking-only).
+
+### [RESOLVED 2026-07-03 second pass] U9 — llama3_405B/HBM4/8-GPU LONG TPS −13%
+
+Resolved as the AllReduce ring-latency overcharge — see "Resolved" list above and CHANGES.md
+item 37. The original record (kept for the reproduction recipe; its candidate suspects (a)-(c)
+were all MEASURED NOT-CAUSAL — attention/KV-read shares match the paper):
 
 Fresh measurement on the fixed binary (`CHANGES.md` items 30-35): batch **3.62/GPU** (29 total,
 winner `TP=8/PP=1/EP=1/DP=1`, capacity-bound ✓, `bound=flash`) vs the paper's 3.8 (−4.7%), but
@@ -72,28 +112,11 @@ across rows; `latency` column = tpot in ns). Diff this cell's component shares a
 (batch 1527) and MID (batch 485) cells at the same TP=8 config: the −13% must live in whichever
 component grows superlinearly with context relative to the paper's implied scaling.
 
-### Open residuals from the resolved items (small, deliberately NOT tuned — pick-up list)
+### Open residuals — pick-up list status after the second pass
 
-Each of these survived the 2026-07-03 fixes at <±5-13%; none was calibrated away. Exact operating
-points for a follow-up investigator (all 0.1s SLO, fixed binary, throughput-max search):
-
-1. **llama4/HBM4/8-GPU SHORT: batch +5.1%, TPS −4.9%.** Winner `TP=2/PP=1/EP=1/DP=4`, batch 3868
-   total (483.5/GPU vs paper 460), tpot 0.0268s, TPS/GPU 18,016 (paper 18,943). The pure-DP
-   alternative `TP=1/PP=1/EP=1/DP=8` measures batch 3680 (=460.0/GPU exactly) at tpot 0.0262,
-   TPS 17,555 — our comm model prices TP=2 marginally better than DP-pure; the paper's operating
-   point is consistent with the DP-pure config. Suspects: MoEScatter/Gather cost at dp>1
-   (cross-replica all-to-all volume), all-reduce constants at TP=2.
-2. **U2 ratio 1.116 vs paper 1.15 (−3%).** Numerator (HBF+/4gpu LONG) matches paper +0.9%;
-   denominator (HBM4/8gpu LONG) is +3.9% high: batch 31.0/GPU ≈ paper 31.3 but tpot 0.023 vs
-   paper-implied 0.0242. Same LONG-context HBM4 regime as U9 — likely the same root cause,
-   opposite sign of impact (here our LONG tpot is too LOW, in U9 too HIGH... note the two cells
-   differ in model: llama4 (iRoPE-windowed KV) vs llama3 (full-context KV) — a context-accounting
-   suspect would explain both signs).
-3. **llama3/HBM4/8-GPU SHORT/LONG batch −2.4%/−4.7%** (190.9 vs 195.5; 3.62 vs 3.8) — both
-   capacity-bound; a ~2-5% KV-per-seq or capacity-accounting delta (e.g. steady-state context
-   occupancy convention) would close both.
-4. **llama4 CONV+ SHORT 4-GPU −33%** (116 vs paper 173.9; 8/16-GPU are −10%/−4%) — SLO-bound
-   growth cell; the 4-GPU point undershoots more than its neighbors. Un-investigated.
+Items 2/3/4 of the former pick-up list are RESOLVED (see the "Resolved" list above: U2 ratio
+1.145; llama3 anchors ±1.4%; CONV+ 4-GPU +8.8%). Item 1 (llama4/HBM4 SHORT) remains open and is
+now tracked as Residual-1 under "Still open" above.
 
 ## Explained — not bugs
 
@@ -103,6 +126,20 @@ former item 8, both consolidated there. Removed from this section since it's no 
 "explained, not a bug" finding.)*
 
 ### U5 — "1-GPU HBF/HBF+ per-GPU batch > 8-GPU HBM4, in most cases" (llama3_405B miss)
+
+**RECLASSIFIED (2026-07-03 second pass): the miss no longer exists — current binary MATCHES the
+paper's own 1-GPU bars.** Two independent measurements on the current binary (before the second-
+pass fixes) gave llama3 1-GPU HBF = 181/74/5 (SHORT/MID/LONG) vs the paper's own Fig-3 1-GPU
+bars 176.2/70.0/5.1 (+2.7/+5.7/−2%), and HBF+ = 362/125/7 vs 329.4/116.1/7.1 (+10/+7.7/−1.4%);
+after fix-38 (weight-stream page-fill amortization) the HBF SHORT cell reads 185 (+5.0%). The
+table below (97/39/2, 235/81/5) is STALE — it predates the CHANGES.md item-17/18/30-35 fixes and
+was never re-measured when this section was written. Two errors in the original record: (a)
+stale numbers, and (b) it benchmarks 1-GPU HBF against the 8-GPU HBM4 anchor (194.8) — the
+paper's claim compares against the paper's OWN 1-GPU bars. The weight-reread-floor MECHANISM
+below was independently re-verified (weight charged exactly once per op, `k·n·precision`, no
+batch factor; CSV: FFN+QKV+O-proj weight-read ≈ 77% of the 100 ms budget at the SLO-saturated
+point) and stands as the correct physical explanation of WHY the 1-GPU cell is SLO-bound — it
+just no longer needs to explain away any discrepancy. Historical record kept below.
 
 Holds 5/6 for llama4_maverick but 0/6 (pre-fix) for llama3_405B — e.g. SHORT: 1-GPU HBF = 75 vs.
 8-GPU HBM4 = 194.8 (−61%). **Root-caused as physically correct, not a bug**, and confirmed
@@ -194,6 +231,26 @@ mechanism it demonstrates is a property of the model/hardware pair near the SLO 
 to the exact batch number, so it remains valid as illustrative evidence.)
 
 ### U7 — HBF+/CONV+ per-GPU batch grows with GPU count instead of staying flat — not a bug, a documented model divergence from the paper's tool
+
+**ADVERSARIAL RE-AUDIT (2026-07-03 second pass): explanation SURVIVES, strengthened.** Two new
+findings: (1) the paper-text "327 seq/GPU (Llama 4 Maverick)" does not match the llama4 SHORT
+bar under any accounting (score-free ≈ 4,200, score-inclusive-max ≈ 800-900 — the SHORT bar
+854.7 IS the score-inclusive-max ceiling; exact footprint replica: 361.7 KB/seq → 906). Two
+candidate readings of "327", neither changing the disposition: (a) a model mislabel — 327 ≈
+llama3's own SHORT/HBF+ bar (329.4); or (b) **(user-preferred, 2026-07-03)** the llama4 MID
+1-GPU HBF+ bar — read as 352.7 in paper_figure_readings.md, but the figure's scale makes 327 an
+equally valid visual read, and notably the score-inclusive accounting's implied MID ceiling
+(~300/GPU: 40 heads × ~6.4K ctx × 2B × 2 buffers ≈ 1 MB/seq against 320 MB) lands within ~8% of
+327 — which would make the paper's text internally consistent for llama4 at that one cell.
+(2) The dual-constraint hunt (a single accounting fitting llama4's ~374 KB/seq AND llama3's
+~995 KB/seq, SHORT and MID simultaneously) has no solution — adopting score-inclusive as the
+gate breaks llama4 MID at 8/16 GPUs (314 vs 745), llama3 MID (98 vs 190) and llama3 LONG (6 vs
+19) by 2-3×, and empirical SRAM_DIAG ceilings confirm it would UNDERSHOOT the paper's own
+growing MID/LONG bars. (Reading (b) above sharpens rather than resolves this: if 327 = the MID
+1-GPU score-inclusive ceiling, the paper's own MID series would be SRAM-capped at ~327/GPU at
+1 GPU yet reads 745.1 at 8/16 GPUs — per-GPU SRAM ceilings don't loosen with GPU count to first
+order, so the six bars remain mutually inconsistent with any single O(ctx) formula.) The
+current score-exclusive max model matches 10/12 bars. No fix. Original record below.
 
 **UPDATE (2026-07-03 session — napkin-math quantification of the divergence, and why the paper's
 SRAM-bound bar is flat across GPU counts at all).** Two additions to the analysis below:
@@ -392,7 +449,45 @@ current model's SRAM ceiling is arguably looser than the paper reports for legit
 code change is proposed as a result of this investigation. Related to (and separately confirmed
 alongside) U5's SLO-vs-capacity-bound distinction above.
 
+## Deferred by decision (2026-07-03 second pass — real, quantified, deliberately NOT applied)
+
+Two physically-motivated model changes were identified, measured, and deferred by explicit user
+decision, to avoid any calibrated constant ("no fudging" rule). Recorded here so a future pass
+can pick them up as a PAIR:
+
+1. **FlashAttention score/query HBM-traffic removal + GEMM-efficiency (MFU<1) — both or
+   neither.** The non-flash attention memory charge includes `m·n·G` (score matrix) + `m·k·G`
+   (query) bytes per (seq, kv-head) (`attention_gen_impl.cpp` Scoring/Context; MLA gen has the
+   same term; the flash branch charges the same bytes on the HBM-stack act path). With
+   `use_flash_attention: on` the score matrix never materializes in HBM, so this is physically
+   wrong — but it is a CONSTANT ~11% fraction of attention memory in every cell (llama3 G=16:
+   1.9/1.86/2.05 ms at LONG/MID/SHORT; llama4 G=5: ~0.6 ms), and it currently cancels an
+   opposite-sign divergence: §III implies roofline max (「FFN … compute-bound GEMM」— so max is
+   the PAPER-ALIGNED convention), yet Fig-5's FFN shares imply the paper's GEMM time is ~2× our
+   100%-peak time, i.e. an unmodeled MFU ≈ 0.45-0.5 (infra exists: `mfu_max`/`mfu_m_half`,
+   currently 1.0/0). Measured prediction table (post-fix-37 binary, tpot err vs paper): applying
+   score-removal alone drives MID/SHORT/llama4-LONG to −8…−11% (breaks 3 cells); applying both
+   (score-removal + calibrated MFU) is expected to bring every cell within a few %, but the MFU
+   value would be fitted to Fig-5 — hence deferred.
+   **Honest post-fix state**: with the ring-latency overcharge (item 37) gone, llama3 SHORT/MID
+   tpot reads ~4-6% FAST vs paper (TPS high; e.g. MID TPS/GPU 1904.7). This is the exposed
+   compute-under-charge, no longer masked by accidental cancellation.
+2. **Steady-state decode context seeding.** Decode tpot is measured over 10 iterations seeded at
+   `current_len = input_len` (start-of-generation), while steady-state serving averages
+   `input + output/2`. Raises tpot ~2-3% on SHORT/MID, ~0.2% on LONG; helps the post-fix-37
+   fast cells, slightly worsens llama4 SHORT. Deferred with the MFU item (same cells, same
+   direction); the CAPACITY convention stays at full `input+output` — steady-state there was
+   REFUTED (overshoots SHORT by +7%).
+
 ## Ruled out as causes (for completeness)
+
+**CORRECTION (2026-07-03 second pass):** the entry below that ruled out communication cost was
+only ever measured at TP=1/TP=2 operating points — it did NOT cover the TP=8 regime, where the
+ring-latency term was in fact U9's root cause (CHANGES.md item 37). Scope rulings to the
+configs actually measured. Additionally ruled out this pass: steady-state KV CAPACITY sizing
+(overshoots, wrong direction — twice confirmed), decimal-GB capacity constants (wrong direction;
+paper's pools are consistent with GiB), and the KV fork's apparent "7.4% optimizer↔live weight
+drift" (a GiB-vs-GB units artifact in the comparison itself, not a real drift).
 
 Flash bandwidth constants and llama4's weight footprint (746.4 GiB) match the paper's Table I and
 stated figure exactly. Routing skew (`skewness: 0.8`) doesn't reach U1's capacity-bound operating

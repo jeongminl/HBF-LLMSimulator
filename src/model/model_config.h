@@ -155,6 +155,57 @@ inline double effectiveKvLenSumAllLayers(const ModelConfig& mc, double context_l
 // Single shared definition used by both the module-construction path
 // (llm.cpp) and the parallelism optimizer (parallelism_optimizer.cpp), so the
 // two never disagree on which layers are MoE.
+inline bool isMoELayer(const ModelConfig& mc, int layer);
+
+// Number of consecutive weight-read linear ops a (stage-0) device issues per
+// decode iteration -- the length of its per-iteration flash weight stream.
+// Used to amortize the flash page-read PIPELINE-FILL latency in
+// getLinearMemoryDuration (layer_impl.h): weights carry no activation
+// dependency, so the staging-SRAM prefetcher double-buffers ACROSS consecutive
+// weight tensors just as it does across chunks within one tensor, exposing
+// ~one fill latency per stream rather than one per op. Mirrors
+// getKVWriteDuration's program_latency_amortize_calls on the write side.
+// Counts follow the live module graph (layer.cpp / decoder.cpp / expert.cpp):
+//   GQA attention: attn_qkv_proj + attn_o_proj = 2 weight tensors.
+//   MLA: q_down/kv_down/kr/q_up/(absorb extras)/o_proj -> use_absorb ? 8 : 7
+//        (same convention as the optimizer's former per-op page counts).
+//   FFN: dense = ffn_way; MoE = router gate + resident_experts*ffn_way +
+//        num_shared_expert*ffn_way. Resident (static) expert count is used;
+//        the batch-dependent ACTIVE count can be lower, which under-exposes at
+//        most ~one extra page latency total (microseconds -- negligible).
+//   lm_head: +1 when pp == 1 (stage 0 is then also the last stage).
+inline int weightReadOpsPerIteration(const ModelConfig& mc, int total_num_devices) {
+  int pp = (mc.pp_dg > 0) ? mc.pp_dg : 1;
+  int layers_per_stage = mc.num_layers / pp;
+  if (layers_per_stage < 1) layers_per_stage = 1;
+  int devices_per_stage = (total_num_devices > 0) ? total_num_devices / pp : 1;
+  if (devices_per_stage < 1) devices_per_stage = 1;
+  int e_tp = (mc.e_tp_dg > 0) ? mc.e_tp_dg : 1;
+
+  int experts_per_device = 0;
+  if (mc.num_routed_expert > 0) {
+    int expert_groups = devices_per_stage / e_tp;
+    if (expert_groups < 1) expert_groups = 1;
+    experts_per_device = mc.num_routed_expert / expert_groups;
+    if (experts_per_device < 1) experts_per_device = 1;
+  }
+
+  int attn_ops = (mc.q_lora_rank != 0) ? (mc.use_absorb ? 8 : 7) : 2;
+
+  int ops = 0;
+  for (int layer = 0; layer < layers_per_stage; ++layer) {
+    ops += attn_ops;
+    if (isMoELayer(mc, layer)) {
+      ops += 1 + mc.ffn_way * experts_per_device +
+             mc.ffn_way * mc.num_shared_expert;
+    } else {
+      ops += mc.ffn_way;
+    }
+  }
+  if (pp == 1) ops += 1;  // lm_head
+  return (ops > 0) ? ops : 1;
+}
+
 inline bool isMoELayer(const ModelConfig& mc, int layer) {
   if (mc.num_routed_expert == 0) return false;              // dense model
   if (mc.first_k_dense > 0 && layer < mc.first_k_dense) return false; // forced-dense prefix
