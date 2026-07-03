@@ -1056,3 +1056,100 @@ reading tolerance); the 1→2 GPU growth is the physical halving of the expert w
 Exit criteria met: both outliers (U9, CONV+ 4-GPU) collapsed into band; no cell regressed beyond
 the documented, deliberate SHORT/MID exposure band (see PAPER_INCONSISTENCIES.md "Deferred by
 decision"); nothing calibrated to a target.
+
+## Third-pass independent bug hunt (2026-07-03) — items 41-50
+
+Run blind to this file and PAPER_INCONSISTENCIES.md (independence protocol; post-hoc convergence
+check), against a fresh extraction of the paper's ground truth (`PAPER_ANCHOR_SHEET.md`). Every
+finding was adversarially verified by independent refuter agents before any fix was applied. Full
+finding records, refuter verdicts, and the convergence classification live in
+`FINDINGS_REGISTER.md`. All fixes are grounded in technical correctness or the paper's stated
+methodology; nothing was calibrated to a paper number.
+
+41. **Optimizer TP all-reduce latency hops: ring → recursive-doubling** (`parallelism_optimizer
+    .cpp`). Item 37 fixed the LIVE AllReduce to `2·ceil(log2 N)` hop latencies but the optimizer
+    mirror still charged the ring's `2(tp−1)` — while its comment claimed parity. Spurious
+    1.61 ms/step at tp=8 (llama3, pp=1) deflated high-TP seed_tps ~16% vs tp=4, so a true TP=8
+    winner could be pruned unverified (run_experiments.py's seed_tps upper-bound prune).
+    **Corrects items #20/#37's "lock-step / identical formula" language, which was false since
+    item 37 landed.**
+
+42. **Optimizer MoE comm terms now mirror the live modules** (scatter crossing-fraction excludes
+    the ne_tp group and divides volume by ne_tp; gather excludes the e_tp group and divides by
+    e_tp·ne_tp; decode link = node_ict when num_node>1; the two per-MoE-layer all-reduces —
+    previously omitted entirely — use the shared log2 model, node-aware).
+
+43. **Optimizer shared-expert capacity weight now TP-sharded** (was "fully replicated"; runtime
+    builds it on the ne_tp group — confirmed by recorded per-GPU weights 116.384→106.020 GiB at
+    TP=2). **Qualifies item #32's "parity <0.01%": that held only at pp=1/TP=1.**
+
+44. **Live AllReduce made node-aware** (`communication.cpp`): groups spanning nodes now pay the
+    inter-node link, like MoEScatter/Gather/PipelineStage. A 16-GPU 2-node e_tp=16 MoE all-reduce
+    (a valid candidate the optimizer's EP-max bias reaches) was priced at NVLink 1800 GB/s instead
+    of IB 100 GB/s (~18× undercharge), inflating 16-GPU llama4 TPS.
+
+45. **Interconnect latency constants** (`eval/test.cpp`): NVLink 0.8 µs vs IB 0.13 µs was
+    physically inverted (H100-era carry-over vs NIC port-to-port figure). Paper anchors no
+    latencies; set datasheet-plausible NVLink 0.5 µs / IB 3.0 µs (user-approved).
+
+46. **Residual op priced on the intermediate tier** (`residual.cpp`): previously used the
+    device-wide bandwidth scalar unconditionally — on HBF that is the FLASH read bandwidth
+    (11.2 TB/s) for pure activation traffic belonging on the 1.6 TB/s HBM stack (~7× fast,
+    ~1 ms/step on llama3 HBF MID). Now uses the same tier selection as activationCore.
+
+47. **Flash-pool double-count + PEC windowing** (`footprint.h`, `eval/test.cpp`,
+    `run_experiments.py`). (a) The weights+KV gate used Table I's COMBINED capacity (3,620 GB
+    includes the reserved HBM stack that is separately the activation tier); flash pool is now
+    3,584 GB (~1%). (b) Fig-7 PEC volume was unwindowed (all layers × full context) while the
+    write-timing and capacity models window llama4's 36/48 local iRoPE layers at 8192 — a 3.16×
+    internal inconsistency on llama4 LONG only. The binary now emits `PEC_KV_BYTES_PER_SEQ`
+    (per-layer windowed lifetime volume) and compute_pec consumes it. **Documented divergence:
+    llama4-LONG PEC at the paper's operating point drops below the 100K SLC line, where the
+    paper's own (unwindowed-matching) bar sits above it. User-approved.**
+
+48. **Shared expert charged at full per-device batch in the SRAM footprint gates**
+    (`footprint.h`, `cluster.cpp` prefill branches). It was charged at expert_batch_size — the
+    global average tokens per ROUTED expert (16× under-count for maverick at 8 GPUs) — while the
+    runtime passes the full batch through it. Context-independent correction; llama4-SHORT-HBF+
+    SRAM ceilings drop to 2824/1883/1130/628 per GPU at EP=1/2/4/8. See PAPER_INCONSISTENCIES.md
+    U7 for why the cell nonetheless stays SLO-bound (EP-escape).
+
+49. **Steady-state decode context, both sides** (`scheduler.cpp`, `parallelism_optimizer.cpp`,
+    `eval/test.cpp`). Live decode seeded sequences at current_len=input (start-of-generation);
+    the analytic latency estimate used input+output (a third convention). Both now use the
+    paper-implied steady-state input+output/2 for the per-step READ basis (capacity keeps the
+    full lifetime). Also restores the pruning invariant (analytic latency must not overestimate).
+    **Supersedes PAPER_INCONSISTENCIES "Deferred by decision" #2 (user-approved, applied alone);
+    the paired MFU/score-removal item REMAINS OUTSTANDING — expect llama3 SHORT/MID TPS to read
+    a few % fast until it is decided.**
+
+50. **Zipf-hot experts decorrelated from contiguous placement** (`scheduler.cpp`): skew weights
+    are index-monotone and placement is contiguous, so ALL hot experts colocated on device 0 —
+    at LONG batch (~31 active experts) the bottleneck device carried ~8.6 active experts vs ~2.9
+    balanced (~3× expert weight-stream inflation of max-over-devices step time). A fixed
+    coprime-stride permutation of the drawn hotness rank round-robins hot experts across devices,
+    preserving the skew distribution and determinism. **Scopes the earlier "routing skew ruled
+    out" note, which was only ever verified at U1's capacity-bound point.**
+
+**Post-fix 13-cell regression (throughput-max search, 0.1 s SLO; paper anchors =
+PAPER_ANCHOR_SHEET.md exact red labels, visual bars ±0.1-0.15 norm):**
+
+| Cell | batch/GPU (Δ vs paper) | TPS/GPU (Δ) | bound |
+|---|---|---|---|
+| llama3 HBM4/8 SHORT | 197.88 (+2.0%) | 3566.6 (+8.1%) | capacity |
+| llama3 HBM4/8 MID | 62.88 (+2.2%) | 1890.0 (+5.0%) | capacity |
+| llama3 HBM4/8 LONG | 3.75 (exact) | 140.0 (−4.7%) | capacity |
+| llama4 HBM4/8 SHORT | 488.50 (+6.2%) | 18448.4 (−2.9%) | capacity |
+| llama4 HBM4/8 MID | 155.00 (+2.3%) | 6237.5 (−1.0%) | capacity |
+| llama4 HBM4/8 LONG | 32.00 (+3.2%) | 1323.5 (+1.8%) | capacity |
+| llama4 HBF+/8 SHORT | 2245.0 (vs ✕759 — see U7 final) | — | slo |
+| llama4 HBF+/8 MID | 794.0 (+7.0%, was 814) | — | slo |
+| llama4 HBF+/8 LONG | 169.0 (≈ visual 170) | — | slo |
+| llama4 HBF+/4 LONG | 156.0 | 1561.5 (+4.4% vs 1.15×) | slo |
+| llama4 HBF+/16 LONG | 174.0 | 1743.1 (+3.1% vs 1.3×) | slo |
+| llama4 CONV+/8 SHORT | 394.5 (−4.7% vs visual) | — | slo |
+| llama3 HBF/1 SHORT | 170.0 (−3.5% vs 176.2, was +5.0%) | — | slo |
+
+llama3 SHORT/MID TPS reading fast = the outstanding MFU counterpart of item 49 (documented,
+deliberate). llama4 HBM4 SHORT batch +6.2%: the search now reaches TP=2's true capacity ceiling
+(488.5/GPU) — see PAPER_INCONSISTENCIES.md Residual-1 (resolved: capacity mechanism, not comm).
