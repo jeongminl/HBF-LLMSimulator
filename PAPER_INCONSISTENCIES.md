@@ -53,6 +53,30 @@ directly rather than through intermediary docs.
 > bug was real but the cell stays SLO-bound — the throughput-max search escapes the SRAM ceiling
 > via EP=1 (see the U7 section's "THIRD-PASS FINAL" block).
 
+> **Session note (2026-07-04, fourth pass): blind re-investigations CONVERGED on U5, U7 and
+> Residual-1; 7 new fixes (CHANGES.md items 51-57); deferred-pair rationale corrected.** Ten
+> finder tracks ran blind (no analysis docs, no git history), then six adversarial refuters,
+> then targeted verification runs (records: `FINDINGS_REGISTER.md` "Fourth-pass register").
+> Headlines: (1) the biggest new bug was the MoE all-to-all DECODE pricing intra-node bytes on
+> InfiniBand at 16 GPUs (item 51 — comm share 19.1%→8.7% post-fix vs paper's ~3.9%; 16-GPU
+> llama4 cells improve); (2) U5's blind re-derivation matched the documented weight-stream-floor
+> mechanism to 0.3% and found the paper's claim is consistent with its own figure 10/11 cells —
+> the single miss is the "in most cases" hedge; (3) U7's blind re-derivation unified the paper's
+> 854.7 ✕ bar and "327" text quote as ONE score-inclusive accounting at TWO contexts,
+> contradicting the paper's own unmarked MID bar — paper-internal inconsistency CONFIRMED
+> independently; (4) Residual-1 re-confirmed (DP-pure = 460.00 exact) with a NEW corroboration:
+> 460 requires 288 GiB (decimal GB → ~428), settling the GB-vs-GiB question in the code's favor;
+> (5) the deferred score+MFU pair REMAINS deferred but its old "cancellation" rationale is
+> corrected — no structural cancellation exists (score bytes ≡0 on HBF+/CONV+, sub-max on HBF;
+> live only on HBM4's sum path); the stronger ground is that the paper never mentions
+> FlashAttention and `use_flash_attention` is structurally MLA-only, so charging score bytes is
+> plausibly paper-conformant; measured MFU sensitivity at 0.5: SHORT +33.6% / MID +8.0% tpot,
+> and the MFU knob is miskeyed (per-op m=1 on decode attention) — must be repaired before any
+> future MFU work; (6) a new "explained — not a bug" entry: Fig-6's plotted 8-GPU HBM4 baseline
+> is ~0.84/0.64, not 1.0, under every reading of the paper's own caption — a paper-side scale
+> anomaly that structurally inflates Fig-6 comparison error rates ~16-19% (TPS); (7) C5/I5
+> prune-risk closed empirically (pruning-off run reproduces the pruned winner exactly).
+
 ## Resolved — see CHANGES.md
 
 Full resolution records (original inconsistency, root cause, fix references, final verified
@@ -88,6 +112,15 @@ numbers) are in `CHANGES.md`'s "Paper-comparison items resolved (2026-07-03)" se
 *(none — Residual-1 resolved below, 2026-07-03 third pass)*
 
 ### [RESOLVED 2026-07-03 third pass — NOT A BUG] Residual-1 — llama4/HBM4/8-GPU SHORT: batch high / TPS low
+
+**FOURTH-PASS BLIND RE-CONFIRMATION (2026-07-04, F8c):** an independent investigator (no access
+to this file or git history) re-derived the identical mechanism: full TP scan gives 460.00 /
+488.50 / 502.50 / 509.50 per-GPU ceilings at TP=1/2/4/8 (all capacity-bound, tpot 24-33ms ≪ SLO),
+argmax TP=2 at 19,280 TPS/GPU; DP-pure = the paper's 460 anchor TO THE DIGIT (TPS +0.24%); no
+capacity-accounting defect (recorded ≡ analytic weights; matched-batch TP-comm deficit −0.7%,
+correctly signed). NEW corroboration: 460 is only reproducible with the 288-GiB capacity —
+288 decimal GB yields ~428 — so the paper's tool used binary GiB AND a DP-restricted search for
+this cell. Original third-pass record below.
 
 **Root cause (measured, adversarially verified — see FINDINGS_REGISTER.md Track A):** the cell is
 **CAPACITY-bound, not SLO- or comm-bound** (tpot ≈ 26 ms ≪ 100 ms at every feasible batch; all OOM
@@ -145,12 +178,37 @@ now tracked as Residual-1 under "Still open" above.
 
 ## Explained — not bugs
 
+### Fig-6 normalization baseline — paper-side scale anomaly (2026-07-04 fourth pass)
+
+The sim's Fig-6 writer normalizes each SLO row-group to that SLO's own 8-GPU HBM4 cell
+(run_experiments.py:1377-1396, :1434-1438), so sim HBM4 ratios are structurally 1.00×. The
+paper's caption states one fixed baseline — "All values are normalized to the 8-GPU HBM4 for
+each workload" — and since HBM4 is SLO-invariant (capacity-bound), the two conventions are
+numerically equivalent. BUT the paper's own plotted 8-GPU HBM4 points read ~0.84 (TPS) / 0.64
+(batch) — not 1.0 under ANY reading of its own caption — while the paper text's RELATIVE claims
+(e.g. HBF+ vs HBM4 "+4.1%→+14.8% offline at 16 GPUs") match the pixel readings' ratios. So the
+readings are internally consistent up to an unexplained absolute scale on that figure (the
+readings file itself warns the near-zero HBM4 batch bars are pixel-offset-dominated). Verdict:
+paper-side anomaly; no sim change (changing the writer's convention would alter nothing real).
+CONSEQUENCE for `compare_error_rates.py`: every Fig-6 TPS pair carries a structural ~16-19%
+error component and the HBM4 batch rows up to ~56% (1.00 vs 0.64) that reflect the paper
+figure's scale, not simulator error — read Fig-6 group errors with this floor in mind.
+
 *(Note: an item formerly tracked here, "Degenerate one-device-per-stage optimizer choices," was
 found this session to actually be a real, now-fixed bug — see `CHANGES.md` item 26 and `BUGS.md`'s
 former item 8, both consolidated there. Removed from this section since it's no longer a genuine
 "explained, not a bug" finding.)*
 
 ### U5 — "1-GPU HBF/HBF+ per-GPU batch > 8-GPU HBM4, in most cases" (llama3_405B miss)
+
+**FOURTH-PASS BLIND RE-CONFIRMATION (2026-07-04, F8a):** independent re-derivation matched the
+mechanism quantitatively — batch-invariant weight-streaming floor measured 72.1 ms vs 810 GB /
+11.2 TB/s = 72.3 ms first-principles (72% of the 100 ms budget before any batch); max batch
+boundary probed exactly (177 pass / 178 fail); sim matches the paper's OWN Fig-3 bars to ~1%
+(177 vs 176.2; 197.9 vs 195.5). NEW sharpening: across all 11 comparable 1-GPU-HBF/HBF+ vs
+8-GPU-HBM4 cells in the paper's own figure, 10 exceed the anchor; the single miss IS
+llama3/SHORT/HBF — i.e. the paper's "in most cases" hedge is literally consistent with its own
+figure, and there is no claim-vs-figure inconsistency to explain at all. Historical record below.
 
 **RECLASSIFIED (2026-07-03 second pass): the miss no longer exists — current binary MATCHES the
 paper's own 1-GPU bars.** Two independent measurements on the current binary (before the second-
@@ -256,6 +314,19 @@ mechanism it demonstrates is a property of the model/hardware pair near the SLO 
 to the exact batch number, so it remains valid as illustrative evidence.)
 
 ### U7 — HBF+/CONV+ per-GPU batch grows with GPU count instead of staying flat — not a bug, a documented model divergence from the paper's tool
+
+**FOURTH-PASS BLIND RE-CONFIRMATION (2026-07-04, F8b — caveat: footprint.h's own comments
+reference the U7 diagnostic, so the code carried partial context; the evidence is fresh
+measurement):** independent re-derivation reached the same disposition and UNIFIED the paper's
+two SRAM numbers: the 854.7 flat ✕ SHORT bar and the paper-text "327 seq/GPU" are ONE
+score-inclusive accounting evaluated at TWO contexts — score-inclusive diagnostic ceiling
+755.6/GPU at SHORT ctx≈2033 (≈ the ✕ bar) and ~294-327/GPU at MID ctx≈6399 (= the text quote) —
+while the paper's OWN MID bar is 745 UNMARKED, which that same accounting would cap at ~327.
+So no single accounting fits the paper's own bars (re-proving the impossibility result
+independently). Sim's context-independent gate re-verified by run: SHORT and MID analytic caps
+identical (22,592 total = 2,824/GPU at tp1/ep1/dp8); score-inclusive ceiling ~flat across tp
+(755→651), so the paper's flat ✕ is not a tp-escape artifact either. Post-fix measured SHORT
+8-GPU cell: 2,374/GPU slo-bound (vs ✕854.7). Disposition unchanged: keep the gate. Records below.
 
 **THIRD-PASS FINAL (2026-07-03; supersedes the re-audit below where they differ — full derivation
 in FINDINGS_REGISTER.md "U7 FINAL" + Track B sections):**
@@ -499,6 +570,26 @@ alongside) U5's SLO-vs-capacity-bound distinction above.
 
 ## Deferred by decision (2026-07-03 second pass — real, quantified, deliberately NOT applied)
 
+> **FOURTH-PASS UPDATE (2026-07-04): item 1 REMAINS DEFERRED, rationale corrected.** Blind
+> re-derivation confirmed both halves' arithmetic exactly (score fraction = G/(G+head_dim) =
+> 11.1% llama3 / 3.76% llama4 of attention memory). Three refuter findings supersede the
+> "constant fraction that cancels the MFU divergence" framing: (a) NO structural cancellation —
+> score bytes are identically ZERO on HBF+/CONV+ (act-tier guard, num_hbm_stacks==0) and bounded
+> below the KV-read term inside max() on HBF (act/kv = 7·G/head_dim = 0.875/0.273 < 1); they are
+> live ONLY on the plain-HBM4 sum path; (b) `use_flash_attention` is STRUCTURALLY MLA-only (the
+> GQA SelfAttentionGen/Sum classes have no such member; MLA uses use_flash_mla/use_flash_attention
+> for gen/sum respectively) and the paper never mentions FlashAttention — its "chunked attention"
+> extension is the HBF SRAM-staging mechanism — so charging score bytes on the GQA path is
+> plausibly what the paper's own tool does (paper-CONFORMANT), the strongest ground yet for not
+> "fixing" it unilaterally; (c) measured MFU sensitivity (forced llama3/HBM4/8, mfu_max=0.5):
+> SHORT tpot +33.6%, MID +8.0% — the GEMM M-basis is per-DP-replica tokens, so SHORT cells are
+> deeply compute-sensitive; an MFU value remains unanchored by the paper (fitting = forbidden).
+> ALSO: the MFU knob itself is MISKEYED (decode-attention call sites pass per-op m=1,
+> contradicting hardware_config.h's own "batch*tokens" doc comment; any nonzero mfu_m_half would
+> derate attention ~(batch/m_half)× harder than FFN) — dormant at defaults, but it must be
+> repaired before any future MFU-sensitivity work. See FINDINGS_REGISTER "Fourth-pass register"
+> N4 and CHANGES.md items 51-57 postscript.
+
 Two physically-motivated model changes were identified, measured, and deferred by explicit user
 decision, to avoid any calibrated constant ("no fudging" rule). Recorded here so a future pass
 can pick them up as a PAIR:
@@ -528,6 +619,14 @@ can pick them up as a PAIR:
    longer masked). A future pass deciding item 1 should re-measure those cells.
 
 ## Ruled out as causes (for completeness)
+
+**Fourth-pass additions (2026-07-04):** batch-search pruning empirically clean at the worst-case
+cell — `HBF_DISABLE_CONFIG_PRUNING=1` on llama4/HBF+/8/LONG (30 configs, 0 pruned) reproduces the
+pruned winner exactly (tp2/dp4, 169/GPU, TPS 1692.07). GB-vs-GiB capacities ruled out again,
+now decisively: paper Table I is exact in BOTH conventions (units cancel in 36/512 combinations),
+and Residual-1's DP-pure anchor (460.00) reproduces ONLY under 288 GiB (decimal → ~428). The
+energy/ramulator subsystem ruled out as an influence on ANY reported number (use_ramulator off
+everywhere; energy CSV columns unread by the harness).
 
 **CORRECTION (2026-07-03 second pass):** the entry below that ruled out communication cost was
 only ever measured at TP=1/TP=2 operating points — it did NOT cover the TP=8 regime, where the

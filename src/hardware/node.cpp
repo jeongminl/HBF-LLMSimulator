@@ -4,6 +4,7 @@ namespace llm_system {
 
 Node::Node(SystemConfig config, int node_rank, Cluster_ptr cluster)
     : config(config), node_rank(node_rank), cluster(cluster) {
+  // DEAD: never read anywhere (comm ops use device->config.node_ict_*); values below are the intra-node constants and would be wrong for an inter-node link if ever used.
   node_ict_latency = config.device_ict_latency;
   node_ict_bandwidth = config.device_ict_bandwidth;
 

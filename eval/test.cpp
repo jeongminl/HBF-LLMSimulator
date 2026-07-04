@@ -692,7 +692,10 @@ int main(int argc, char *argv[]) {
                             "_N" + std::to_string(num_node) + "_D" + 
                             std::to_string(num_device) + "_TP" +
                             std::to_string(ne_tp_dg) + "_DP" +
-                            std::to_string(ne_dp_dg) + "_maxbatch" +
+                            // EP + memory preset in the name: EP-sibling candidates at the same (TP,DP,batch) and same-worker different-preset cells must not clobber each other's CSV (Fig-5 breakdown source)
+                            std::to_string(ne_dp_dg) + "_EP" +
+                            std::to_string(model_config.e_tp_dg) + "_MEM" +
+                            system_config.memory_type + "_maxbatch" +
                             std::to_string(max_batch_size) + "_maxprocess" +
                             std::to_string(max_process_token) + "_iter" +
                             std::to_string(total_iter) + 
@@ -706,7 +709,10 @@ int main(int argc, char *argv[]) {
                             "_N" + std::to_string(num_node) + "_D" + 
                             std::to_string(num_device) + "_TP" +
                             std::to_string(ne_tp_dg) + "_DP" +
-                            std::to_string(ne_dp_dg) + "_maxbatch" +
+                            // EP + memory preset in the name: EP-sibling candidates at the same (TP,DP,batch) and same-worker different-preset cells must not clobber each other's CSV (Fig-5 breakdown source)
+                            std::to_string(ne_dp_dg) + "_EP" +
+                            std::to_string(model_config.e_tp_dg) + "_MEM" +
+                            system_config.memory_type + "_maxbatch" +
                             std::to_string(max_batch_size) + "_maxprocess" +
                             std::to_string(max_process_token) + "_iter" +
                             std::to_string(total_iter) + 
@@ -722,7 +728,10 @@ int main(int argc, char *argv[]) {
                             "_N" + std::to_string(num_node) + "_D" + 
                             std::to_string(num_device) + "_TP" +
                             std::to_string(ne_tp_dg) + "_DP" +
-                            std::to_string(ne_dp_dg) + "_maxbatch" +
+                            // EP + memory preset in the name: EP-sibling candidates at the same (TP,DP,batch) and same-worker different-preset cells must not clobber each other's CSV (Fig-5 breakdown source)
+                            std::to_string(ne_dp_dg) + "_EP" +
+                            std::to_string(model_config.e_tp_dg) + "_MEM" +
+                            system_config.memory_type + "_maxbatch" +
                             std::to_string(max_batch_size) + "_maxprocess" +
                             std::to_string(max_process_token) + "_iter" +
                             std::to_string(total_iter) + 
@@ -736,7 +745,10 @@ int main(int argc, char *argv[]) {
                             "_N" + std::to_string(num_node) + "_D" + 
                             std::to_string(num_device) + "_TP" +
                             std::to_string(ne_tp_dg) + "_DP" +
-                            std::to_string(ne_dp_dg) + "_maxbatch" +
+                            // EP + memory preset in the name: EP-sibling candidates at the same (TP,DP,batch) and same-worker different-preset cells must not clobber each other's CSV (Fig-5 breakdown source)
+                            std::to_string(ne_dp_dg) + "_EP" +
+                            std::to_string(model_config.e_tp_dg) + "_MEM" +
+                            system_config.memory_type + "_maxbatch" +
                             std::to_string(max_batch_size) + "_maxprocess" +
                             std::to_string(max_process_token) + "_iter" +
                             std::to_string(total_iter) + 
@@ -752,7 +764,10 @@ int main(int argc, char *argv[]) {
                             "_N" + std::to_string(num_node) + "_D" + 
                             std::to_string(num_device) + "_TP" +
                             std::to_string(ne_tp_dg) + "_DP" +
-                            std::to_string(ne_dp_dg) + "_maxbatch" +
+                            // EP + memory preset in the name: EP-sibling candidates at the same (TP,DP,batch) and same-worker different-preset cells must not clobber each other's CSV (Fig-5 breakdown source)
+                            std::to_string(ne_dp_dg) + "_EP" +
+                            std::to_string(model_config.e_tp_dg) + "_MEM" +
+                            system_config.memory_type + "_maxbatch" +
                             std::to_string(max_batch_size) + "_maxprocess" +
                             std::to_string(max_process_token) + "_iter" +
                             std::to_string(total_iter) + 
@@ -766,7 +781,10 @@ int main(int argc, char *argv[]) {
                             "_N" + std::to_string(num_node) + "_D" + 
                             std::to_string(num_device) + "_TP" +
                             std::to_string(ne_tp_dg) + "_DP" +
-                            std::to_string(ne_dp_dg) + "_maxbatch" +
+                            // EP + memory preset in the name: EP-sibling candidates at the same (TP,DP,batch) and same-worker different-preset cells must not clobber each other's CSV (Fig-5 breakdown source)
+                            std::to_string(ne_dp_dg) + "_EP" +
+                            std::to_string(model_config.e_tp_dg) + "_MEM" +
+                            system_config.memory_type + "_maxbatch" +
                             std::to_string(max_batch_size) + "_maxprocess" +
                             std::to_string(max_process_token) + "_iter" +
                             std::to_string(total_iter) + 

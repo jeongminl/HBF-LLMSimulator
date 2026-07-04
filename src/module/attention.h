@@ -55,12 +55,12 @@ class SelfAttentionSum : public Module {
   using Ptr = std::shared_ptr<SelfAttentionSum>;
   [[nodiscard]] static Ptr Create(std::string prefix, std::string name,
                                   int head_dim, int num_heads, int num_kv_heads,
-                                  int max_seq_len, int batch_size, int qk_rope_head_dim, 
+                                  int max_seq_len, int batch_size, int qk_rope_head_dim,
                                   std::vector<int> device_list,
-                                  Device::Ptr device) {
+                                  Device::Ptr device, int gen_max_seq_len = -1) {
     Ptr ptr = Ptr(new SelfAttentionSum(prefix, name, head_dim, num_heads,
                                        num_kv_heads, max_seq_len, batch_size, qk_rope_head_dim,
-                                       device_list, device));
+                                       device_list, device, gen_max_seq_len));
     ptr->set_tensor_module();
     return ptr;
   };
@@ -69,7 +69,7 @@ class SelfAttentionSum : public Module {
   SelfAttentionSum(std::string& prefix, std::string& name, int head_dim,
                    int num_heads, int num_kv_heads, int max_seq_len,
                    int batch_size, int qk_rope_head_dim, std::vector<int> device_list,
-                   Device::Ptr device);
+                   Device::Ptr device, int gen_max_seq_len = -1);
   SelfAttentionSum() = default;
 
   Tensor::Ptr forward(const Tensor::Ptr input,
@@ -81,6 +81,14 @@ class SelfAttentionSum : public Module {
   int num_heads;
   int num_kv_heads;
   int qk_rope_head_dim;
+  // Per-layer local-attention window (Llama-4-style iRoPE), mirroring
+  // SelfAttentionGen::max_seq_len / model/model_config.h's effectiveKvLen(): caller
+  // (module/parallel.cpp) passes resolved_gen_max_seq_len here. Stored SEPARATELY
+  // from max_seq_len (unlike Gen) because the Sum output tensor must stay sized at
+  // the full prefill sequence length -- only the scoring/context dimension is
+  // capped, in forward(). <=0 (the default) or == max_seq_len means "global
+  // attention, no cap" (every model except llama4_maverick/llama4_scout).
+  int local_attention_window;
   // std::vector<int> device_list;
 };
 

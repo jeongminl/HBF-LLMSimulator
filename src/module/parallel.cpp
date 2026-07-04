@@ -156,10 +156,14 @@ SelfAttentionParallel::SelfAttentionParallel(std::string& prefix,
   device);
   add_module(attention_split);
 
+  // AttentionSum's tensor allocation stays at the full max_seq_len (every prefill
+  // token needs an output slot), but its scoring/context read is capped at
+  // resolved_gen_max_seq_len -- same windowed value AttentionGen gets below --
+  // mirroring the Gen path's iRoPE local-attention handling for the prefill phase.
   Module::Ptr attention_sum = SelfAttentionSum::Create(
   module_map_name, "AttentionSum", head_dim, num_heads / parallel_num,
   num_kv_heads / parallel_num, max_seq_len, batch_size, qk_rope_head_dim, device_list,
-  device);
+  device, resolved_gen_max_seq_len);
   add_module(attention_sum);
 
   // AttentionGen (decode-phase) is the only sub-module that gets the

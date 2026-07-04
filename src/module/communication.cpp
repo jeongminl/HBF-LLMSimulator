@@ -175,15 +175,18 @@ Tensor::Ptr MoEScatter::forward(const Tensor::Ptr input,
     send_time = std::max(intra_node_latency, inter_node_latency);
   }
   else if (sequences_metadata->get_gen_process_token() > 0){
-    // decode - use only InifiniBand, but when num_node == 1, use NVLink
-    if(device->config.num_node == 1){
-      send_time = (intra_node_comm_size + inter_node_comm_size) / device->config.device_ict_bandwidth * 1000 * 1000 * 1000
-      + device->config.device_ict_latency;
-    }
-    else{
-      send_time = (intra_node_comm_size + inter_node_comm_size) / device->config.node_ict_bandwidth * 1000 * 1000 * 1000
-      + device->config.node_ict_latency;
-    }
+    // decode - same physical links as prefill: intra-node bytes ride NVLink,
+    // inter-node bytes ride InfiniBand, and the two links run concurrently
+    // (max composition). A zero-byte direction charges nothing. At
+    // num_node == 1 inter_node_comm_size is structurally 0, so this reduces
+    // to the old NVLink-only path bit-for-bit.
+    time_ns intra_node_latency = intra_node_comm_size > 0 ?
+        intra_node_comm_size / device->config.device_ict_bandwidth * 1000 * 1000 * 1000
+        + device->config.device_ict_latency : 0;
+    time_ns inter_node_latency = inter_node_comm_size > 0 ?
+        inter_node_comm_size / device->config.node_ict_bandwidth * 1000 * 1000 * 1000
+        + device->config.node_ict_latency : 0;
+    send_time = std::max(intra_node_latency, inter_node_latency);
   }
 
   // Receive time //
@@ -244,15 +247,18 @@ Tensor::Ptr MoEScatter::forward(const Tensor::Ptr input,
     receive_time = std::max(intra_node_latency, inter_node_latency);
   }
   else if (sequences_metadata->get_gen_process_token() > 0){
-    // decode - use only InifiniBand, but when num_node == 1, use NVLink
-    if(device->config.num_node == 1){
-      receive_time = (intra_node_comm_size + inter_node_comm_size) / device->config.device_ict_bandwidth * 1000 * 1000 * 1000
-      + device->config.device_ict_latency;
-    }
-    else{
-      receive_time = (intra_node_comm_size + inter_node_comm_size) / device->config.node_ict_bandwidth * 1000 * 1000 * 1000
-      + device->config.node_ict_latency;
-    }
+    // decode - same physical links as prefill: intra-node bytes ride NVLink,
+    // inter-node bytes ride InfiniBand, and the two links run concurrently
+    // (max composition). A zero-byte direction charges nothing. At
+    // num_node == 1 inter_node_comm_size is structurally 0, so this reduces
+    // to the old NVLink-only path bit-for-bit.
+    time_ns intra_node_latency = intra_node_comm_size > 0 ?
+        intra_node_comm_size / device->config.device_ict_bandwidth * 1000 * 1000 * 1000
+        + device->config.device_ict_latency : 0;
+    time_ns inter_node_latency = inter_node_comm_size > 0 ?
+        inter_node_comm_size / device->config.node_ict_bandwidth * 1000 * 1000 * 1000
+        + device->config.node_ict_latency : 0;
+    receive_time = std::max(intra_node_latency, inter_node_latency);
   }
 
   total_time = std::max(send_time, receive_time);
@@ -368,15 +374,18 @@ TensorVec MoEGather::forward(const TensorVec input_vec,
     receive_time = std::max(intra_node_latency, inter_node_latency);
   }
   else if (sequences_metadata->get_gen_process_token() > 0){
-    // decode - use only InifiniBand, but when num_node == 1, use NVLink
-    if(device->config.num_node == 1){
-      receive_time = (intra_node_comm_size + inter_node_comm_size) / device->config.device_ict_bandwidth * 1000 * 1000 * 1000
-      + device->config.device_ict_latency;
-    }
-    else{
-      receive_time = (intra_node_comm_size + inter_node_comm_size) / device->config.node_ict_bandwidth * 1000 * 1000 * 1000
-      + device->config.node_ict_latency;
-    }
+    // decode - same physical links as prefill: intra-node bytes ride NVLink,
+    // inter-node bytes ride InfiniBand, and the two links run concurrently
+    // (max composition). A zero-byte direction charges nothing. At
+    // num_node == 1 inter_node_comm_size is structurally 0, so this reduces
+    // to the old NVLink-only path bit-for-bit.
+    time_ns intra_node_latency = intra_node_comm_size > 0 ?
+        intra_node_comm_size / device->config.device_ict_bandwidth * 1000 * 1000 * 1000
+        + device->config.device_ict_latency : 0;
+    time_ns inter_node_latency = inter_node_comm_size > 0 ?
+        inter_node_comm_size / device->config.node_ict_bandwidth * 1000 * 1000 * 1000
+        + device->config.node_ict_latency : 0;
+    receive_time = std::max(intra_node_latency, inter_node_latency);
   }
 
   // Send time //
@@ -437,15 +446,18 @@ TensorVec MoEGather::forward(const TensorVec input_vec,
     send_time = std::max(intra_node_latency, inter_node_latency);
   }
   else if (sequences_metadata->get_gen_process_token() > 0){
-    // decode - use only InifiniBand, but when num_node == 1, use NVLink
-    if(device->config.num_node == 1){
-      send_time = (intra_node_comm_size + inter_node_comm_size) / device->config.device_ict_bandwidth * 1000 * 1000 * 1000
-      + device->config.device_ict_latency;
-    }
-    else{
-      send_time = (intra_node_comm_size + inter_node_comm_size) / device->config.node_ict_bandwidth * 1000 * 1000 * 1000
-      + device->config.node_ict_latency;
-    }
+    // decode - same physical links as prefill: intra-node bytes ride NVLink,
+    // inter-node bytes ride InfiniBand, and the two links run concurrently
+    // (max composition). A zero-byte direction charges nothing. At
+    // num_node == 1 inter_node_comm_size is structurally 0, so this reduces
+    // to the old NVLink-only path bit-for-bit.
+    time_ns intra_node_latency = intra_node_comm_size > 0 ?
+        intra_node_comm_size / device->config.device_ict_bandwidth * 1000 * 1000 * 1000
+        + device->config.device_ict_latency : 0;
+    time_ns inter_node_latency = inter_node_comm_size > 0 ?
+        inter_node_comm_size / device->config.node_ict_bandwidth * 1000 * 1000 * 1000
+        + device->config.node_ict_latency : 0;
+    send_time = std::max(intra_node_latency, inter_node_latency);
   }
 
   total_time = std::max(send_time, receive_time);

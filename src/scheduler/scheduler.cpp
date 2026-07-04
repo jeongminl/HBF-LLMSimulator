@@ -40,7 +40,7 @@ void Scheduler::initRunningQueue() {
   }
 }
 
-void Scheduler::pushDummySeq(int input_len, int output_len) {
+void Scheduler::pushDummySeq(int input_len, int output_len, int idx, int count) {
   // QUIRK (guide §16 / not in BUGS.md or BUGS_HIDDEN_BY_FLAGS.md): this whole block
   // -- norm_dist_value, the rejection loop below, and delta -- computes a per-sequence
   // length-jitter value that is NEVER applied: the three lines that would consume it
@@ -96,14 +96,39 @@ void Scheduler::pushDummySeq(int input_len, int output_len) {
     new_seq->total_len = input_len;
   }
   else if(system_config.decode_mode){
-    // Steady-state decode: under continuous batching with arrival rate
-    // matching completion rate (paper SS-III), in-flight queries are uniformly
-    // distributed over their output lifetime, so the representative context is
-    // input + output/2 — not start-of-generation (input), which under-charged
-    // the context-linear attention cost by output/2 tokens (~10% of context on
-    // SHORT, ~4% MID, ~0.5% LONG). Capacity/KV-write admission accounting are
-    // config-driven (full input+output lifetime) and unaffected by this seed.
-    new_seq->current_len = input_len + output_len / 2; // for decode mode
+    // Steady-state decode: under continuous batching with arrival rate matching
+    // completion rate (paper SS-III), in-flight queries are uniformly distributed
+    // over their output lifetime, so the POPULATION's mean context is input +
+    // output/2 at every tick (matching the optimizer's steady_ctx,
+    // parallelism_optimizer.cpp:404-408) -- not start-of-generation (input), which
+    // under-charged the context-linear attention cost by output/2 tokens (~10% of
+    // context on SHORT, ~4% MID, ~0.5% LONG).
+    //
+    // The INITIAL fill must realize that population mean as a uniform SNAPSHOT
+    // across the generation lifetime, not a single cohort all seeded at the
+    // midpoint: seeding every dummy at exactly input+output/2 makes them all
+    // advance in lockstep, so hittingQueue(N)'s periodic sampling always lands on
+    // the same phase of the cycle instead of the intended steady-state average
+    // (measured drift: SHORT's sampled context read 1988-1996 instead of the
+    // intended ~1846). Staggering idx/count sequences evenly across [0, output_len)
+    // reproduces the uniform-snapshot population at t=0 and keeps it uniform
+    // forever after (steady-state refills below enter at start-of-generation,
+    // maintaining the same age distribution as sequences complete and are replaced).
+    //
+    // The output_len-2 clamp keeps the stagger strictly inside the sequence's
+    // lifetime: updateScheduler's completion check (current_len == total_len) runs
+    // AFTER advancing current_len by one step, so a dummy seeded at exactly
+    // total_len-1 would complete on its very first step, but one seeded at
+    // total_len would never satisfy the equality test post-increment and would
+    // become a zombie that never gets collected.
+    if (!initial_fill_done) {
+      long long offset = (long long)idx * output_len / std::max(count, 1);
+      offset = std::min(offset, (long long)(output_len - 2));
+      if (offset < 0) offset = 0;
+      new_seq->current_len = input_len + offset;
+    } else {
+      new_seq->current_len = input_len; // steady-state refill: enters at start-of-generation
+    }
   }
   new_seq->get_expert_from_list = false;
   sequence_queue.push_back(new_seq);
@@ -118,7 +143,7 @@ void Scheduler::pushSeq(int num_seq) {
       std::cout << "output_len is modfied to " << model_config.output_len << std::endl;
     }
     for(int i = 0; i < num_seq; i ++){
-      pushDummySeq(model_config.input_len, model_config.output_len);
+      pushDummySeq(model_config.input_len, model_config.output_len, i, num_seq);
     }
   } else {
     pushRealSeq(num_seq);
@@ -199,7 +224,10 @@ std::set<int> Scheduler::getZipfianRandomExpert(std::vector<double> weight, int 
   static const int kStrideCandidates[] = {17, 19, 23, 29, 31, 1};
   int stride = 1;
   for (int s : kStrideCandidates) {
-    if (std::gcd(s, n) == 1) { stride = s; break; }
+    // Coprimality alone admits s == identity whenever s ≡ 1 (mod n) (e.g. stride 17
+    // with n in {8, 16}): that leaves hot experts contiguous, defeating the whole
+    // point of this permutation. Reject those candidates too.
+    if (std::gcd(s, n) == 1 && (s % n) != 1) { stride = s; break; }
   }
 
   std::set<int> route;

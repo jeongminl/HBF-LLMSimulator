@@ -170,6 +170,19 @@ def compare_fig6(paper_df, sim_df):
     # factor in the sim table).
     metric_map = {"TPS Ratio": "TPS/GPU", "Batch Ratio": "Batch Size"}
 
+    # The sim writer emits the SLO label "Offline (24h)" (run_experiments.py:1573)
+    # while the paper readings use "offline"; without normalizing both frames'
+    # SLO column to a common spelling, the merge below silently drops every
+    # offline row (12 pairs) instead of matching them.
+    def _normalize_slo(value):
+        s = str(value).strip()
+        return "offline" if s.lower().startswith("offline") else s
+
+    paper_df = paper_df.copy()
+    sim_df = sim_df.copy()
+    paper_df["SLO"] = paper_df["SLO"].apply(_normalize_slo)
+    sim_df["SLO"] = sim_df["SLO"].apply(_normalize_slo)
+
     paper_long = paper_df.melt(
         id_vars=["Model", "Memory", "SLO", "Metric"],
         value_vars=["4 GPU", "8 GPU", "16 GPU"],

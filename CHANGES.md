@@ -1153,3 +1153,115 @@ PAPER_ANCHOR_SHEET.md exact red labels, visual bars ±0.1-0.15 norm):**
 llama3 SHORT/MID TPS reading fast = the outstanding MFU counterpart of item 49 (documented,
 deliberate). llama4 HBM4 SHORT batch +6.2%: the search now reaches TP=2's true capacity ceiling
 (488.5/GPU) — see PAPER_INCONSISTENCIES.md Residual-1 (resolved: capacity mechanism, not comm).
+
+## Fourth-pass independent bug hunt (2026-07-04) — items 51-57
+
+Run with the same independence protocol as the third pass (10 blind Opus finder tracks + 6
+Sonnet adversarial refuters + targeted verification runs; finders saw only the SUBJECTS of prior
+findings, never the explanations; convergence checked post-hoc). Full finding records, refuter
+verdicts, verification-run numbers and the convergence ledger live in `FINDINGS_REGISTER.md`'s
+"Fourth-pass register". Blind re-investigations of U5, U7 and Residual-1 all CONVERGED on the
+documented dispositions with sharper evidence (see PAPER_INCONSISTENCIES.md). All fixes below are
+grounded in technical correctness or the paper's stated methodology; nothing was calibrated to a
+paper number. Gate: 13-cell regression re-run post-fix — every ≤8-GPU cell bit-identical
+(forced-run tpots byte-equal), only the 16-GPU LONG cell moved (174→175/GPU, TPS +0.4%), as the
+fix predicts.
+
+51. **MoE all-to-all DECODE branches made node-aware with concurrent-link max composition**
+    (`communication.cpp`, 4 sites: MoEScatter send+receive, MoEGather receive+send). The decode
+    branch at `num_node>1` charged (intra+inter)/IB — intra-node expert-dispatch bytes priced on
+    the 100 GB/s inter-node link and serialized with the cross-node bytes — while the prefill
+    branch, AllReduce and PipelineStage all use per-communication node gating. No NIC-gateway
+    model exists anywhere to justify the sum; contradicts the paper's Assumption 4 (NVLink
+    intra-node / IB inter-node). Now: intra bytes on NVLink, inter bytes on IB,
+    `max(intra, inter)` with zero-byte directions charging nothing. At `num_node==1` this reduces
+    bit-for-bit to the old path (verified: 8-GPU forced-run tpots byte-identical pre/post).
+    Run-verified at llama4/HBM4/16-GPU MID (winner TP2/EP4/DP8, batch 2432): communication
+    4.80→1.95 ms/step, comm share 19.1%→8.7% (paper Fig-5 reads ~3.9%), tpot −11.4%.
+    **Refuter-confirmed (survived all 4 adversarial angles) before the fix was written.**
+
+52. **Optimizer MoE a2a mirror of item 51** (`parallelism_optimizer.cpp` MoE-comm block): the
+    single-link `multi_node ? IB : NVLink` selection replaced by the same node-aware split
+    (local-node crossing fraction on NVLink, remote fraction on IB, max composition, zero-fraction
+    guard), assuming contiguous stages/groups. Estimate-only and strictly ≤ the old cost →
+    prune-safe direction (seed_tps upper bound preserved). Also corrects item 42's description
+    ("decode link = node_ict when num_node>1"), which had faithfully mirrored the live bug.
+
+53. **Optimizer MoE FFN compute now counts the always-on shared expert**
+    (`parallelism_optimizer.cpp`): `mlp_weights_params` used `top_k` active experts only, while
+    the live sim runs the shared expert over the full per-device batch (`expert.cpp`) — a ~50%
+    per-token MoE compute undercount for llama4_maverick (top_k=1 + 1 shared). Refuter-proven
+    prune-safe before fixing (undercounted compute → est_lat lower → seed_tps still an upper
+    bound; `Optimize()`'s misranking path is bypassed by the sweep) — hygiene fix for
+    estimate/live parity. Empirical A/B: `HBF_DISABLE_CONFIG_PRUNING=1` on llama4/HBF+/8/LONG
+    (30 configs, 0 pruned) reproduces the pruned winner exactly (tp2/dp4, 169/GPU, TPS 1692.07).
+
+54. **Per-run CSV filename now encodes EP and the memory preset** (`eval/test.cpp`, all filename
+    builders: `_EP{e_tp_dg}_MEM{memory_type}`). The name previously encoded TP/DP/batch but not
+    EP or memory preset, and the CSV write is an unconditional truncate before the SLO check —
+    so an EP-sibling candidate probed at the same (TP,PP,DP,batch) after the winner (batch grid
+    is EP-invariant: capacity/latency hints barely move across EP), or a same-worker later cell
+    differing only in preset, silently overwrote the winner's Fig-5 breakdown source
+    (`parse_csv_breakdown` runs at end of `main()` on the stored path string). tpot/batch/TPS
+    were never affected (parsed from stdout). Dense llama3 was immune; llama4 Fig-5 cells were
+    at risk, with `communication` the most EP-sensitive column. Verified: no harness code parses
+    the filename structurally (path captured from stdout).
+
+55. **Pseudo-channel command-count copy-paste typo** (`device.cpp` `run_ideal`):
+    `rw_cmd_to_pCH_1` tested `% num_channel == 1` where the pCH_0 twin tests `== 0`. Found
+    independently by two blind finders. Affects only the hand-computed DRAM access counters that
+    feed the CSV energy columns — which (also established this pass) no reported figure consumes.
+
+56. **Capacity-gate OOM messages now print GiB truthfully** (`footprint.h`, `cluster.cpp`
+    `checkMemorySize`): binary-byte quantities were divided by 1e9 and labeled "GB", contradicting
+    the code's own comments (e.g. printing "3848 GB" for the 3584-GiB flash pool). Display-only;
+    the `classify_failure` marker substrings are unchanged.
+
+57. **`Node::node_ict_*` dead-field warning comment** (`node.cpp`): the constructor initializes
+    these from the intra-node NVLink constants and nothing ever reads them — flagged so a future
+    reader doesn't trust them for an inter-node link.
+
+### Fourth-pass verdicts that are deliberately NOT fixes
+
+- **Energy/ramulator path is decorative end-to-end** (two independent traces): `use_ramulator`
+  is off in every sweep (all presets default false) — kernel timing is fully analytic; the DRAM
+  access counters come from `run_ideal`; the CSV energy columns are written but read by nothing
+  (Fig-5 is time-based; Fig-7 PEC is geometry-based; the paper reports no energy figure). Also:
+  the ramulator YAML is chosen by gpu_gen only — every preset maps to an HBM3-class config, so
+  enabling `use_ramulator` for a flash preset would silently model HBM3E (landmine documented in
+  FINDINGS_REGISTER). `data_object.cpp` confirmed dead. power.h's `X4`/`X16` comments disagree 2×
+  with the ×8/×32 code factors, and `kMAC` is uncited with an unexplained /2 — provenance notes
+  only, on unread columns.
+- **GB-vs-GiB capacities: undecidable from the paper, binary convention kept** — Table I's
+  totals are linear combinations of 36 and 512 so the unit cancels (exact in both conventions);
+  no formula mixes 1e9 with 2^30; and the Residual-1 re-investigation added a decisive
+  corroboration: DP-pure at 288 GiB reproduces the paper's 460/GPU anchor EXACTLY, while 288
+  decimal GB would give ~428 → the paper's own tool evidently used GiB.
+- **FlashAttention score-traffic + MFU pair: REMAINS DEFERRED, rationale corrected.** Blind
+  finders re-derived both halves exactly (score fraction = G/(G+head_dim) = 11.1%/3.76% of
+  attention memory; MFU≡1). Three refuters then established: (i) `use_flash_attention` is
+  STRUCTURALLY an MLA-only flag (the GQA attention classes have no such member — symmetric scope
+  gap, not selective breakage); the paper never mentions FlashAttention and its "chunked
+  attention" extension is the HBF SRAM-staging mechanism — so charging score bytes is plausibly
+  paper-CONFORMANT; (ii) there is NO structural cancellation between the two halves: score bytes
+  are identically zero on HBF+/CONV+ (act-tier guard) and bounded below the KV-read max on HBF
+  (act/kv = 7·G/head_dim < 1 for both models) — they are live only on the plain-HBM4 sum path;
+  (iii) measured MFU sensitivity (forced llama3/HBM4/8, mfu_max=0.5): SHORT tpot +33.6%, MID
+  +8.0% — the GEMM M-basis is per-DP-replica tokens, so SHORT cells are compute-sensitive; any
+  MFU value is still unanchored by the paper → fitting one remains forbidden. Additionally the
+  MFU knob itself is MISKEYED (decode-attention call sites pass per-op m=1, contradicting
+  hardware_config.h's own "batch*tokens" doc comment) — dormant at defaults; must be fixed
+  before any future MFU-sensitivity work (recorded, not fixed: the correct aggregation is a
+  modeling decision).
+- **Fig-6 normalization**: the sim normalizes each SLO row-group to that SLO's own 8-GPU HBM4
+  cell; the paper's caption says one fixed baseline per workload. Since HBM4 is SLO-invariant
+  (capacity-bound), the two conventions are numerically equivalent — but the paper's own plotted
+  8-GPU HBM4 points read ~0.84 (TPS) / 0.64 (batch), i.e. NOT 1.0 under ANY reading of its own
+  caption, while the paper-text ratio claims (e.g. "+14.8% offline at 16 GPUs") match the
+  readings' RELATIVE values. Verdict: paper-side absolute-scale anomaly (or pixel-calibration
+  artifact on near-zero bars — the readings file itself warns of this); no sim change. Fig-6
+  comparison error rates carry a structural ~16-19% (TPS) component from this — flag when
+  reading `compare_error_rates.py` output.
+- **`classify_failure` maps "HBM capacity exceeded" into the "flash" bucket** — semantically a
+  "capacity" label; harmless (Fig-3 hatching only consults "sram"). Doc-note only to avoid
+  churning downstream consumers of `bound_reason`.

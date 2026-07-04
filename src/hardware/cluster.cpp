@@ -154,9 +154,13 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
         // MoE FFN — routed experts at expert_batch_size; the SHARED expert is
         // dense (sees the full per-device batch; expert.cpp passes the whole
         // input) and is TP-sharded on the ne_tp group at runtime.
+        // Column-parallel gate/up/silu over e_tp (expert.cpp:84): shard width is
+        // expert_intermediate_dim/e_tp_dg; num_routed_expert_per_device already
+        // carries the x e_tp_dg expert-count factor, so full width double-counts it.
+        // Down-proj stays full width (row-parallel input).
         num_routed_expert_per_device *
-        (2.0 * (expert_batch_size * input_len * expert_intermediate_dim) + // gate proj out + silu out
-        (expert_batch_size * input_len * expert_intermediate_dim) + // up proj out
+        (2.0 * (expert_batch_size * input_len * expert_intermediate_dim / e_tp_dg) + // gate proj out + silu out
+        (expert_batch_size * input_len * expert_intermediate_dim / e_tp_dg) + // up proj out
         (expert_batch_size * input_len * hidden_dim)) +  // down proj out
         (double)device->model_config.num_shared_expert *
         (2.0 * ((double)batch_size_per_dp * input_len * expert_intermediate_dim / ne_tp_dg) +
@@ -183,9 +187,13 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
         // MoE FFN — routed experts at expert_batch_size; the SHARED expert is
         // dense (sees the full per-device batch; expert.cpp passes the whole
         // input) and is TP-sharded on the ne_tp group at runtime.
+        // Column-parallel gate/up/silu over e_tp (expert.cpp:84): shard width is
+        // expert_intermediate_dim/e_tp_dg; num_routed_expert_per_device already
+        // carries the x e_tp_dg expert-count factor, so full width double-counts it.
+        // Down-proj stays full width (row-parallel input).
         num_routed_expert_per_device *
-        (2.0 * (expert_batch_size * input_len * expert_intermediate_dim) + // gate proj out + silu out
-        (expert_batch_size * input_len * expert_intermediate_dim) + // up proj out
+        (2.0 * (expert_batch_size * input_len * expert_intermediate_dim / e_tp_dg) + // gate proj out + silu out
+        (expert_batch_size * input_len * expert_intermediate_dim / e_tp_dg) + // up proj out
         (expert_batch_size * input_len * hidden_dim)) +  // down proj out
         (double)device->model_config.num_shared_expert *
         (2.0 * ((double)batch_size_per_dp * input_len * expert_intermediate_dim / ne_tp_dg) +
@@ -310,8 +318,17 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
   // checkCapacity() (footprint.h), which never sums activation into the flash-pool
   // comparison. For plain HBM systems (no scarce tier), this lumped act+weight+kv check
   // is the sole legitimate capacity gate, so activation must stay included there.
+  // Mirrors footprint.h checkCapacity()'s flash_cap: the reserved HBM stack(s) back the
+  // activation tier above, not weight+KV, so they must come out of the flash pool here
+  // too (0 for HBF+/CONV+ where num_hbm_stacks==0; also 0 for HBM4, which never reaches
+  // this branch since hasScarceTier() is false there).
+  double capacity_limit = config.memory_capacity;
+  if (hasScarceTier(config)) {
+    capacity_limit -= (double)config.hbf_config.num_hbm_stacks *
+                      (double)config.hbf_config.hbm_per_stack_bytes;
+  }
   double size_for_capacity_gate = hasScarceTier(config) ? (size - activation_size) : size;
-  if (size_for_capacity_gate > config.memory_capacity) {
+  if (size_for_capacity_gate > capacity_limit) {
     out_of_memory = true;
     // Descriptive marker for the sweep's bound_reason classifier
     // (run_experiments.py::classify_failure). Without it, a forced-distribution
@@ -320,8 +337,8 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
     // bound. Wording matches classify_failure's expected substrings.
     std::cout << (hasScarceTier(config) ? "Flash capacity exceeded"
                                         : "HBM capacity exceeded")
-              << ": weight+kv " << size_for_capacity_gate / 1e9 << "GB > "
-              << config.memory_capacity / 1e9 << "GB" << std::endl;
+              << ": weight+kv " << size_for_capacity_gate / 1073741824.0 << "GiB > "
+              << capacity_limit / 1073741824.0 << "GiB" << std::endl;
     if (config.exit_out_of_memory) {
       return true;
     } else if (config.mem_cap_limit == true){
@@ -333,32 +350,38 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
           device->model_config.num_layers * device->model_config.precision_byte;
       }
       else{
+        // effectiveKvLenSumAllLayers() replaces the raw "(input+output) * num_layers"
+        // factor so iRoPE local layers (attn_chunk_size>0) are capped at their bounded
+        // window here too, matching the timing/capacity KV sizing elsewhere
+        // (parallelism_optimizer.cpp / footprint.h). Reduces exactly to the old
+        // expression when attn_chunk_size==0.
         kv_cache_size_per_seq =
             2.0 *
-            (device->model_config.input_len + device->model_config.output_len) *
-            device->model_config.num_layers * device->model_config.head_dim *
+            effectiveKvLenSumAllLayers(device->model_config,
+                device->model_config.input_len + device->model_config.output_len) *
+            device->model_config.head_dim *
             device->model_config.num_kv_heads / device->model_config.ne_tp_dg *
             device->model_config.precision_byte;
       }
       hw_metric avail_capacity = 0;
       if(device->model_config.q_lora_rank == 0){
         avail_capacity =
-            config.memory_capacity -
+            capacity_limit -
             (size_vector.at(0) / device->model_config.num_layers) -
             size_vector.at(1);
       }
       else{
         avail_capacity =
-            config.memory_capacity - activation_size - size_vector.at(1);
+            capacity_limit - activation_size - size_vector.at(1);
       }
 
       if (avail_capacity < 0) {
         fail("Memory capacity is smaller than model weight");
       }
       std::cout << "Available capacity for KV cache is "
-                << avail_capacity / 1024.0 / 1024 / 1024 << "GB" << std::endl;
+                << avail_capacity / 1073741824.0 << "GiB" << std::endl;
       std::cout << "KV cache per seq is "
-                << kv_cache_size_per_seq / 1024.0 / 1024 / 1024 << "GB" << std::endl;                
+                << kv_cache_size_per_seq / 1073741824.0 << "GiB" << std::endl;
       int max_batch_size =
           (int)(avail_capacity / kv_cache_size_per_seq) * scheduler->dp_degree;
       std::cout << "Modify max_batch_size to " << max_batch_size - 1
@@ -419,7 +442,7 @@ bool Cluster::checkHeteroMemorySize() {
       std::cout << "Available capacity for KV cache is "
                 << avail_capacity / 1024.0 / 1024 / 1024 << "GB" << std::endl;
       std::cout << "KV cache per seq is "
-                << kv_cache_size_per_seq / 1024.0 / 1024 / 1024 << "GB" << std::endl;                
+                << kv_cache_size_per_seq / 1024.0 / 1024 / 1024 << "GB" << std::endl;
       int max_batch_size =
           (int)(avail_capacity / kv_cache_size_per_seq) * scheduler->dp_degree;
       std::cout << "Modify max_batch_size to " << max_batch_size - 1
@@ -530,6 +553,11 @@ std::vector<Stat> Cluster::runIteration(int iter, std::string file_name) {
 
   scheduler->fillSequenceQueue();
   scheduler->fillRunningQueue();
+
+  // Initial dummy population is done: subsequent pushDummySeq calls (steady-state
+  // refills as sequences complete) must seed at start-of-generation, not the
+  // staggered initial-fill offset -- see pushDummySeq's decode_mode branch.
+  scheduler->initial_fill_done = true;
 
   // hitting
   scheduler->hittingQueue(10000);

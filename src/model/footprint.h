@@ -74,8 +74,8 @@ inline CapacityResult checkCapacity(const SystemConfig& s,
     if (weight + kv > flash_cap) {
       return {true,
               "Flash capacity exceeded (" +
-              std::to_string((weight + kv) / 1e9) + " GB > " +
-              std::to_string(flash_cap / 1e9) + " GB)"};
+              std::to_string((weight + kv) / 1073741824.0) + " GiB > " +
+              std::to_string(flash_cap / 1073741824.0) + " GiB)"};
     }
 
     // Activations live on the scarce tier (HBM stacks or logic SRAM)
@@ -95,8 +95,8 @@ inline CapacityResult checkCapacity(const SystemConfig& s,
     if (total > s.memory_capacity) {
       return {true,
               "HBM capacity exceeded (" +
-              std::to_string(total / 1e9) + " GB > " +
-              std::to_string(s.memory_capacity / 1e9) + " GB)"};
+              std::to_string(total / 1073741824.0) + " GiB > " +
+              std::to_string(s.memory_capacity / 1073741824.0) + " GiB)"};
     }
     return {false, ""};
   }
@@ -204,9 +204,15 @@ inline double peakIntermediateBytes(const ModelConfig& model,
     // input), so it must be charged at batch_per_dp, not expert_batch_size
     // (a 16x under-count for maverick at 8 GPUs). Its gate/silu/up widths are
     // TP-sharded at runtime (built on the ne_tp group), hence the /tp.
+    // Routed gate/up/silu are column-parallel over the e_tp group (expert.cpp:84),
+    // so each device's shard is only expert_intermediate_dim/e_tp wide;
+    // num_routed_expert_per_device already carries the x e_tp expert-count factor
+    // (its caller-side formula), so leaving these at full width double-counts e_tp.
+    // Down-proj is row-parallel (full input width, no e_tp division).
+    int e_tp = (model.e_tp_dg > 0) ? model.e_tp_dg : 1;
     double routed_act = num_routed_expert_per_device *
-        (2.0 * (expert_batch_size * model.expert_intermediate_dim) +  // gate proj + silu out
-         expert_batch_size * model.expert_intermediate_dim +          // up proj out
+        (2.0 * (expert_batch_size * model.expert_intermediate_dim / e_tp) +  // gate proj + silu out
+         expert_batch_size * model.expert_intermediate_dim / e_tp +          // up proj out
          expert_batch_size * hidden_dim);                             // down proj out
     double shared_act = model.num_shared_expert *
         (2.0 * (batch_per_dp * model.expert_intermediate_dim / tp) +  // gate proj + silu out

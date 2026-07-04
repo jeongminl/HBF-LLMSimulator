@@ -1798,7 +1798,7 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
       temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::GPU,
               DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
       exec_status += temp;
-      accumul_memory_duration = temp.memory_duration;
+      accumul_memory_duration += temp.memory_duration;
     }
     else{
       ExecStatus temp;
@@ -2225,7 +2225,7 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
       temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::LOGIC,
               DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
       exec_status += temp;
-      accumul_memory_duration = temp.memory_duration;
+      accumul_memory_duration += temp.memory_duration;
     }
     else{
       ExecStatus temp;
@@ -2625,7 +2625,7 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
       temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::PIM,
               DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
       exec_status += temp;
-      accumul_memory_duration = temp.memory_duration;
+      accumul_memory_duration += temp.memory_duration;
     }
     else{
       ExecStatus temp;

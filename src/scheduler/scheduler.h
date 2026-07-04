@@ -36,7 +36,7 @@ class Scheduler : public std::enable_shared_from_this<Scheduler> {
   void clear();
 
   void pushSeq(int num_seq);
-  void pushDummySeq(int input_len = 256, int max_len = 1024);
+  void pushDummySeq(int input_len = 256, int max_len = 1024, int idx = 0, int count = 1);
   void pushRealSeq(int num_seq);
 
   void initializeDummyInput(int num_seq, int input_len, int output_len);
@@ -92,6 +92,13 @@ class Scheduler : public std::enable_shared_from_this<Scheduler> {
 
   bool real_data;
   bool real_expert_data;
+
+  // Set once by Cluster::runIteration after the initial fillSequenceQueue()/
+  // fillRunningQueue() population (before hittingQueue(10000)): distinguishes the
+  // initial-fill dummy population (which staggers current_len across the generation
+  // lifetime, see pushDummySeq) from steady-state refills (which enter at
+  // start-of-generation). See pushDummySeq's decode_mode branch for the full model.
+  bool initial_fill_done = false;
 
   std::vector<Sequence::Ptr> sequence_queue;
   std::vector<BatchedSequence::Ptr> running_queue;

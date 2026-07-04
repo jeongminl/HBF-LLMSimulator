@@ -1,3 +1,94 @@
+# Findings register — FOURTH-pass bug hunt (2026-07-04)
+
+Protocol: 10 blind Opus finder tracks (F1 energy/power, F2 ramulator trace, F3 GB-vs-GiB,
+F4 roofline/MFU/flops, F5 FlashAttention score-traffic, F6 harness mechanics, F7 LmHead/node/
+CONV-presets, F8a/b/c re-blind U5/U7/Residual-1) + 6 Sonnet adversarial refuters (R1-R6) +
+targeted verification runs. Finders were denied all analysis docs AND git history; allowed only
+the paper PDF, PAPER_ANCHOR_SHEET.md, paper_figure_readings.md, src/eval/harness code. Fixes =
+CHANGES.md items 51-57. Gate: 13-cell regression, all ≤8-GPU cells bit-identical post-fix.
+
+## Convergence summary (blind verdicts vs prior docs)
+- CONVERGED + SHARPENED: U5 (F8a: weight-stream floor 72.1ms measured = 72.3ms first-principles;
+  paper-claim ledger 10/11 cells exceed the 8-GPU HBM4 anchor, the single miss IS the paper's
+  "in most cases" hedge; sim matches the paper's OWN 1-GPU bars to ~1%). U7 (F8b: the 854.7
+  flat ✕ bar and the paper-text "327" are ONE score-inclusive accounting at TWO contexts —
+  SHORT→755.6, MID→294-327 — which contradicts the paper's own unmarked MID=745 bar; sim gate
+  correct, no fix; NOTE: footprint.h's own comments reference the U7 diagnostic, a partial
+  context leak via allowed code — the convergence rests on F8b's fresh measurements).
+  Residual-1 (F8c: DP-pure ceiling = 460.00/GPU EXACT; TP=2 argmax legitimate under §III; NEW:
+  460 is only reproducible with 288 GiB — decimal GB gives ~428 — so the paper's tool used
+  binary GiB, settling F3's question too).
+- CORRECTED vs docs: the deferred score+MFU pair's "cancellation" rationale. R3 proved no
+  structural cancellation exists (score bytes ≡ 0 on HBF+/CONV+, < KV max on HBF; live only on
+  the HBM4 sum path); R1 established use_flash_attention is STRUCTURALLY MLA-only (GQA classes
+  lack the member) and the paper never mentions FlashAttention → keeping score bytes is
+  plausibly paper-conformant, a stronger keep-deferred ground than cancellation. V-MFU measured
+  mfu_max=0.5 → SHORT +33.6% / MID +8.0% tpot (M-basis = per-DP-replica tokens; R3's per-GPU
+  threshold arithmetic was wrong — orchestrator caveat, run-confirmed).
+- RESOLVED empirically: C5/I5 prune-risk — HBF_DISABLE_CONFIG_PRUNING=1 at the worst-case LONG
+  cell (30 configs, 0 pruned) reproduces the pruned winner exactly.
+- CLOSES anchor-sheet ambiguity #5: CONV/CONV+ write-BW = plane-count derivation (16/25 planes,
+  16 dies × 4 KiB / 100 µs) reconstructs Table I exactly (F7 checked-correct).
+
+## Fixed this pass (see CHANGES.md 51-57 for full records)
+- P4-1 [F7-1, R4: SURVIVES all 4 angles; run-verified] MoE a2a decode branches priced intra-node
+  bytes on IB, serialized (4 sites) → node-aware max composition. 16-GPU llama4 MID: comm share
+  19.1%→8.7% (paper ~3.9%), tpot −11.4%. ≤8-GPU bit-identical (guarded reduction).
+- P4-2 [orchestrator] Optimizer a2a mirror of P4-1 (prune-safe: new cost ≤ old).
+- P4-3 [F4-3, R5: real but impact-refuted → hygiene] Optimizer MoE compute + shared-expert flops.
+- P4-4 [F6-1, R6: SURVIVES, strengthened] CSV filename + _EP{e}_MEM{preset} → Fig-5 clobber gone.
+- P4-5 [F1-3 ≡ F2-2, convergent] device.cpp run_ideal pCH_1 %==1→==0 (energy counters only).
+- P4-6 [F3-1] OOM messages GiB labeling (display-only).
+- P4-7 [F7-2] node.cpp dead node_ict_* fields warning comment.
+
+## Doc-notes (real, deliberately not fixed)
+- N1 [F1+F2, independent convergence] Entire energy/ramulator path DECORATIVE: use_ramulator off
+  everywhere; timing analytic; energy CSV columns written, never read; paper reports no energy
+  figure. (Corrects the pre-pass exploration claim that FC/Attn/MoE energy columns are never
+  assigned — they ARE assigned, cluster.cpp:1003-1008/1263-1268, just unread.)
+- N2 [F2-1] Ramulator YAML chosen by gpu_gen only — all presets map to HBM3-class configs;
+  enabling use_ramulator on a flash preset would silently simulate HBM3E. Landmine.
+- N3 [F1-1/F1-2] power.h ×8/×32 factors vs "X4"/"X16" comments (2× self-inconsistency); kMAC
+  uncited with unexplained /2. Unread columns.
+- N4 [F4-1, R2: survives, dormant] effectiveMFU M-basis miskeyed: decode-attention sites pass
+  per-op m=1, contradicting hardware_config.h's own "batch*tokens" doc; dormant (knob never
+  enabled). MUST be fixed before any MFU-sensitivity study.
+- N5 [F4-4] Optimizer KV-write hiding budget uses QKVO-projection flops as the compute basis vs
+  the sim's score+context compute — comment claims exact match, doesn't hold at LONG. Empirically
+  no prune flip (C5-B). Hygiene candidate for a future optimizer-parity pass.
+- N6 [F6-2, R6: survives; orchestrator adjudicated vs the actual PDF figure] Fig-6 normalization:
+  sim per-SLO self-baseline ≡ caption's fixed per-workload baseline (HBM4 is SLO-invariant), but
+  the paper's own 8-GPU HBM4 points plot at ~0.84 TPS / 0.64 batch — not 1.0 under any reading
+  of its caption — while its text's RELATIVE claims match the readings. Paper-side scale anomaly
+  (or pixel-offset artifact on near-zero bars). Structural ~16-19% component in Fig-6 TPS error
+  rates; batch rows worse. No sim change.
+- N7 [F6-3] classify_failure buckets "HBM capacity exceeded" under "flash" — semantically
+  "capacity"; harmless to every current consumer.
+- N8 [F5-3/F5-4, latent] attention_mixed_impl omits score-write AND output-write (unreconciled
+  with Gen); GQA prefill sum kernel charges score round-trip like Gen (consistent, non-flash);
+  both off the paper's decode-only path.
+- N9 [F1-5, latent] StatusBoard energy fields lack initializers (safe today via value-init).
+- N10 [F1/F2] Dead code: data_object.cpp (no callers), getDramEnergyForLoad + *_energy_load.
+- N11 [F8c cosmetic] cluster.cpp HBM-gate OOM message says "weight+kv" but the gated sum
+  includes the small activation term.
+
+## Verification-run record
+- V-MFU (forced llama3/HBM4/8 tp8/dp1): SHORT 54.16→72.33ms, MID 33.14→35.79ms at mfu 0.5.
+- V-comm16 (llama4/HBM4/16 MID 2432, winner TP2/EP4/DP8): pre-fix comm 4.80ms/19.1% share;
+  post-fix 1.95ms/8.7%; tpot 25.20→22.32ms; atten_gen unchanged.
+- V-C5 (llama4/HBF+/8 LONG, pruning off): identical winner (tp2/dp4, 169/GPU, 1692.07 TPS/GPU).
+- V-classify: forced 60000-batch HBF+ SHORT → "sram" ✓.
+- F8a probes: batch sweep + boundary 177 pass/178 fail; component decomposition (FFN weight-read
+  ~58.9ms of 72.1ms floor).
+- F8b probes: analytic ceilings (tp1/ep1/dp8 cap 22,592 total = 2,824/GPU, SHORT≡MID
+  context-independent; LONG flash-bound 5,415); score-inclusive diag 755.6 (SHORT) / 293.7 (MID).
+- F8c probes: TP scan (460.00/488.5/502.5/509.5 per GPU at tp1/2/4/8, argmax tp2), OOM boundary
+  probes, matched-batch comm deficit −0.7%.
+- Post-fix 13-cell regression: all ≤8-GPU cells bit-identical; l4_HBFp_16_LONG 174→175/GPU
+  (+3.6% vs paper TPS anchor); l4_HBFp_8_SHORT completed at 2374/GPU slo (the U7 cell, vs ✕854.7).
+
+---
+
 # Findings register — third-pass bug hunt (2026-07-03)
 
 ## Phase-4 convergence summary (vs prior docs, read only after all verdicts fixed)

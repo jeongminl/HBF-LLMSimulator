@@ -91,12 +91,13 @@ SelfAttentionSum::SelfAttentionSum(std::string& prefix, std::string& name,
                                    int head_dim, int num_heads,
                                    int num_kv_heads, int max_seq_len,
                                    int batch_size, int qk_rope_head_dim, std::vector<int> device_list,
-                                   Device::Ptr device)
+                                   Device::Ptr device, int gen_max_seq_len)
     : Module(prefix, name, device, device_list, true),
       head_dim(head_dim),
       num_heads(num_heads),
       num_kv_heads(num_kv_heads),
-      qk_rope_head_dim(qk_rope_head_dim) {
+      qk_rope_head_dim(qk_rope_head_dim),
+      local_attention_window(gen_max_seq_len > 0 ? gen_max_seq_len : max_seq_len) {
   int parallel_num = device_list.size();
 
   std::vector<int> shape = {batch_size, max_seq_len, num_kv_heads, head_dim};
@@ -124,6 +125,11 @@ Tensor::Ptr SelfAttentionSum::forward(const Tensor::Ptr input,
   layer_info.head_dim = head_dim;
   layer_info.qk_rope_head_dim = qk_rope_head_dim;
   layer_info.use_chunked_attention = true; // chunked attention should always be used regardless of configuration
+  // Llama-4-style interleaved local/global attention: caps this layer's prefill-phase
+  // scoring/context read at local_attention_window (see the constructor's comment;
+  // for every model except llama4_maverick/llama4_scout's local layers, this equals
+  // max_seq_len -- full context -- so AttentionSumExecutionGPU's cap never triggers).
+  layer_info.local_attention_window = local_attention_window;
 
   std::vector<Tensor::Ptr> tensor_list;
   tensor_list.resize(0);

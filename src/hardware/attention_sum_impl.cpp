@@ -62,6 +62,11 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
     m = seq->num_process_token;
     k = head_dim;
     n = seq->current_len + seq->num_process_token;
+    // Llama-4-style interleaved local/global attention: cap this layer's scoring
+    // read at its effective window (0 = no cap, every model except
+    // llama4_maverick/scout's local layers -- see LayerInfo::local_attention_window
+    // / model_config.h), mirroring attention_gen_impl.cpp's Scoring-loop cap (:69).
+    if (layer_info.local_attention_window > 0) n = std::min(n, layer_info.local_attention_window);
 
     flops = 1.0 * m * k * n * 2.0 * num_heads;
     total_flops += flops;
@@ -174,6 +179,9 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
 
     m = seq->num_process_token;
     n = seq->current_len + seq->num_process_token;
+    // Same cap as the Scoring loop above, mirroring attention_gen_impl.cpp's
+    // Softmax-loop cap (:125).
+    if (layer_info.local_attention_window > 0) n = std::min(n, layer_info.local_attention_window);
 
     flops = 7.0 * m * n * num_heads;
     total_flops += flops;
@@ -239,6 +247,11 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
 
     m = seq->num_process_token;
     k = seq->current_len + seq->num_process_token;
+    // Llama-4-style interleaved local/global attention: same cap as the Scoring
+    // loop above, applied to k (the KV-position count) here since Context swaps
+    // k/n vs. Scoring's roles -- mirrors attention_gen_impl.cpp's Context-loop
+    // cap (:152).
+    if (layer_info.local_attention_window > 0) k = std::min(k, layer_info.local_attention_window);
     n = head_dim;
 
     flops = 1.0 * m * k * n * 2.0 * num_heads;

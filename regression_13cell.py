@@ -18,7 +18,7 @@ CELLS = [
     ("l4_HBM4_8_SHORT", "llama4_maverick", "HBM4", 8, "SHORT", 460.0, 19000.0),
     ("l4_HBM4_8_MID",   "llama4_maverick", "HBM4", 8, "MID",   151.5, 6300.0),
     ("l4_HBM4_8_LONG",  "llama4_maverick", "HBM4", 8, "LONG",  31.0,  1300.0),
-    ("l4_HBFp_8_SHORT", "llama4_maverick", "HBF+", 8, "SHORT", 759.0, None),   # 1.65x460 visual, SRAM-marked
+    ("l4_HBFp_8_SHORT", "llama4_maverick", "HBF+", 8, "SHORT", 854.7, None),   # paper_figure_readings.md #1 calibrated pixel-read (supersedes 1.65x460 rough visual)
     ("l4_HBFp_8_MID",   "llama4_maverick", "HBF+", 8, "MID",   742.0, None),   # 4.9x151.5 visual
     ("l4_HBFp_8_LONG",  "llama4_maverick", "HBF+", 8, "LONG",  None,  None),
     ("l4_HBFp_4_LONG",  "llama4_maverick", "HBF+", 4, "LONG",  None,  1495.0), # 1.15x1300 visual

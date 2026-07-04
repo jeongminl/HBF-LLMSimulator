@@ -158,8 +158,9 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
         mlp_weights_per_gpu = routed + shared;
         // Use top_k active experts (not num_routed/tp): the outer /tp in total_flops
         // provides the TP split, so no inner /tp here.  No * precision: param count.
+        // active experts per token: top_k routed + always-on shared (expert.cpp runs the shared expert over the full batch)
         mlp_weights_params  = 3.0 * hidden_dim * model_config.expert_intermediate_dim *
-                              model_config.top_k;
+                              (model_config.top_k + model_config.num_shared_expert);
       } else {
         // Dense FFN: TP-split
         mlp_weights_per_gpu = 3.0 * hidden_dim * model_config.intermediate_dim * precision / tp;
@@ -545,11 +546,15 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
         return latency_hops * lat +
                (2.0 * (n_ranks - 1) / n_ranks) * (msg_bytes / bw * 1e9);
       };
-      // Two all-reduces per layer (attention + FFN). Recurs identically on EVERY pp
-      // stage, so it stays a PER-STAGE term (added into stage_latency_ns).
+      // Two all-reduces per dense layer (attention + decoder-FFN AR, decoder.cpp:62-63/:88);
+      // ONE per MoE layer here (attention AR only -- layer.cpp:43-45/:58 -- the MoE gather AR
+      // is charged separately below as moe_comm_time's ne_tp_ar_ns, expert.cpp:113-115/:197).
+      // Recurs identically on EVERY pp stage, so it stays a PER-STAGE term (added into
+      // stage_latency_ns). Reduces to the old 2.0*layers_per_stage form when moe_layers_in_stage==0.
       double tp_comm_time = 0.0;
       if (tp > 1) {
-        tp_comm_time = 2.0 * layers_per_stage * allreduce_ns(tp, inter_stage_message_size);
+        tp_comm_time = allreduce_ns(tp, inter_stage_message_size) *
+                       (2.0 * (layers_per_stage - moe_layers_in_stage) + 1.0 * moe_layers_in_stage);
       }
 
       // MoE communication, mirroring the live modules per MoE layer
@@ -559,29 +564,45 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
       //    the volume is divided by ne_tp_dg (TP-replicated tokens are sent once);
       //  - gather: crossing fraction excludes the e_tp group and the volume is
       //    divided by e_tp_dg * ne_tp_dg (communication.cpp MoEGather);
-      //  - link: decode-path selection is device_ict when num_node == 1, node_ict
-      //    otherwise (communication.cpp decode branches);
+      //  - link: node-aware max composition, mirroring the fixed live
+      //    MoEScatter/MoEGather decode branches (communication.cpp): of the
+      //    crossing fraction, the part on the local node rides NVLink
+      //    (device_ict), the part on remote node(s) rides InfiniBand
+      //    (node_ict), the two links run concurrently (max), and a zero
+      //    fraction charges no latency;
       //  - the two all-reduces use the shared allreduce_ns model above (the e_tp
       //    group spans nodes when e_tp_dg > gpus_per_node).
       double moe_comm_time = 0.0;
       if (model_config.num_routed_expert > 0) {
-        bool multi_node = system_config.num_node > 1;
-        double link_lat = multi_node ? system_config.node_ict_latency
-                                     : system_config.device_ict_latency;
-        double link_bw  = multi_node ? system_config.node_ict_bandwidth
-                                     : system_config.device_ict_bandwidth;
         double token_bytes = batch_size_per_gpu * model_config.top_k *
                              hidden_dim * precision;
+        // Node-aware link split, mirroring the fixed live MoEScatter/MoEGather decode
+        // branches (communication.cpp): intra-node crossing bytes ride NVLink,
+        // inter-node bytes ride InfiniBand, links concurrent (max composition).
+        // Stage devices are contiguous, so a stage has max(0, devices_per_stage - gpn)
+        // devices on the remote node; the excluded group (contiguous) is local.
+        int gpn = system_config.num_device;  // GPUs per node
+        auto a2a_ns = [&](double excluded, double per_dev_bytes) -> double {
+          double local_devs  = (double)std::min(devices_per_stage, gpn);
+          double remote_devs = (double)devices_per_stage - local_devs;
+          double intra_frac = std::max(0.0, local_devs - excluded) / devices_per_stage;
+          double inter_frac = remote_devs / devices_per_stage;
+          double intra_ns = intra_frac > 0 ? system_config.device_ict_latency +
+              (intra_frac * per_dev_bytes) / system_config.device_ict_bandwidth * 1e9 : 0.0;
+          double inter_ns = inter_frac > 0 ? system_config.node_ict_latency +
+              (inter_frac * per_dev_bytes) / system_config.node_ict_bandwidth * 1e9 : 0.0;
+          return std::max(intra_ns, inter_ns);
+        };
         double scatter_ns = 0.0, gather_ns = 0.0;
         if (e_tp_dg < devices_per_stage) {
-          double scatter_frac = 1.0 - (double)tp / devices_per_stage;
-          double gather_frac  = 1.0 - (double)e_tp_dg / devices_per_stage;
-          scatter_ns = link_lat +
-                       (scatter_frac * token_bytes / tp) / link_bw * 1e9;
-          gather_ns  = link_lat +
-                       (gather_frac * token_bytes / (e_tp_dg * tp)) / link_bw * 1e9;
+          scatter_ns = a2a_ns((double)tp, token_bytes / tp);
+          gather_ns  = a2a_ns((double)e_tp_dg, token_bytes / (e_tp_dg * tp));
         }
-        double e_tp_ar_ns  = allreduce_ns(e_tp_dg, token_bytes);
+        // Live e_tp AR (expert.cpp:188, all_reduce_for_e_tp) reduces the (batch, hidden)
+        // block -- the un-duplicated input tensor -- not the top_k-duplicated scatter/gather
+        // volume above, so it gets its own message size.
+        double e_tp_ar_volume = batch_size_per_gpu * hidden_dim * precision;
+        double e_tp_ar_ns  = allreduce_ns(e_tp_dg, e_tp_ar_volume);
         double ne_tp_ar_ns = allreduce_ns(tp, inter_stage_message_size);
         moe_comm_time = moe_layers_in_stage *
                         (scatter_ns + gather_ns + e_tp_ar_ns + ne_tp_ar_ns);
