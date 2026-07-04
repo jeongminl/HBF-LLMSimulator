@@ -1,6 +1,7 @@
 #include "module/layernorm.h"
 #include "scheduler/scheduler.h"
 #include "common/assert.h"
+#include "hardware/layer_impl.h"
 
 namespace llm_system {
 
@@ -48,9 +49,13 @@ Tensor::Ptr LayerNorm::forward(const Tensor::Ptr input,
   const auto& sys_config = device->config;
   if (sys_config.use_hbf && sys_config.hbf_config.num_flash_stacks > 0) {
     const auto& hbf = sys_config.hbf_config;
-    // LayerNorm weight (gamma/beta, shape [k,1]) lives on flash.
-    double weight_bytes = (double)k * n * input->precision_byte;
-    double weight_read = weight_bytes / hbf.flash_read_bandwidth * 1e9 + hbf.flash_page_read_latency_ns;
+    // LayerNorm weight (gamma/beta, shape [k,1]) lives on flash. Route through
+    // the same amortized weight-stream helper Linear/QKVO use (m=0 isolates the
+    // weight-read term: LayerNorm's activation read/write is width k on both
+    // sides, not the Linear (m,k)->(m,n) shape getLinearMemoryDuration assumes,
+    // so it's priced separately below rather than via this call's act terms).
+    time_ns weight_read = getLinearMemoryDuration(sys_config, 0, k, n, input->precision_byte,
+                                                   0, memory_bandwidth);
     // Activations (input read + output write) are on the scarce tier.
     // When num_hbm_stacks==0 (HBF+/CONV+), activations stage in logic-die SRAM
     // (~320 MB, fast) → modeled as free to match all other ops (e.g. activation_impl.cpp).

@@ -227,6 +227,22 @@ inline double peakIntermediateBytes(const ModelConfig& model,
   }
   double ffn_total = std::max(ffn_moe, ffn_dense);
 
+  // res_1_out (the residual produced after attention, before post-attn
+  // layernorm) stays live across the whole FFN phase until residual_2 adds it
+  // back -- same persistent-carry convention attn_total already applies to its
+  // own "input/residual" term above. Added ONCE to the max(), not per branch
+  // (max(a,b)+c == max(a+c,b+c)).
+  ffn_total += batch_per_dp * hidden_dim * precision;
+
+  if (has_moe_layer && model.num_shared_expert > 0) {
+    // expert.cpp's shared-expert branch re-reads the original block input
+    // (post_attn_ln_out) AFTER the routed scatter->route->gather->all-reduce
+    // pipeline completes, so it is a second tensor concurrently live for the
+    // full FFN phase -- same shape/basis as the residual carry above. Never
+    // fires for dense llama3 or any non-shared-expert config.
+    ffn_total += batch_per_dp * hidden_dim * precision;
+  }
+
   return std::max(attn_total, ffn_total);
 }
 

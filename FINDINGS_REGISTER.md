@@ -1,3 +1,125 @@
+# Findings register — FIFTH-pass bug hunt (2026-07-04)
+
+Protocol: 9 blind Opus finder tracks (F1 scheduler lifecycle, F2 decode attention accounting, F3
+metrics/figure writers/Fig-6 re-blind, F4 config-flag leaks, F5 module-graph/time aggregation, F6
+Fig-5 bucketing pipeline, F7 U5-angle/1-GPU HBF budget, F8 U7-angle/SRAM-gate re-blind, F9
+Residual-1-angle/HBM4 capacity 3-way consistency) + 6 Sonnet adversarial refuters (R1-R6) +
+targeted verification runs. Finders were denied all analysis docs and git history; allowed only
+the paper PDF, `PAPER_ANCHOR_SHEET.md`, `paper_figure_readings.md`, and `src/eval` harness code.
+Fixes = CHANGES.md items 58-65. Gate: 13-cell regression — 6/13 (all HBM4) bit-identical, 7/13
+(all HBF/HBF+/CONV+) moved <1% each, fully mechanism-explained, zero unexplained deltas.
+
+## Finder headline summary
+- **F1 (scheduler lifecycle):** sound overall (steady-state context basis, DP refill balance,
+  warm-up all verified correct). One real-but-small finding: a bounded phase-lock-window bias
+  from the rigid age lattice sampling a non-representative segment of the completion sawtooth at
+  an arbitrary warm-up phase (+0.57% measured worst-case on a probe; bound-tabled ≤0.74% across
+  all 125 Fig-3 cells, most ≤0.25%). Doc-note only, no seeding change this pass. Also
+  independently re-found the CSV-drop bug (convergent with F5).
+- **F2 (decode attention accounting):** sound on all six audited questions (iRoPE caps, page
+  latency, roofline non-double-counting, hide budget, context basis). Found the K/V double-fill
+  bug (fixed, item 61) and a small structural HBM4 zero-KV-write nit (refuted as
+  negligible-by-construction — the paper's own Fig-5 HBM4 rows read 0.0 too).
+- **F3 (metrics/figure writers, Fig-6 re-blind):** harness metric math sound end-to-end (tpot,
+  TPS, PEC, Fig-3/4 writers). **NEW discovery:** the readings file's Fig-6 TPS column is
+  uniformly ~0.843× the caption-faithful values — a readings-file extraction error, not the
+  paper-side scale anomaly the fourth pass had concluded (see `PAPER_INCONSISTENCIES.md`). Fig-6
+  Batch rows remain separately, unexplainedly broken (~25% overshoot after any single rescale) —
+  flagged unresolved, do not naively rescale.
+- **F4 (config-flag leaks):** surfaced the unstated `skewness: 0.8` Zipf-routing assumption (the
+  paper is silent on routing distribution) and confirmed `reuse_kv_cache`/`chunk_size` dormancy
+  already known from prior passes. All other flags classified dormant or conformant.
+- **F5 (module-graph/time aggregation):** core aggregation verified correct (7-item checklist:
+  intra-device serial sum, max-over-devices reporting, TP sync-then-add, comm once-per-op,
+  etc.). Found the device-0 CSV-pinning nit (fixed, item 63) and independently re-confirmed the
+  CSV-drop bug F1 also found (fixed, item 62).
+- **F6 (Fig-5 bucketing pipeline):** sound at pp=1 (buckets sum to per-iteration latency within
+  0.011%/0.55%). **Discovered LATENT pp>1 corruption:** device-0's timeboard misses later
+  stages' work entirely and `pipeline_stage` matches no bucket — a 33% bucket-sum gap on a
+  forced tp4/pp2 probe (fixed, item 63); unreached by any current paper-compared cell (all pp=1).
+- **F7 (U5-angle, 1-GPU HBF/HBF+ non-weight budget):** clean re-derivation of the
+  weight-streaming-floor mechanism (measured 72.1ms vs 72.3ms first-principles; both anchors
+  reproduce). Found the LN weight-fill nit (fixed, item 60) and the dormant RoPE flash-BW nit
+  (hygiene, item 65).
+- **F8 (U7-angle, SRAM-gate re-blind):** byte-exact validation of the analytic ceiling (hand
+  formula = binary dump exactly). Reconfirmed the paper-internal SRAM inconsistency blind (no
+  single accounting fits all six HBF+ bars), and found the residual/block-input under-count
+  (fixed, item 58 + V-moe-liveness adjudication).
+- **F9 (Residual-1-angle, HBM4 capacity 3-way consistency):** paper anchor reproduced exactly 3
+  independent ways (live pass/OOM boundary, weight derivation, KV-lifetime consistency). Found
+  the shared-expert `/tp` bug (fixed, item 59) — which directly CONTRADICTS a prior-pass
+  documentation attribution (see below).
+
+## Refuter verdicts
+- **R1 (skewness):** mechanism CONFIRMED, framing/reachability largely REFUTED. The effect is a
+  coupon-collector hump (peaks ~13-15% at batch 100-500, saturates to ~0% by batch 1500-2500),
+  not the finder's originally-claimed monotone/preferentially-flatters-flash effect
+  (matched-batch probes: HBM4 14.76%/12.35% vs HBF+ 14.30%/11.52% — mildly the opposite). Real
+  exposure confined to llama4 LONG at 1/2/4-GPU cells (~5-10%); SHORT/MID and 8/16-GPU cells are
+  batch-saturated and unaffected. Disposition: SURFACE, no code change (paper anchors neither 0.0
+  nor 0.8).
+- **R2 (shared-expert `/tp`):** CONFIRMED, all six angles (code trace, bit-exact arithmetic,
+  independent live-probe rebisection). No published number corrupted (`cap_batch` is a bisection
+  seed only, every batch live-verified). FIX ADOPTED (item 59).
+- **R3 (SRAM residual-in-FFN-phase):** CONFIRMED byte-exact, impact LARGER than the finder's own
+  estimate (corrected ceiling tp1/ep1/dp8 2824→2600, not the finder's 2601; tp2/ep1/dp4 cap
+  5201→4488, −13.7%). Discovered the follow-on MoE block-input liveness question, referred to the
+  V-moe-liveness adjudication rather than bundled unilaterally.
+- **R4 (breakdown pinning/pp>1):** device-0 pinning (Finding A) PARTIAL — premise confirmed,
+  severity refuted in practice (0.0003% gap at real 16-GPU TP/EP winner-style configs; TP/EP sync
+  collectives erase the drift the finder worried about). pp>1 corruption (Finding B) CONFIRMED,
+  independently reproduced (66.85% gap on llama4 TP2/PP2/EP4/DP4, cross-validated against F6's
+  66.73% on llama3). Both folded into item 63's fix shape.
+- **R5 (small-op pricing cluster):** LN weight-fill and K/V double-fill both CONFIRMED-BUG, fixed
+  now (items 60, 61). HBM4 zero-KV-write REFUTED (paper's own Fig-5 reads 0.0 too; true magnitude
+  0.004-0.024%). RoPE flash-BW CONFIRMED-BUG but dormant (MLA-only path, never instantiated by
+  llama3/llama4) — hygiene fix only (item 65).
+- **R6 (window bias + CSV drop):** window bias (F1-C1) CONFIRMED mechanism, impact SMALL/localized
+  (bound-tabled ≤0.74% worst-case over all 125 Fig-3 cells, most ≤0.25%) — doc-note only, no
+  seeding change this pass (minimal-disturbance decision). CSV drop (F1-C2/F5-C5) CONFIRMED,
+  zero-risk fix ADOPTED (item 62).
+
+## V-moe-liveness adjudication — MoE shared-expert block-input liveness
+Question: does the shared expert's re-read of the original block input (`expert.cpp:204`,
+`post_attn_ln_out`, consumed AFTER the entire routed scatter→route→gather→all-reduce pipeline)
+constitute a second phase-spanning liveness term the SRAM footprint model must count, alongside
+the already-adopted residual carry (R3)? **Ruling: ADOPT variant (c) — count BOTH terms.**
+Grounds are internal-convention consistency, not paper-calibration: `decoder.cpp`'s
+`MoEDecoder::forward` computes the routed-expert and shared-expert outputs as two
+logically-parallel branches summed at `residual_2` — the model's own existing convention for
+parallel-live tensors is to count them concurrently (the same reason routed+shared weight/
+activation costs are already summed rather than maxed elsewhere, and the same reason the
+attention phase already counts its own persistent carry rather than treating it as freed). Under
+that same convention `post_attn_ln_out` cannot be modeled as freed once the routed path starts —
+the shared branch needs it concurrently until `residual_2` — so omitting it while counting the
+residual carry is the asymmetry, not a justified simplification. Rejected: variant (a)
+residual-only (asymmetric with the model's own summing convention) and variant (b)
+block-input-only (ignores R3's independently-confirmed residual omission). Implemented as item
+58; expected effect (maverick tp1/ep1/dp8): 2824 (pre-fix) → 2600 (residual only) → **2409**
+(residual + block-input, this ruling) — confirmed by the post-fix regression.
+
+## CONTRADICTS-DOC: shared-expert TP-sharding attribution
+A prior pass's documentation (`CHANGES.md`'s former item 43 / third-pass `FINDINGS_REGISTER.md`
+C12) attributed the runtime as TP-sharding the shared expert, citing the measured 106.020 GiB
+weight at TP=2 as its verification. **That attribution was factually wrong** — 106.020 GiB
+matches ONLY the full, undivided shared-expert computation (the TP=1→TP=2 weight delta decomposes
+completely into attention + dense-FFN + embed/lm_head, with zero shared-expert contribution). The
+erroneous `/tp` this pass removes from `parallelism_optimizer.cpp:157` (item 59) was very likely
+introduced by that same prior pass under the mistaken belief its own attribution was correct.
+**No published or reported number was corrupted by the error** — `cap_batch` only seeds the
+live-verified bisection search, and every reported batch is confirmed by the actual simulator
+run, not the analytic estimate.
+
+## Convergence table
+| Item | This pass's blind verdict | vs. prior-pass disposition |
+|---|---|---|
+| U5 (1-GPU HBF/HBF+ non-weight budget) | F7: weight-stream floor 72.1ms ≈ 72.3ms first-principles; sim matches the paper's own 1-GPU bars to ~1% | **CONVERGED** with fourth-pass F8a |
+| U7 (SRAM-gate paper-internal inconsistency) | F8: byte-exact ceiling reproduction; no single accounting fits all six HBF+ bars, reached blind | **CONVERGED**, and **SHARPENED** by the residual/block-input fix (item 58), which narrows but does not close the gap |
+| Residual-1 (HBM4 capacity 3-way consistency) | F9: DP-pure anchor reproduces the paper's 460/GPU exactly, 3 independent ways | **CONVERGED**, and found a genuinely NEW bug (the shared-expert `/tp`, item 59) that partially DIVERGES from a prior pass's documented mechanism (see CONTRADICTS-DOC above) |
+| Deferred score+MFU pair | Not re-derived this pass (out of scope); item 64 fixes the unrelated MFU M-basis miskeying flagged as a prerequisite for any future MFU-sensitivity work | **UNCHANGED**, still deferred; the M-basis prerequisite fix is now done |
+
+---
+
 # Findings register — FOURTH-pass bug hunt (2026-07-04)
 
 Protocol: 10 blind Opus finder tracks (F1 energy/power, F2 ramulator trace, F3 GB-vs-GiB,

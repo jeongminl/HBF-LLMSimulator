@@ -169,6 +169,8 @@ inline bool isMoELayer(const ModelConfig& mc, int layer);
 //   GQA attention: attn_qkv_proj + attn_o_proj = 2 weight tensors.
 //   MLA: q_down/kv_down/kr/q_up/(absorb extras)/o_proj -> use_absorb ? 8 : 7
 //        (same convention as the optimizer's former per-op page counts).
+//   LayerNorm: input_layer_norm + post_attn_layer_norm = 2 weight tensors per
+//        layer (layernorm.cpp), every layer regardless of dense/MoE.
 //   FFN: dense = ffn_way; MoE = router gate + resident_experts*ffn_way +
 //        num_shared_expert*ffn_way. Resident (static) expert count is used;
 //        the batch-dependent ACTIVE count can be lower, which under-exposes at
@@ -195,6 +197,7 @@ inline int weightReadOpsPerIteration(const ModelConfig& mc, int total_num_device
   int ops = 0;
   for (int layer = 0; layer < layers_per_stage; ++layer) {
     ops += attn_ops;
+    ops += 2;  // input_layer_norm + post_attn_layer_norm
     if (isMoELayer(mc, layer)) {
       ops += 1 + mc.ffn_way * experts_per_device +
              mc.ffn_way * mc.num_shared_expert;

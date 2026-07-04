@@ -46,7 +46,18 @@ Tensor::Ptr RoPE::forward(const Tensor::Ptr input,
   memory_size = (2.0 * m * k + 1.0 * sin_cos_shape[0] * sin_cos_shape[1]) * input->precision_byte;
 
   time_ns compute_duration = flops / compute_peak_flops * 1000 * 1000 * 1000;
-  time_ns memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+  time_ns memory_duration;
+  const auto& sys_config = device->config;
+  if (sys_config.use_hbf && sys_config.hbf_config.num_flash_stacks > 0) {
+    const auto& hbf = sys_config.hbf_config;
+    // RoPE touches only activations (sin/cos table + in-place Q/K rotation), no
+    // weight tensor, so it belongs on the scarce activation tier (HBM stacks or
+    // logic-die SRAM), never flash -- same tier convention as layernorm.cpp's act_time.
+    memory_duration = (hbf.num_hbm_stacks > 0)
+        ? (time_ns)(memory_size / hbf.hbm_read_bandwidth * 1e9) : 0;
+  } else {
+    memory_duration = (time_ns)(memory_size / memory_bandwidth * 1000 * 1000 * 1000);
+  }
 
   time_ns total_time = std::max(compute_duration, memory_duration);
 
@@ -105,7 +116,18 @@ TensorVec BatchedRoPE::forward(const TensorVec input,
   memory_size = (2.0 * m * k * n + 1.0 * sin_cos_shape[0] * sin_cos_shape[1]) * input[0]->precision_byte;
 
   time_ns compute_duration = flops / compute_peak_flops * 1000 * 1000 * 1000;
-  time_ns memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+  time_ns memory_duration;
+  const auto& sys_config = device->config;
+  if (sys_config.use_hbf && sys_config.hbf_config.num_flash_stacks > 0) {
+    const auto& hbf = sys_config.hbf_config;
+    // RoPE touches only activations (sin/cos table + in-place Q/K rotation), no
+    // weight tensor, so it belongs on the scarce activation tier (HBM stacks or
+    // logic-die SRAM), never flash -- same tier convention as layernorm.cpp's act_time.
+    memory_duration = (hbf.num_hbm_stacks > 0)
+        ? (time_ns)(memory_size / hbf.hbm_read_bandwidth * 1e9) : 0;
+  } else {
+    memory_duration = (time_ns)(memory_size / memory_bandwidth * 1000 * 1000 * 1000);
+  }
 
   time_ns total_time = std::max(compute_duration, memory_duration);
 

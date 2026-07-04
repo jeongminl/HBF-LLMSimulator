@@ -148,13 +148,18 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
         double routed = (double)model_config.num_routed_expert / devices_per_stage *
                         model_config.ffn_way * hidden_dim *
                         model_config.expert_intermediate_dim * precision;
-        // Shared experts: TP-sharded at runtime (expert.cpp builds shared_expert_ffn
-        // on non_moe_device_list of size ne_tp_dg = tp), so divide by tp to mirror
-        // the actually-constructed tensor bytes (verified against the live sim's
-        // recorded per-GPU weights: 116.384 GiB @ tp1 vs 106.020 GiB @ tp2).
+        // Shared experts: NOT tensor-sharded at the live-simulation level
+        // (expert.cpp builds the shared expert with use_dp=true -> a plain
+        // Linear layer via layer.cpp's else-branch, not ColumnParallel/
+        // RowParallel) -- full weight per GPU, matching the live sim's
+        // recorded per-GPU weights exactly: 116.384 GiB @ tp1 == 106.020 GiB
+        // @ tp2 (both full-shared arithmetic; /tp would predict 103.207 GiB
+        // @ tp2, which does not match). Also mirrors the latency estimate
+        // below (weight_for_latency, :266-268), which already treats the
+        // shared expert as full-size.
         double shared = (double)model_config.num_shared_expert *
                         model_config.ffn_way * hidden_dim *
-                        model_config.expert_intermediate_dim * precision / tp;
+                        model_config.expert_intermediate_dim * precision;
         mlp_weights_per_gpu = routed + shared;
         // Use top_k active experts (not num_routed/tp): the outer /tp in total_flops
         // provides the TP split, so no inner /tp here.  No * precision: param count.

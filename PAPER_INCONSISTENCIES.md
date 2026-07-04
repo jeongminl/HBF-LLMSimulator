@@ -77,6 +77,36 @@ directly rather than through intermediary docs.
 > anomaly that structurally inflates Fig-6 comparison error rates ~16-19% (TPS); (7) C5/I5
 > prune-risk closed empirically (pruning-off run reproduces the pruned winner exactly).
 
+> **Session note (2026-07-04, fifth pass): U7 reconfirmed with a real footprint fix that narrows
+> but does not close the gap; Residual-1 reconfirmed AND found a genuinely new optimizer bug that
+> CONTRADICTS a prior pass's own documentation; the fourth pass's "Fig-6 paper-side scale anomaly"
+> conclusion is CORRECTED to a readings-file extraction error; 8 new fixes (CHANGES.md items
+> 58-65).** Nine finder tracks ran blind (no analysis docs, no git history), then six adversarial
+> refuters, then targeted verification runs (records: `FINDINGS_REGISTER.md` "Fifth-pass
+> register"). Headlines: (1) the SRAM footprint model was under-counting two phase-spanning MoE
+> FFN-phase tensors — the persistent residual carry AND the shared expert's re-read of the
+> original block input — fixed on internal-convention grounds (see the V-moe-liveness
+> adjudication in `FINDINGS_REGISTER.md`), narrowing but not closing U7's paper-internal
+> inconsistency; (2) the optimizer's shared-expert capacity term was dividing by `tp` when the
+> live simulator does not TP-shard the shared expert at all — this directly CONTRADICTS a
+> prior-pass documentation claim that cited the identical 106.020 GiB measurement as evidence FOR
+> TP-sharding; no published number was corrupted (the erroneous term only seeded a bisection
+> search, and every reported batch is live-verified); (3) a corrected extraction of the readings
+> file's Fig-6 TPS rows (uniformly ~0.843× low vs the caption's own construction requirement)
+> cross-validates against Fig-4 (<1%) and the independent anchor-sheet extraction (≤2.4%) — this
+> SUPERSEDES the fourth pass's "paper-side scale anomaly" conclusion for the TPS rows specifically
+> (see the Fig-6 entry below); SURFACED as a decision for the user, not applied this pass; the
+> Fig-6 Batch rows remain separately and unexplainedly broken (~25% overshoot after any single
+> rescale) — do not naively rescale those; (4) five smaller pricing/plumbing fixes (LayerNorm
+> weight-fill amortization, K/V page-fill double-exposure, a missing final CSV flush, a device-0
+> breakdown-pinning fix for PP>1 bundled with a PP>1 energy-double-count correction, and an MFU
+> M-basis rekeying that also covers two previously-bypassed flash-MLA sites) — all either
+> bit-identical or <1% movement on the 13-cell regression, with zero unexplained deltas; (5) an
+> unstated `skewness: 0.8` routing-distribution assumption was traced to a bounded,
+> batch-saturating "coupon-collector" effect (not the monotone effect originally suspected),
+> confined to llama4 LONG at 1/2/4-GPU cells (~5-10%) — SURFACED, no code change (the paper
+> states no routing distribution to calibrate toward either way).
+
 ## Resolved — see CHANGES.md
 
 Full resolution records (original inconsistency, root cause, fix references, final verified
@@ -178,9 +208,37 @@ now tracked as Residual-1 under "Still open" above.
 
 ## Explained — not bugs
 
-### Fig-6 normalization baseline — paper-side scale anomaly (2026-07-04 fourth pass)
+### Fig-6 normalization baseline — paper-side scale anomaly (2026-07-04 fourth pass); TPS-row extraction correction (2026-07-04 fifth pass)
 
-The sim's Fig-6 writer normalizes each SLO row-group to that SLO's own 8-GPU HBM4 cell
+**FIFTH-PASS CORRECTION (2026-07-04, F3/S-fig6-check):** an independent blind re-derivation
+sharpened this item and, for the TPS rows specifically, REPLACES the fourth pass's "paper-side
+scale anomaly" conclusion with a more precise diagnosis: the readings file's own Fig-6 TPS
+column (`paper_figure_readings.md` §4) is uniformly ~0.843× the caption-faithful values — a
+**readings-file pixel-extraction error**, not a property of the paper's plotted figure. Key
+evidence: the paper's HBF+@8GPU@0.1s row reads 1.090 in the readings file; 1.090/0.843 = 1.293,
+which is EXACTLY the independent Fig-4 ratio (189.5/146.6) for the same cell — and the repo
+already carries two conflicting extractions of the same figure (`PAPER_ANCHOR_SHEET.md:179`
+reads Fig-6 HBM4@8GPU ≈ 1.0, caption-consistent, while `paper_figure_readings.md` §4 reads
+0.834-0.855/0.64). Rescaling the readings file's §4 TPS rows by `1/0.843` (≈×1.186) recovers the
+caption's own construction requirement (HBM4@8GPU ≡ 1.0) with ±1.2% residuals across every SLO,
+and the renormalized cells cross-validate against BOTH the independent Fig-4 ratios (mean|dev|
+0.97%) and the anchor sheet's own independent Fig-6 extraction (≤2.4%) — two independent
+extraction passes agreeing once renormalized is stronger evidence than the single 1.293-ratio
+datum alone (which is itself axis-rescale-invariant and non-diagnostic on its own). **DECISION
+FOR THE USER:** apply the corrected §4 TPS-row extraction (a caption-grounded ground-truth fix,
+not a calibration) — this would lower the reported Fig-6 TPS comparison error by roughly 16
+percentage points. **This pass did NOT apply it**, only documented and surfaced it; the
+structural ~15.7% TPS error floor in every current Fig-6 comparison cell stands until a decision
+is made. **Separately, and NOT resolved by this correction:** the Fig-6 Batch-row readings show a
+distinct, still-unexplained ~25% overshoot on HBF/HBF+ rows after applying any single rescale
+factor (the TPS ratio of 1.186 does not match the Batch rows' implied factor of 1.5625) — flagged
+as a separate, unresolved calibration problem; **do not naively rescale the Batch rows** using the
+TPS factor. Full derivation and the corrected 24-row table: `FINDINGS_REGISTER.md`'s "Fifth-pass
+register" (F3) and the `p5_fig6_rescale.py` output referenced there.
+
+**FOURTH-PASS conclusion (below), STANDS UNCHANGED for the Batch rows and as historical context
+for the TPS rows' original discovery:** the sim's Fig-6 writer normalizes each SLO row-group to
+that SLO's own 8-GPU HBM4 cell
 (run_experiments.py:1377-1396, :1434-1438), so sim HBM4 ratios are structurally 1.00×. The
 paper's caption states one fixed baseline — "All values are normalized to the 8-GPU HBM4 for
 each workload" — and since HBM4 is SLO-invariant (capacity-bound), the two conventions are
@@ -314,6 +372,30 @@ mechanism it demonstrates is a property of the model/hardware pair near the SLO 
 to the exact batch number, so it remains valid as illustrative evidence.)
 
 ### U7 — HBF+/CONV+ per-GPU batch grows with GPU count instead of staying flat — not a bug, a documented model divergence from the paper's tool
+
+**FIFTH-PASS RE-CONFIRMATION (2026-07-04, F8):** an independent blind re-derivation reached the
+same disposition — byte-exact validation of the analytic ceiling (hand formula = binary analytic
+dump exactly; boundary 2824 pass / 2825 fail at maverick tp1/ep1/dp8; SHORT≡MID context-
+independent) and no single accounting fits all six HBF+ bars, reached without reading this file.
+**This pass ALSO found and fixed a real correctness bug that was hiding under this item:**
+`peakIntermediateBytes`'s FFN phase omitted the persistent residual carry AND the shared expert's
+re-read of the original block input (both phase-spanning tensors under the model's own existing
+concurrent-liveness convention — see `FINDINGS_REGISTER.md`'s V-moe-liveness adjudication).
+Fixed (`CHANGES.md` item 58): the maverick tp1/ep1/dp8 analytic ceiling drops 2824→**2409**/GPU.
+The live-optimizer-selected `l4_HBFp_8_SHORT` regression cell's SRAM headroom collapsed
+accordingly — from +450/GPU (~16%) pre-fix to +31/GPU (~1.3%) post-fix against the (now tighter)
+ceiling — a near-miss that quantitatively confirms the fix engages at the predicted magnitude,
+but the cell stays `slo`-bound rather than flipping to `sram`-bound for this specific
+auto-selected config (a *different*, hand-forced `tp2/ep1/dp4` config had been used to
+demonstrate the flip in this same pass's R3 probe methodology — both figures are independently
+correct for their respective configs). **Net effect on this item's disposition: unchanged.** The
+residual/block-input fix narrows the gap between the sim's gate and the paper's ✕-marked bar, but
+does not close it — no accounting was found this pass that makes the paper's HBF+ SRAM bars
+internally self-consistent (the impossibility proof below still stands: SHORT binding at ~759
+while MID stays unbound at 742 requires an O(ctx) coefficient no physical score term satisfies).
+This remains an open paper-side (or paper-methodology-vs-simulator) inconsistency, now sitting on
+a more accurate sim-side baseline. Full derivation: `FINDINGS_REGISTER.md`'s "Fifth-pass
+register" (F8, R3, V-moe-liveness).
 
 **FOURTH-PASS BLIND RE-CONFIRMATION (2026-07-04, F8b — caveat: footprint.h's own comments
 reference the U7 diagnostic, so the code carried partial context; the evidence is fresh
@@ -617,6 +699,30 @@ can pick them up as a PAIR:
    established). Item 1 above (score-traffic + MFU pair) **remains deferred** — so llama3
    SHORT/MID TPS currently reads ~5-8% fast vs the paper (the exposed compute under-charge, no
    longer masked). A future pass deciding item 1 should re-measure those cells.
+
+3. **[SURFACED 2026-07-04 fifth pass, NOT applied] Unstated expert-routing skewness assumption
+   (`config.yaml`'s `skewness: 0.8`).** The paper is completely silent on the routing-distribution
+   used to generate its MoE results (no stated skew, no stated balance claim), but
+   `run_experiments.py`'s config-override map does not touch this key, so every Maverick MoE cell
+   in Figs 3/4/5/7 runs with an unstated Zipf skew of 0.8 baked into `config.yaml`. Blind finder
+   F4 flagged this as a flagship live-unstated leak; adversarial refuter R1 confirmed the
+   mechanism (Zipf skew → fewer distinct active experts per step → less token-independent
+   expert-weight streaming from flash) but REFUTED the originally-claimed shape and reach: the
+   effect is a **coupon-collector hump**, not a monotone or preferentially-flash-flattering
+   effect — it peaks ~13-15% around batch 100-500 and saturates to ~0% by batch 1500-2500 (all
+   experts active regardless of skew, since `aggregate_expert` pools tokens across ALL DP
+   replicas, so it's the SYSTEM batch that matters). Matched-batch probes actually run mildly
+   opposite the originally-claimed direction (HBM4 14.76%/12.35% vs HBF+ 14.30%/11.52%). **Real
+   exposure is confined to llama4 LONG at low GPU counts** — measured +8.56% at 1-GPU/batch 100,
+   +4.68% at batch 300; 4-GPU LONG plausibly low-single-digit% — because those are the only cells
+   whose real (optimizer-selected) system batch sits inside the hump's active range; every
+   SHORT/MID cell and every 8/16-GPU cell runs at a system batch (600-19,000) well past
+   saturation. **No paper ground truth exists to fix toward either 0.0 (uniform) or 0.8 (current)**
+   — both are equally unanchored assumptions, so this is a surface-only finding: no code change
+   was made this pass. A future pass with user input on the intended routing distribution should
+   revisit this. (Distinct from `CHANGES.md` item 50 / third-pass C10, which fixed a *placement*
+   bug — hot experts contiguously colocated on device 0 — orthogonal to this item's *skew value*
+   question; item 50 remains a real, already-fixed bug regardless of what skew value is chosen.)
 
 ## Ruled out as causes (for completeness)
 

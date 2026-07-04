@@ -45,6 +45,7 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
 
   // Scoring //
   int num_seq = seq_list.size();
+  double batch_m = sequences_metadata->get_sum_process_token();
   // For HBF configs: KV (key cache) is on flash, activations (query + score
   // output) are on the scarce tier (HBM for HBF, logic SRAM for HBF+). Sizes are
   // accumulated across all sequences and getAttentionMemoryDuration is called once
@@ -76,7 +77,7 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
         input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     // kv_read_size = k*n*kv_heads (the key cache rows read for scoring);
     // act_size = (query + output score) = (m*k*heads + m*n*heads).
     if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
@@ -191,7 +192,7 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
     memory_size = 0;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     if (use_ramulator) {
@@ -262,7 +263,7 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
         input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
 
     // Context phase uses the flash model on HBF presets (same as Scoring above).
     // kv_read_size = score(m*k*heads) + V-cache(k*n*kv_heads); act_size = output write (m*n*heads).
@@ -401,6 +402,7 @@ ExecStatus AttentionSumExecutionLogic(Device_Ptr device,
 
   // Scoring //
   int num_seq = seq_list.size();
+  double batch_m = sequences_metadata->get_sum_process_token();
   for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
     time_ns compute_duration = 0;
     time_ns memory_duration = 0;
@@ -417,7 +419,7 @@ ExecStatus AttentionSumExecutionLogic(Device_Ptr device,
     memory_size = (m * k * num_heads + k * n * num_kv_heads) * input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     if (use_ramulator) {
@@ -487,7 +489,7 @@ ExecStatus AttentionSumExecutionLogic(Device_Ptr device,
     // memory_size = (m * k * num_heads + k * n * num_kv_heads) *
     // input->precision_byte; total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     // memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     exec_status.total_duration += compute_duration;
@@ -510,7 +512,7 @@ ExecStatus AttentionSumExecutionLogic(Device_Ptr device,
     memory_size = (k * n * num_kv_heads) * input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     if (use_ramulator) {
@@ -581,6 +583,7 @@ ExecStatus AttentionSumExecutionPIM(Device_Ptr device,
 
   // Scoring //
   int num_seq = seq_list.size();
+  double batch_m = sequences_metadata->get_sum_process_token();
   for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
     time_ns compute_duration = 0;
     time_ns memory_duration = 0;
@@ -597,7 +600,7 @@ ExecStatus AttentionSumExecutionPIM(Device_Ptr device,
     memory_size = (m * k * num_heads + k * n * num_kv_heads) * input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     if (use_ramulator) {
@@ -641,7 +644,7 @@ ExecStatus AttentionSumExecutionPIM(Device_Ptr device,
     // memory_size = (m * k * num_heads + k * n * num_kv_heads) *
     // input->precision_byte; total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     // memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     exec_status.total_duration += compute_duration;
@@ -664,7 +667,7 @@ ExecStatus AttentionSumExecutionPIM(Device_Ptr device,
     memory_size = (k * n * num_kv_heads) * input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     if (use_ramulator) {
@@ -735,6 +738,10 @@ ExecStatus MultiLatentAttentionSumExecutionGPU(Device_Ptr device,
 
   std::vector<Sequence::Ptr> seq_list = sequences_metadata->get_sum();
   Sequence::Ptr seq;
+  // seq_list is get_sum() for the whole function (both the flash and non-flash
+  // branches below iterate the same list), so the batch-wide M is get_sum_process_token()
+  // in both branches -- no per-branch distinction needed.
+  double batch_m = sequences_metadata->get_sum_process_token();
 
   if(use_flash_attention) {
     int num_seq = seq_list.size();
@@ -776,7 +783,7 @@ ExecStatus MultiLatentAttentionSumExecutionGPU(Device_Ptr device,
                      num_heads * input->precision_byte;      // consider only matmuls
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
       if (use_ramulator) {
@@ -914,7 +921,7 @@ ExecStatus MultiLatentAttentionSumExecutionGPU(Device_Ptr device,
                     input->precision_byte;
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000; 
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
       if (use_ramulator) {
@@ -1004,12 +1011,12 @@ ExecStatus MultiLatentAttentionSumExecutionGPU(Device_Ptr device,
       // memory_size = 0; // can be overlapped
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
       if (use_ramulator) {
         time_ns accumul_memory_duration = 0;
-        
+
         ExecStatus temp;
         // read query
         auto shape = input->getShape();
@@ -1072,7 +1079,7 @@ ExecStatus MultiLatentAttentionSumExecutionGPU(Device_Ptr device,
       
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
       if (use_ramulator) {
@@ -1196,6 +1203,10 @@ ExecStatus MultiLatentAttentionSumExecutionLogic(Device_Ptr device,
 
   std::vector<Sequence::Ptr> seq_list = sequences_metadata->get_sum();
   Sequence::Ptr seq;
+  // seq_list is get_sum() for the whole function (both the flash and non-flash
+  // branches below iterate the same list), so the batch-wide M is get_sum_process_token()
+  // in both branches -- no per-branch distinction needed.
+  double batch_m = sequences_metadata->get_sum_process_token();
 
   if(use_flash_attention) {
     int num_seq = seq_list.size();
@@ -1236,7 +1247,7 @@ ExecStatus MultiLatentAttentionSumExecutionLogic(Device_Ptr device,
                     ) * num_heads * input->precision_byte;        // consider only matmuls
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
       if (use_ramulator) {
@@ -1376,7 +1387,7 @@ ExecStatus MultiLatentAttentionSumExecutionLogic(Device_Ptr device,
                     input->precision_byte;
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
       if (use_ramulator) {
@@ -1466,12 +1477,12 @@ ExecStatus MultiLatentAttentionSumExecutionLogic(Device_Ptr device,
       // memory_size = 0; // can be overlapped
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
       if (use_ramulator) {
         time_ns accumul_memory_duration = 0;
-        
+
         ExecStatus temp;
         // read query
         auto shape = input->getShape();
@@ -1534,7 +1545,7 @@ ExecStatus MultiLatentAttentionSumExecutionLogic(Device_Ptr device,
       
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
       if (use_ramulator) {
@@ -1657,7 +1668,10 @@ ExecStatus MultiLatentAttentionSumExecutionPIM(Device_Ptr device,
 
   std::vector<Sequence::Ptr> seq_list = sequences_metadata->get_sum();
   Sequence::Ptr seq;
-
+  // seq_list is get_sum() for the whole function (both the flash and non-flash
+  // branches below iterate the same list), so the batch-wide M is get_sum_process_token()
+  // in both branches -- no per-branch distinction needed.
+  double batch_m = sequences_metadata->get_sum_process_token();
 
   if(use_flash_attention) {
     int num_seq = seq_list.size();
@@ -1698,7 +1712,7 @@ ExecStatus MultiLatentAttentionSumExecutionPIM(Device_Ptr device,
                     ) * num_heads * input->precision_byte;        // consider only matmuls
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
       if (use_ramulator) {
@@ -1838,7 +1852,7 @@ ExecStatus MultiLatentAttentionSumExecutionPIM(Device_Ptr device,
                     input->precision_byte;
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
       if (use_ramulator) {
@@ -1929,12 +1943,12 @@ ExecStatus MultiLatentAttentionSumExecutionPIM(Device_Ptr device,
       // memory_size = 0; // can be overlapped
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
       if (use_ramulator) {
         time_ns accumul_memory_duration = 0;
-        
+
         ExecStatus temp;
           // read query
         auto shape = input->getShape();
@@ -1997,7 +2011,7 @@ ExecStatus MultiLatentAttentionSumExecutionPIM(Device_Ptr device,
       
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
       if (use_ramulator) {
@@ -2118,6 +2132,7 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
   Sequence::Ptr seq;
 
   int num_seq = seq_list.size();
+  double batch_m = sequences_metadata->get_sum_process_token();
   assertTrue(num_heads == input->shape[0], "input tensor shape is not match in num_head");
 
   // Scoring for nope //
@@ -2139,7 +2154,7 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
                   input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000; 
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     exec_status.compute_duration += compute_duration;
@@ -2235,7 +2250,7 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
                   input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     exec_status.compute_duration += compute_duration;
@@ -2335,7 +2350,7 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
     // memory_size = 0; // can be overlapped
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     exec_status.compute_duration += compute_duration;
@@ -2356,7 +2371,7 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
                          DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
       exec_status += temp;
       accumul_memory_duration += temp.memory_duration;
-      
+
       // store output
       temp =
           issueRamulator(device, LayerType::ABSORBED_MLA_SUM, ProcessorType::GPU,
@@ -2407,7 +2422,7 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
                   input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     exec_status.compute_duration += compute_duration;
@@ -2542,6 +2557,7 @@ ExecStatus AbsorbMLASumExecutionLogic(Device_Ptr device,
 
   // Scoring //
   int num_seq = seq_list.size();
+  double batch_m = sequences_metadata->get_sum_process_token();
   assertTrue(num_heads == input->shape[0], "input tensor shape is not match in num_head");
 
   for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
@@ -2561,7 +2577,7 @@ ExecStatus AbsorbMLASumExecutionLogic(Device_Ptr device,
       1.0 * m * n * num_heads) * input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     exec_status.compute_duration += compute_duration;
@@ -2641,7 +2657,7 @@ ExecStatus AbsorbMLASumExecutionLogic(Device_Ptr device,
                   input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     exec_status.compute_duration += compute_duration;
@@ -2739,7 +2755,7 @@ ExecStatus AbsorbMLASumExecutionLogic(Device_Ptr device,
     total_flops += flops;
 
     memory_size = 2.0 * (1.0 * m * n * num_heads) * input->precision_byte;
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
 
     exec_status.compute_duration += compute_duration;
     total_memory_size += memory_size;
@@ -2768,8 +2784,10 @@ ExecStatus AbsorbMLASumExecutionLogic(Device_Ptr device,
                   input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+
+    exec_status.compute_duration += compute_duration;
 
     if (use_ramulator) {
       // read score
@@ -2894,6 +2912,7 @@ ExecStatus AbsorbMLASumExecutionPIM(Device_Ptr device,
 
   // Scoring for NoPE//
   int num_seq = seq_list.size();
+  double batch_m = sequences_metadata->get_sum_process_token();
   assertTrue(num_heads == input->shape[0], "input tensor shape is not match in num_head");
 
   for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
@@ -2914,7 +2933,7 @@ ExecStatus AbsorbMLASumExecutionPIM(Device_Ptr device,
                   input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     exec_status.compute_duration += compute_duration;
@@ -2944,8 +2963,8 @@ ExecStatus AbsorbMLASumExecutionPIM(Device_Ptr device,
     }
     exec_status.total_duration += std::max(compute_duration, memory_duration);
   }
-  
-  // Scoring for RoPE // 
+
+  // Scoring for RoPE //
   for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
     time_ns compute_duration = 0;
     time_ns memory_duration = 0;
@@ -2964,7 +2983,7 @@ ExecStatus AbsorbMLASumExecutionPIM(Device_Ptr device,
                   input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     exec_status.compute_duration += compute_duration;
@@ -3012,7 +3031,7 @@ ExecStatus AbsorbMLASumExecutionPIM(Device_Ptr device,
     // memory_size = (m * k * num_heads + k * n * num_kv_heads) *
     // input->precision_byte; total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     // memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     exec_status.compute_duration += compute_duration;
@@ -3037,11 +3056,11 @@ ExecStatus AbsorbMLASumExecutionPIM(Device_Ptr device,
     memory_size = (1.0 * m * k * num_heads + k * n + 1.0 * m * n * num_heads) * input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     exec_status.compute_duration += compute_duration;
-    
+
     if (use_ramulator) {
       std::vector<int> shape = {1,1};
       shape.at(0) = k;

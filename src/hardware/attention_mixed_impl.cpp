@@ -42,6 +42,7 @@ ExecStatus AttentionMixedExecutionGPU(Device_Ptr device,
 
   // Scoring //
   int num_seq = sequences_metadata->sequence.size();
+  double batch_m = sequences_metadata->get_process_token();
   time_ns scoring_compute_duration = 0;
   time_ns scoring_memory_duration = 0;
   hw_metric scoring_kv_read_size = 0;
@@ -59,7 +60,7 @@ ExecStatus AttentionMixedExecutionGPU(Device_Ptr device,
     memory_size = (m * k * num_heads + k * n * num_kv_heads) * input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     scoring_compute_duration += compute_duration;
     total_compute_duration += compute_duration;
 
@@ -95,7 +96,7 @@ ExecStatus AttentionMixedExecutionGPU(Device_Ptr device,
     memory_size = (m * k * num_heads + k * n * num_kv_heads) * input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     context_compute_duration += compute_duration;
     total_compute_duration += compute_duration;
 
@@ -175,6 +176,7 @@ ExecStatus AttentionMixedExecutionPIM(Device_Ptr device,
 
   // Scoring //
   int num_seq = sequences_metadata->sequence.size();
+  double batch_m = sequences_metadata->get_process_token();
   for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
     Sequence::Ptr seq = sequences_metadata->get_seq()[seq_idx];
 
@@ -188,7 +190,7 @@ ExecStatus AttentionMixedExecutionPIM(Device_Ptr device,
     memory_size = (m * k * num_heads + k * n * num_kv_heads) * input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     total_duration += std::max(compute_duration, memory_duration);
@@ -210,7 +212,7 @@ ExecStatus AttentionMixedExecutionPIM(Device_Ptr device,
     memory_size = (m * k * num_heads + k * n * num_kv_heads) * input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     total_duration += std::max(compute_duration, memory_duration);
@@ -260,6 +262,7 @@ ExecStatus MultiLatentAttentionMixedExecutionGPU(Device_Ptr device,
 
   // Scoring //
   int num_seq = sequences_metadata->sequence.size();
+  double batch_m = sequences_metadata->get_process_token();
   for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
     Sequence::Ptr seq = sequences_metadata->get_seq()[seq_idx];
 
@@ -273,7 +276,7 @@ ExecStatus MultiLatentAttentionMixedExecutionGPU(Device_Ptr device,
     memory_size = (m * k * num_heads + k * n * num_kv_heads) * input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     total_duration += std::max(compute_duration, memory_duration);
@@ -295,7 +298,7 @@ ExecStatus MultiLatentAttentionMixedExecutionGPU(Device_Ptr device,
     memory_size = (m * k * num_heads + k * n * num_kv_heads) * input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     total_duration += std::max(compute_duration, memory_duration);
@@ -357,6 +360,7 @@ ExecStatus MultiLatentAttentionMixedExecutionPIM(Device_Ptr device,
 
   // Scoring //
   int num_seq = sequences_metadata->sequence.size();
+  double batch_m = sequences_metadata->get_process_token();
   for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
     Sequence::Ptr seq = sequences_metadata->get_seq()[seq_idx];
 
@@ -370,7 +374,7 @@ ExecStatus MultiLatentAttentionMixedExecutionPIM(Device_Ptr device,
     memory_size = (m * k * num_heads + k * n * num_kv_heads) * input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     total_duration += std::max(compute_duration, memory_duration);
@@ -392,7 +396,7 @@ ExecStatus MultiLatentAttentionMixedExecutionPIM(Device_Ptr device,
     memory_size = (m * k * num_heads + k * n * num_kv_heads) * input->precision_byte;
     total_memory_size += memory_size;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
     total_duration += std::max(compute_duration, memory_duration);

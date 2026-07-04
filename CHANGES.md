@@ -1265,3 +1265,132 @@ fix predicts.
 - **`classify_failure` maps "HBM capacity exceeded" into the "flash" bucket** — semantically a
   "capacity" label; harmless (Fig-3 hatching only consults "sram"). Doc-note only to avoid
   churning downstream consumers of `bound_reason`.
+
+## Fifth-pass independent bug hunt (2026-07-04) — items 58-65
+
+Run with the same independence protocol as the third/fourth passes (9 blind Opus finder tracks +
+6 Sonnet adversarial refuters + targeted verification runs; finders were denied all analysis docs
+and git history, allowed only the paper PDF, `PAPER_ANCHOR_SHEET.md`, `paper_figure_readings.md`,
+and `src/eval` harness code). Full finding records, refuter verdicts, the V-moe-liveness
+adjudication, and the convergence ledger live in `FINDINGS_REGISTER.md`'s "Fifth-pass register".
+All fixes below are grounded in technical correctness or the codebase's own existing conventions;
+nothing was calibrated to a paper number. **Gate:** 13-cell regression re-run post-fix — 6/13
+cells (all HBM4) bit-identical; the remaining 7/13 (all HBF/HBF+/CONV+ cells) moved by <1% each,
+every movement mechanism-explained against a specific fix below, no `bound_reason` flips. Two
+investigated-in-depth cells are recorded honestly rather than glossed over: `l3_HBF_1_SHORT`'s
++0.565% move was initially flagged as unexpected, but traced to item 61 (K/V fill amortization)
+applying, as designed, to dense-llama3/HBF/1-GPU/SHORT — the fix is not gated to HBF+/CONV+ tiers,
+an earlier note had mistakenly assumed it was. And `l4_HBFp_8_SHORT` (the U7 flagship cell) had
+been predicted, by item 58's follow-on adjudication, to flip from slo- to sram-bound; it stayed
+slo-bound post-fix, but its SRAM headroom collapsed from +450/GPU (~16%) to +31/GPU (~1.3%) against
+the ceiling — a near-miss that quantitatively confirms the fix engaged at the predicted magnitude
+without crossing zero for this specific auto-selected parallelism config (full reconciliation in
+`FINDINGS_REGISTER.md`).
+
+58. **SRAM/capacity footprint under-counted two phase-spanning MoE FFN-phase tensors: the
+    persistent residual carry, and the shared expert's re-read of the original block input**
+    (`footprint.h`). The attention phase's `peakIntermediateBytes` already counts its own
+    persistent residual carry as concurrently live, but the FFN phase's dense/shared branches
+    (`footprint.h:224-227`/`:217-221`) omitted the equivalent residual term entirely — an
+    asymmetry between the two phases' own accounting convention, not a paper-calibration change.
+    Separately, `expert.cpp:204`'s shared-expert branch re-reads `post_attn_ln_out` (the original
+    block input) *after* the entire routed scatter→route→gather→all-reduce pipeline completes —
+    under the model's own existing convention of summing (not maxing) routed+shared costs as
+    logically-parallel live branches, this tensor cannot be modeled as freed once routing starts,
+    the same reasoning that already justifies counting the residual carry (see the V-moe-liveness
+    adjudication in `FINDINGS_REGISTER.md`). **Fix:** both terms added once to `ffn_total` after
+    the phase max (the `max(a+c,b+c) = max(a,b)+c` identity), the block-input term gated to
+    `has_moe_layer && model.num_shared_expert > 0` so it never touches dense llama3 or any
+    non-shared-expert MoE config. **Verified:** maverick tp1/ep1/dp8 analytic ceiling
+    2824→2409/GPU (residual-only alone would have landed at 2600); HBM4/HBF/dense-llama3 cells
+    untouched (the block-input term only fires on shared-expert MoE FFN phases).
+
+59. **Optimizer's shared-expert capacity term incorrectly divided by `tp`**
+    (`parallelism_optimizer.cpp:157`), contradicting the live simulator, which does not TP-shard
+    the shared expert: `expert.cpp:99-102` constructs it with `use_dp=true`, routing it through
+    the plain (undivided) `Linear` branch (`layer.cpp:406-424`), not `ColumnParallel`/
+    `RowParallel`. The recorded weight at TP=2 (106.020 GiB) matches the FULL-shared arithmetic
+    exactly, and the TP=1→TP=2 weight drop decomposes completely into attention + dense-FFN +
+    embed/lm_head terms with zero shared-expert contribution — the `/tp` had no basis in the
+    runtime it was meant to mirror. **Fix:** removed the erroneous `/tp`; also corrected a
+    self-contradicting verifying comment at the same site (`:151-154`) that cited the 106.020 GiB
+    measurement as confirming the division, when that figure only matches the full-shared,
+    undivided computation. **No published number is affected** — `cap_batch`/`slo_hint` are
+    bisection seeds only, every reported batch is live-verified, and the seed remained a valid
+    (if slightly loose) upper bound throughout. **Note:** this corrects a mistaken attribution
+    carried in this same doc's third-pass item 43, which claimed the runtime TP-shards the shared
+    expert citing this identical 106.020 GiB figure — that claim was factually wrong, and the
+    erroneous `/tp` this item removes was very likely introduced by that same third-pass edit
+    under the mistaken belief (see `FINDINGS_REGISTER.md`'s CONTRADICTS-DOC entry).
+
+60. **LayerNorm's weight-read cost was hand-rolled outside the shared amortized weight-stream
+    mechanism** that Linear/QKVO layers already use (`layernorm.cpp:53` charged a flat page-read
+    latency per call, invisible to `weightReadOpsPerIteration`'s fold-in accounting). LN reads
+    are statically ordered inside the same per-iteration weight stream as QKVO/MLP — exactly the
+    codebase's own criterion for fold-in. **Fix:** routed LN's weight-read through the shared
+    `getLinearMemoryDuration` helper with `m=0` to deterministically isolate the weight-only term
+    (both `act_read_size`/`act_write_size` scale with `m`, so `m=0` zeros the activation term with
+    no mis-sizing risk), and added LN to `weightReadOpsPerIteration`'s per-layer op count
+    (`model_config.h`). **Verified effect:** ~0.24-0.73%/step faster on HBF+/CONV+ cells
+    (previously hidden under HBF/HBM4's larger `max()` activation term); HBM4/HBF cells
+    unaffected. Noted gap (accepted, out of scope): MLA's `latent_q`/`kv_layer_norm` (2 more LN
+    ops/layer) are not counted — dormant, since no MLA/DeepSeek model is in the paper's own
+    evaluated set.
+
+61. **GQA decode's K-scoring and V-context calls each exposed a full flash page-fill latency
+    (2/layer) when only ~1 should be exposed** (`layer_impl.h`, `attention_gen_impl.cpp`). V's
+    fetch has no data dependency on K/softmax, so by the codebase's own cross-op prefetch
+    convention V's fill is hideable under K's transfer — softmax compute (~10-100ns) cannot hide
+    the fill itself, but the K→V boundary can, the same way `program_latency_amortize_calls`
+    already hides KV-write program latency across a stream. **Fix:** added a
+    `fill_amortize_calls` parameter to the shared fill-latency helper, set to 2 at both the K and
+    V call sites in `attention_gen_impl.cpp` (GQA Gen path). **Verified effect:** ~0.1-0.4%
+    faster on HBF/CONV/CONV+/HBF+ SHORT-MID cells (largest on CONV/CONV+ SHORT, the highest-
+    page-latency presets); not gated to any particular memory tier, so it correctly also applies
+    to plain HBF (confirmed against the `l3_HBF_1_SHORT` regression cell, +0.565%).
+
+62. **`exportToCSV` was called only at loop-top in both iteration-loop functions, so the final
+    measured iteration's row was never flushed before return** (`cluster.cpp`). Fig-5's CSV-based
+    breakdown averaged only 9 of 10 measured iterations under the harness's `iter=10` convention;
+    tpot (read from stdout, not the CSV) was unaffected. **Fix:** added a final flush before each
+    return in both `runIterationMixed` and `runIterationSumGenSplit`. **Verified:** measured
+    spread across the 9-vs-10-row averages is <0.001% on every checked cell — a zero-risk
+    mechanical fix (the CSV's own return value is unread, grep-verified).
+
+63. **Time-breakdown CSV columns were read from device 0's timeboard only, while reported TPOT is
+    the max over all devices** (`cluster.cpp`, `setTimeBreakDown`) — correct under TP/EP (the
+    sync all-reduce/scatter-gather modules erase intra-group drift, confirmed by direct probe:
+    gap 0.0003% at real 16-GPU TP2/EP8/DP8 and TP2/EP4/DP8 winner-style configs) but wrong under
+    PP>1, where a later pipeline stage's work (e.g. `lm_head`) is invisible to device 0 entirely —
+    a forced llama4 TP2/PP2/EP4/DP4 probe measured a 66.85% gap between the CSV's bucket-sum and
+    the true per-iteration latency, and the `pipeline_stage` communication stamp exists in the
+    timeboard but was never queried by any bucket. **Fix:** `setTimeBreakDown` now sums one
+    representative device per pipeline stage (reduces to device 0 alone at `pp_dg==1`, an exact
+    no-op), and routes the `pipeline_stage` stamp into the `Comm` bucket. **Bundled correctness
+    fix:** summing multiple devices' stamps while still multiplying each by the whole cluster's
+    `num_total_device` would have introduced a new pp>1 energy double-count as a direct side
+    effect of this fix; all 34 per-stamp energy-accumulation sites inside `setTimeBreakDown` now
+    scale by `devices_per_stage` instead, also an exact no-op at `pp_dg==1`. Every current
+    paper-compared cell is pp=1, so this fix is entirely latent-proofing — no reported number
+    moves.
+
+64. **`effectiveMFU` (the GEMM compute-throughput derating knob, disabled by default at
+    `mfu_m_half=0`) was called with a per-sequence `m` instead of the documented batch-wide `m` at
+    ~70 attention call sites** (`attention_{mixed,gen,sum}_impl.cpp`), contradicting
+    `hardware_config.h`'s own doc comment and the already-batch-keyed convention used by every
+    Linear/activation/optimizer call site. **Fix:** rekeyed all ~70 sites to the batch-wide
+    accessor (`get_process_token()`/`get_gen()`/`get_sum()`, matching each execution logic's own
+    sequence-metadata source); added the `effectiveMFU` call to 6 flash-MLA sites that previously
+    bypassed the knob entirely (an asymmetry with their non-flash sibling branches, which already
+    applied it); and fixed a latent missing `exec_status.compute_duration +=` accumulation in one
+    `AbsorbMLASumExecutionLogic` Context phase, found while auditing the call sites. **No-op at
+    current defaults** (`mfu_m_half<=0` short-circuits before reading `m` at every site) —
+    verified via a bit-identical 13-cell regression and independent source-level re-derivation of
+    every modified call site.
+
+65. **Hygiene, dormant/latent, zero effect on any currently-recorded paper cell.** `rope.cpp` now
+    branches activation-traffic pricing by device memory tier instead of unconditionally using
+    flash bandwidth — only reachable on the MLA path (RoPE is fused into GQA models), never
+    instantiated by llama3/llama4. `cluster.cpp`'s decode idle-iteration guard (which would
+    deflate tpot if ever hit, but is provably unreachable in decode since
+    `num_process_token==batch` always) got an explanatory invariant comment; no behavior change.

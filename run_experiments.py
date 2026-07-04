@@ -18,6 +18,16 @@ DATA_DIR = os.path.join(SCRIPT_DIR, "data")
 DEFAULT_WORKERS = max(1, min((os.cpu_count() or 4) - 2, 18))
 SWEEP_WORKERS = int(os.environ.get("SWEEP_WORKERS", DEFAULT_WORKERS))
 
+# Offline/unconstrained-SLO cells (slo >= 1000, i.e. the 86400s "24h, no rate limit"
+# probes used by the PEC-gathering phase and one SLOS entry in the sensitivity sweep)
+# search for the ANALYTIC memory-capacity ceiling batch size, whose host-process RSS
+# scales with that batch -- observed to reach 13-23GB per ./run, vs. a few GB for
+# latency-bound online cells. Running SWEEP_WORKERS of these concurrently can
+# oversubscribe host RAM well before hitting SWEEP_WORKERS (e.g. 6 x ~20GB > 63GB),
+# triggering a sustained kernel OOM-killer storm that also kills unrelated processes.
+# Use a much smaller, independently-tunable pool for offline cells specifically.
+OFFLINE_SWEEP_WORKERS = int(os.environ.get("OFFLINE_SWEEP_WORKERS", max(1, SWEEP_WORKERS // 4)))
+
 # Must match model names with compressed_kv=true (MLA) in model_config.h.
 MLA_MODELS = {"deepseekV3", "deepseekR1"}
 
@@ -694,6 +704,32 @@ def _run_cell(spec):
     return {**spec, "max_b": max_b, "tpot": tpot, "csv_path": csv_path,
             "pec_kv": pec_kv, "pec_cap": pec_cap, "dp": dp, "bound_reason": bound_reason}
 
+def _crashed_cell(spec):
+    """Fallback result for a spec whose pool worker died before returning anything
+    (e.g. the worker process itself -- not just its ./run child -- got killed by a
+    system-wide OOM storm, or ProcessPoolExecutor reports BrokenProcessPool). Keeps
+    the phase's canonical-order assembly loop working (same dict shape as _run_cell)
+    instead of an unhandled exception from fut.result() crashing the whole script and
+    discarding every other already-completed cell in this and all later phases."""
+    return {**spec, "max_b": 0, "tpot": 0.0, "csv_path": None,
+            "pec_kv": None, "pec_cap": None, "dp": 1, "bound_reason": "worker_crashed"}
+
+def _checkpoint(name, obj):
+    """Best-effort incremental checkpoint. This script has no resume logic, but
+    writing each completed phase's raw results to disk as soon as it's done means a
+    later-phase failure (timeout, worker crash, host OOM storm, ...) no longer
+    discards prior phases -- previously, everything lived only in main()'s local
+    variables until the single experiment_data.json write at the very end, so e.g. a
+    fully-completed 144-cell main sweep + 118-cell sensitivity sweep were lost in
+    their entirety when the PEC phase later died."""
+    path = os.path.join(SCRIPT_DIR, f"checkpoint_{name}.json")
+    try:
+        with open(path, "w") as f:
+            json.dump(obj, f, indent=2)
+        print(f"[checkpoint] wrote {path}")
+    except Exception as e:
+        print(f"[checkpoint] failed to write {path}: {e!r}")
+
 def parse_csv_breakdown(csv_path):
     if not csv_path or not os.path.exists(csv_path):
         return None
@@ -1235,9 +1271,14 @@ def main():
         for wl_name, (in_len, out_len) in workloads.items()
     ]
     with ProcessPoolExecutor(max_workers=min(SWEEP_WORKERS, len(baseline_specs))) as pool:
-        futures = [pool.submit(_run_cell, spec) for spec in baseline_specs]
-        for fut in as_completed(futures):
-            r = fut.result()
+        fut_to_spec = {pool.submit(_run_cell, spec): spec for spec in baseline_specs}
+        for fut in as_completed(fut_to_spec):
+            spec = fut_to_spec[fut]
+            try:
+                r = fut.result()
+            except Exception as e:
+                print(f"[baseline] worker crashed for {spec}: {e!r} -- recording as failed cell")
+                r = _crashed_cell(spec)
             model, wl_name = r["model"], r["wl_name"]
             max_b, tpot, dp = r["max_b"], r["tpot"], r["dp"]
             # Per-GPU metrics divide by the TOTAL GPU count, not dp -- matches
@@ -1259,6 +1300,7 @@ def main():
             }
             print(f"Baseline {model} {wl_name}: Max Batch/GPU = {max_b_per_gpu:.1f} (total {max_b}, dp={dp}), TPS/GPU = {tps:.2f}")
     # Pool joined (all baseline futures resolved) -- safe to read `baselines` below.
+    _checkpoint("baselines", baselines)
 
     results = []
 
@@ -1286,10 +1328,15 @@ def main():
     to_submit = [s for s in sweep_specs if not (s["mem"] == "HBM4" and s["gpu"] == 8)]
     cell_results = {}  # spec key -> _run_cell's returned dict
     with ProcessPoolExecutor(max_workers=min(SWEEP_WORKERS, max(1, len(to_submit)))) as pool:
-        fut_to_key = {pool.submit(_run_cell, spec): _spec_key(spec) for spec in to_submit}
-        for fut in as_completed(fut_to_key):
-            key = fut_to_key[fut]
-            r = fut.result()
+        fut_to_spec = {pool.submit(_run_cell, spec): spec for spec in to_submit}
+        for fut in as_completed(fut_to_spec):
+            spec = fut_to_spec[fut]
+            key = _spec_key(spec)
+            try:
+                r = fut.result()
+            except Exception as e:
+                print(f"[sweep] worker crashed for {spec}: {e!r} -- recording as failed cell")
+                r = _crashed_cell(spec)
             cell_results[key] = r
             print(f"Completed {r['model']} | {r['wl_name']} | {r['mem']} | {r['gpu']} GPUs "
                   f"-> Max Batch/GPU: {(r['max_b'] / r['gpu']):.1f}, TPOT: {r['tpot']:.4f}s")
@@ -1350,6 +1397,8 @@ def main():
         print(f"{model} | {wl_name} | {mem} | {gpu} GPUs -> Max Batch/GPU: {max_b_per_gpu:.1f} "
               f"(Norm: {norm_batch:.2f}), TPS/GPU: {tps:.2f} (Norm: {norm_tps:.2f})")
 
+    _checkpoint("results", results)
+
     # SLO Sensitivity Sweeps (LONG Workload only)
     print("\n--- RUNNING SLO SENSITIVITY SWEEPS (LONG Workload) ---")
     slo_results = []
@@ -1369,10 +1418,25 @@ def main():
         for model in models for slo in slos if slo != 0.1
     ]
     sens_baseline_results = {}
-    with ProcessPoolExecutor(max_workers=min(SWEEP_WORKERS, max(1, len(sens_baseline_specs)))) as pool:
-        futs = {pool.submit(_run_cell, spec): (spec["model"], spec["slo"]) for spec in sens_baseline_specs}
-        for fut in as_completed(futs):
-            sens_baseline_results[futs[fut]] = fut.result()
+    # Split offline (slo=86400, unconstrained-batch-search) specs into their own,
+    # smaller pool -- see OFFLINE_SWEEP_WORKERS above; these can need 10x+ the host
+    # RAM per process of a latency-bound (online) probe.
+    sens_baseline_offline = [s for s in sens_baseline_specs if s["slo"] >= 1000]
+    sens_baseline_normal = [s for s in sens_baseline_specs if s["slo"] < 1000]
+    for group, workers, label in ((sens_baseline_normal, SWEEP_WORKERS, "sens-baseline"),
+                                   (sens_baseline_offline, OFFLINE_SWEEP_WORKERS, "sens-baseline-offline")):
+        if not group:
+            continue
+        with ProcessPoolExecutor(max_workers=min(workers, max(1, len(group)))) as pool:
+            fut_to_spec = {pool.submit(_run_cell, spec): spec for spec in group}
+            for fut in as_completed(fut_to_spec):
+                spec = fut_to_spec[fut]
+                try:
+                    r = fut.result()
+                except Exception as e:
+                    print(f"[{label}] worker crashed for {spec}: {e!r} -- recording as failed cell")
+                    r = _crashed_cell(spec)
+                sens_baseline_results[(spec["model"], spec["slo"])] = r
 
     sens_baselines = {}
     for model in models:
@@ -1409,14 +1473,26 @@ def main():
 
     sens_to_submit = [s for s in sens_specs if not (s["mem"] == "HBM4" and s["gpu"] == 8 and s["slo"] == 0.1)]
     sens_cell_results = {}
-    with ProcessPoolExecutor(max_workers=min(SWEEP_WORKERS, max(1, len(sens_to_submit)))) as pool:
-        fut_to_key = {pool.submit(_run_cell, spec): _sens_key(spec) for spec in sens_to_submit}
-        for fut in as_completed(fut_to_key):
-            key = fut_to_key[fut]
-            sens_cell_results[key] = fut.result()
-            r = sens_cell_results[key]
-            print(f"Completed Sensitivity Sweep: {r['model']} | {r['mem']} | {r['gpu']} GPUs | SLO {r['slo']}s "
-                  f"-> Max Batch/GPU: {(r['max_b'] / r['gpu']):.1f}")
+    # Same offline/normal pool split as the sensitivity baselines above.
+    sens_offline = [s for s in sens_to_submit if s["slo"] >= 1000]
+    sens_normal = [s for s in sens_to_submit if s["slo"] < 1000]
+    for group, workers, label in ((sens_normal, SWEEP_WORKERS, "sensitivity"),
+                                   (sens_offline, OFFLINE_SWEEP_WORKERS, "sensitivity-offline")):
+        if not group:
+            continue
+        with ProcessPoolExecutor(max_workers=min(workers, max(1, len(group)))) as pool:
+            fut_to_spec = {pool.submit(_run_cell, spec): spec for spec in group}
+            for fut in as_completed(fut_to_spec):
+                spec = fut_to_spec[fut]
+                key = _sens_key(spec)
+                try:
+                    r = fut.result()
+                except Exception as e:
+                    print(f"[{label}] worker crashed for {spec}: {e!r} -- recording as failed cell")
+                    r = _crashed_cell(spec)
+                sens_cell_results[key] = r
+                print(f"Completed Sensitivity Sweep: {r['model']} | {r['mem']} | {r['gpu']} GPUs | SLO {r['slo']}s "
+                      f"-> Max Batch/GPU: {(r['max_b'] / r['gpu']):.1f}")
 
     for spec in sens_specs:
         model, mem, gpu, slo = spec["model"], spec["mem"], spec["gpu"], spec["slo"]
@@ -1451,6 +1527,8 @@ def main():
             print(f"{model} | {mem} | {gpu} GPUs | SLO {slo}s -> Max Batch/GPU: {max_b_per_gpu:.1f} "
                   f"(Norm: {norm_batch:.2f}), TPS/GPU: {tps:.2f} (Norm: {norm_tps:.2f})")
 
+    _checkpoint("slo_results", slo_results)
+
     # Offline-PEC data gathering (Fig. 7's "offline" bars). Online PEC for the
     # same scope is already derivable from `results` (0.1s SLO), but offline
     # (SLO=86400, i.e. no rate limit) isn't probed anywhere else -- the SLO
@@ -1467,12 +1545,20 @@ def main():
         for mem in PEC_MEM_TYPES
     ]
     pec_cell_results = {}
-    with ProcessPoolExecutor(max_workers=min(SWEEP_WORKERS, max(1, len(pec_specs)))) as pool:
-        fut_to_key = {pool.submit(_run_cell, spec): (spec["model"], spec["wl_name"], spec["gpu"], spec["mem"])
-                      for spec in pec_specs}
-        for fut in as_completed(fut_to_key):
-            key = fut_to_key[fut]
-            r = fut.result()
+    # All PEC specs are offline (slo=86400, unconstrained-batch-search) -- see
+    # OFFLINE_SWEEP_WORKERS above. This phase is where the host OOM-killer storm
+    # actually occurred (individual ./run RSS of 13-23GB, SWEEP_WORKERS-wide
+    # concurrency oversubscribing this box's RAM for hours).
+    with ProcessPoolExecutor(max_workers=min(OFFLINE_SWEEP_WORKERS, max(1, len(pec_specs)))) as pool:
+        fut_to_spec = {pool.submit(_run_cell, spec): spec for spec in pec_specs}
+        for fut in as_completed(fut_to_spec):
+            spec = fut_to_spec[fut]
+            key = (spec["model"], spec["wl_name"], spec["gpu"], spec["mem"])
+            try:
+                r = fut.result()
+            except Exception as e:
+                print(f"[pec] worker crashed for {spec}: {e!r} -- recording as failed cell")
+                r = _crashed_cell(spec)
             pec_cell_results[key] = r
             print(f"Completed Offline PEC: {r['model']} | {r['wl_name']} | {r['mem']} | {r['gpu']} GPUs "
                   f"-> Max Batch: {r['max_b']}")
@@ -1496,6 +1582,8 @@ def main():
         pec_str = f"{pec_info['pec']:.1f}" if pec_info else "N/A"
         print(f"{spec['model']} | {spec['wl_name']} | {spec['mem']} | {spec['gpu']} GPUs "
               f"-> Offline Max Batch: {r['max_b']}, 3yr PEC: {pec_str}")
+
+    _checkpoint("pec_results", pec_results)
 
     # Generate Markdown Report — written to the project root alongside this script.
     report_path = os.path.join(SCRIPT_DIR, "experiment_results.md")

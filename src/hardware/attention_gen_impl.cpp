@@ -51,6 +51,7 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
   std::vector<int> shape = {1, head_dim};
 
   int num_seq = seq_list.size();
+  double batch_m = sequences_metadata->get_gen_process_token();
 
   int accumul_len = 0;
   time_ns accumul_compute_duration = 0;
@@ -75,7 +76,7 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
       memory_size = 1.0 * (m * k * num_heads / num_kv_heads + k * n + m * n * num_heads / num_kv_heads) * input->precision_byte;
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       exec_status.compute_duration += compute_duration;
       accumul_compute_duration += compute_duration;
 
@@ -91,7 +92,10 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
   }
 
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
-    accumul_memory_duration = getAttentionMemoryDuration(config, total_kv_read_size, total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size);
+    // V's page address has no data dependency on K/softmax, so its fetch can be
+    // prefetched under K's transfer window (same cross-op hiding convention as
+    // weight_stream_ops_per_iter) -- K and V together expose ~one fill/layer.
+    accumul_memory_duration = getAttentionMemoryDuration(config, total_kv_read_size, total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size, 2);
   }
 
   if (use_ramulator) {
@@ -127,7 +131,7 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
     flops = 7.0 * m * n * num_heads; // scale + mask + softmax
     total_flops += flops;
 
-    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+    compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
 
     exec_status.total_duration += compute_duration;
   }
@@ -159,7 +163,7 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
       memory_size = 1.0 * (m * k * num_heads / num_kv_heads + k * n + m * n * num_heads / num_kv_heads) * input->precision_byte;
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       exec_status.compute_duration += compute_duration;
       accumul_compute_duration += compute_duration;
 
@@ -174,7 +178,9 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
     accumul_len += k;
   }
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
-    accumul_memory_duration = getAttentionMemoryDuration(config, total_context_kv_read_size, total_context_act_size, layer_info.use_chunked_attention, layer_info.chunk_size);
+    // Other half of the K->V fill amortization above: V's fill hides under K's
+    // transfer, so this call also charges only its 1/2 share of the page fill.
+    accumul_memory_duration = getAttentionMemoryDuration(config, total_context_kv_read_size, total_context_act_size, layer_info.use_chunked_attention, layer_info.chunk_size, 2);
   }
 
   if (use_ramulator) {
@@ -266,6 +272,7 @@ ExecStatus AttentionGenExecutionLogic(Device_Ptr device,
   std::vector<int> shape = {1, head_dim};
 
   int num_seq = seq_list.size();
+  double batch_m = sequences_metadata->get_gen_process_token();
 
   int accumul_len = 0;
   time_ns accumul_compute_duration = 0;
@@ -285,7 +292,7 @@ ExecStatus AttentionGenExecutionLogic(Device_Ptr device,
       memory_size = (k * n) * input->precision_byte;
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       exec_status.compute_duration += compute_duration;
       accumul_compute_duration += compute_duration;
 
@@ -333,7 +340,7 @@ ExecStatus AttentionGenExecutionLogic(Device_Ptr device,
       memory_size = (k * n) * input->precision_byte;
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       exec_status.compute_duration += compute_duration;
       accumul_compute_duration += compute_duration;
 
@@ -415,6 +422,7 @@ ExecStatus AttentionGenExecutionPIM(Device_Ptr device,
   std::vector<int> shape = {1, head_dim};
 
   int num_seq = seq_list.size();
+  double batch_m = sequences_metadata->get_gen_process_token();
 
   int accumul_len = 0;
   time_ns accumul_compute_duration = 0;
@@ -434,7 +442,7 @@ ExecStatus AttentionGenExecutionPIM(Device_Ptr device,
       memory_size = (k * n) * input->precision_byte;
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       exec_status.compute_duration += compute_duration;
       accumul_compute_duration += compute_duration;
 
@@ -476,7 +484,7 @@ ExecStatus AttentionGenExecutionPIM(Device_Ptr device,
     total_flops += softmax_flops;
 
     time_ns softmax_compute_duration = softmax_flops /
-        (compute_peak_flops * effectiveMFU(config, softmax_m)) * 1000 * 1000 * 1000;
+        (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
 
     exec_status.total_duration += softmax_compute_duration;
   }
@@ -499,7 +507,7 @@ ExecStatus AttentionGenExecutionPIM(Device_Ptr device,
       memory_size = (k * n) * input->precision_byte;
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       exec_status.compute_duration += compute_duration;
       accumul_compute_duration += compute_duration;
 
@@ -586,6 +594,7 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
   std::vector<int> shape = {1, head_dim};
 
   int num_seq = seq_list.size();
+  double batch_m = sequences_metadata->get_gen_process_token();
 
   int accumul_len = 0;
   time_ns accumul_compute_duration = 0;
@@ -614,8 +623,8 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
                     num_heads * input->precision_byte;
       total_memory_size += memory_size;
 
-      accumul_compute_duration += flops / compute_peak_flops * 1000 * 1000 * 1000;
-      exec_status.compute_duration += flops / compute_peak_flops * 1000 * 1000 * 1000;
+      accumul_compute_duration += flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
+      exec_status.compute_duration += flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
 
       if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
         total_kv_read_size += n * (2.0 * head_dim + qk_rope_head_dim) * num_heads * input->precision_byte;
@@ -696,7 +705,7 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
         memory_size = (m * k + k * n + m * n) * input->precision_byte;
         total_memory_size += memory_size;
 
-        compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+        compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
         exec_status.compute_duration += compute_duration;
         accumul_compute_duration += compute_duration;
 
@@ -764,12 +773,12 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
 
       memory_size = (2.0 * m * n * num_heads) *input->precision_byte;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
       if(use_ramulator){
         memory_duration = 0;
-        
+
         ExecStatus temp;
 
         // read input
@@ -815,13 +824,13 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
       n = head_dim;
 
       for (int head_idx = 0; head_idx < num_heads; head_idx++) {
-        flops = m * k * n * 2.0; 
+        flops = m * k * n * 2.0;
         total_flops += flops;
 
         memory_size = (m * k + k * n + m * n) * input->precision_byte;
         total_memory_size += memory_size;
 
-        compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+        compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
         exec_status.compute_duration += compute_duration;
         accumul_compute_duration += compute_duration;
 
@@ -954,6 +963,7 @@ ExecStatus MultiLatentAttentionGenExecutionLogic(Device_Ptr device,
   std::vector<int> shape = {1, head_dim};
 
   int num_seq = seq_list.size();
+  double batch_m = sequences_metadata->get_gen_process_token();
 
   int accumul_len = 0;
   time_ns accumul_compute_duration = 0;
@@ -982,7 +992,7 @@ ExecStatus MultiLatentAttentionGenExecutionLogic(Device_Ptr device,
       total_memory_size += memory_size;
 
       // Add per-iteration value, not the running sum (running sum causes N²/2 over-count).
-      time_ns iter_compute = flops / compute_peak_flops * 1000 * 1000 * 1000;
+      time_ns iter_compute = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       accumul_compute_duration += iter_compute;
       exec_status.compute_duration += iter_compute;
 
@@ -1056,7 +1066,7 @@ ExecStatus MultiLatentAttentionGenExecutionLogic(Device_Ptr device,
         memory_size = (m * k + k * n + m * n) * input->precision_byte;
         total_memory_size += memory_size;
 
-        compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+        compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
         exec_status.compute_duration += compute_duration;
         accumul_compute_duration += compute_duration;
 
@@ -1116,12 +1126,12 @@ ExecStatus MultiLatentAttentionGenExecutionLogic(Device_Ptr device,
 
       memory_size = (2.0 * m * n * num_heads) *input->precision_byte;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
       if(use_ramulator){
         memory_duration = 0;
-        
+
         ExecStatus temp;
 
         // read input
@@ -1171,7 +1181,7 @@ ExecStatus MultiLatentAttentionGenExecutionLogic(Device_Ptr device,
         memory_size = (m * k + k * n + m * n) * input->precision_byte;
         total_memory_size += memory_size;
 
-        compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+        compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
         exec_status.compute_duration += compute_duration;
         accumul_compute_duration += compute_duration;
 
@@ -1281,6 +1291,7 @@ ExecStatus MultiLatentAttentionGenExecutionPIM(Device_Ptr device,
   std::vector<int> shape = {1, head_dim};
 
   int num_seq = seq_list.size();
+  double batch_m = sequences_metadata->get_gen_process_token();
 
   int accumul_len = 0;
   time_ns accumul_compute_duration = 0;
@@ -1304,12 +1315,12 @@ ExecStatus MultiLatentAttentionGenExecutionPIM(Device_Ptr device,
       memory_size = 1.0 * (m * (head_dim + qk_rope_head_dim) + // query
                     1.0 * n * (head_dim + qk_rope_head_dim) + // key
                     1.0 * n * head_dim + // value
-                    1.0 * m * head_dim) * // output 
+                    1.0 * m * head_dim) * // output
                     num_heads * input->precision_byte;
       total_memory_size += memory_size;
 
       // Add per-iteration value, not the running sum (running sum causes N²/2 over-count).
-      time_ns iter_compute = flops / compute_peak_flops * 1000 * 1000 * 1000;
+      time_ns iter_compute = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       accumul_compute_duration += iter_compute;
       exec_status.compute_duration += iter_compute;
 
@@ -1382,7 +1393,7 @@ ExecStatus MultiLatentAttentionGenExecutionPIM(Device_Ptr device,
         memory_size = (m * k + k * n + m * n) * input->precision_byte;
         total_memory_size += memory_size;
 
-        compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+        compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
         exec_status.compute_duration += compute_duration;
         accumul_compute_duration += compute_duration;
 
@@ -1442,12 +1453,12 @@ ExecStatus MultiLatentAttentionGenExecutionPIM(Device_Ptr device,
 
       memory_size = (2.0 * m * n * num_heads) *input->precision_byte;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
       if(use_ramulator){
         memory_duration = 0;
-        
+
         ExecStatus temp;
 
         // read input
@@ -1491,13 +1502,13 @@ ExecStatus MultiLatentAttentionGenExecutionPIM(Device_Ptr device,
       n = head_dim;
 
       for (int head_idx = 0; head_idx < num_heads; head_idx++) {
-        flops = m * k * n * 2.0; 
+        flops = m * k * n * 2.0;
         total_flops += flops;
 
         memory_size = (m * k + k * n + m * n) * input->precision_byte;
         total_memory_size += memory_size;
 
-        compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+        compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
         exec_status.compute_duration += compute_duration;
         accumul_compute_duration += compute_duration;
 
@@ -1595,6 +1606,7 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
   std::vector<int> orig_shape = input->shape;
 
   int num_seq = seq_list.size();
+  double batch_m = sequences_metadata->get_gen_process_token();
 
   int accumul_len = 0; // num_seq x seqLen
   time_ns accumul_compute_duration = 0;
@@ -1618,12 +1630,12 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
 
       memory_size = 1.0 * (num_heads * (kv_lora_rank + qk_rope_head_dim) + // query
                     1.0 * n * (kv_lora_rank + qk_rope_head_dim) + // latent kv and pe cache
-                    1.0 * num_heads * kv_lora_rank) * // output 
+                    1.0 * num_heads * kv_lora_rank) * // output
                     input->precision_byte;
       total_memory_size += memory_size;
 
-      accumul_compute_duration += flops / compute_peak_flops * 1000 * 1000 * 1000;
-      exec_status.compute_duration += flops / compute_peak_flops * 1000 * 1000 * 1000;
+      accumul_compute_duration += flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
+      exec_status.compute_duration += flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
 
       if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
         total_kv_read_size += n * (kv_lora_rank + qk_rope_head_dim) * input->precision_byte;
@@ -1691,7 +1703,7 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
       memory_size = (1.0 * m * k * num_heads + 1.0 * k * n + 1.0 * m * n * num_heads) * input->precision_byte;
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       exec_status.compute_duration += compute_duration;
       accumul_compute_duration += compute_duration;
 
@@ -1764,13 +1776,13 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
       memory_size = (1.0 * m * k * num_heads + 1.0 * k * n + 1.0 * m * n * num_heads) * input->precision_byte;
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       exec_status.compute_duration += compute_duration;
       accumul_compute_duration += compute_duration;
 
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
       accumul_memory_duration += memory_duration;
-      
+
       accumul_len += n;
     }
 
@@ -1837,12 +1849,12 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
 
       memory_size = (2.0 * m * n * num_heads) * input->precision_byte;
       total_memory_size += memory_size;
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
       if(use_ramulator){
         memory_duration = 0;
-        
+
         ExecStatus temp;
 
         // read input
@@ -1893,7 +1905,7 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
         1.0 * m * n * num_heads) * input->precision_byte;
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       exec_status.compute_duration += compute_duration;
       accumul_compute_duration += compute_duration;
 
@@ -2027,6 +2039,7 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
   std::vector<int> orig_shape = input->shape;
 
   int num_seq = seq_list.size();
+  double batch_m = sequences_metadata->get_gen_process_token();
 
   int accumul_len = 0; // num_seq x seqLen
   time_ns accumul_compute_duration = 0;
@@ -2049,12 +2062,12 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
 
       memory_size = 1.0 * (num_heads * (kv_lora_rank + qk_rope_head_dim) + // query
                     1.0 * n * (kv_lora_rank + qk_rope_head_dim) + // latent kv and pe cache
-                    1.0 * num_heads * kv_lora_rank) * // output 
+                    1.0 * num_heads * kv_lora_rank) * // output
                     input->precision_byte;
       total_memory_size += memory_size;
 
       // Add per-iteration value, not the running sum (running sum causes N²/2 over-count).
-      time_ns iter_compute = flops / compute_peak_flops * 1000 * 1000 * 1000;
+      time_ns iter_compute = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       accumul_compute_duration += iter_compute;
       exec_status.compute_duration += iter_compute;
 
@@ -2118,7 +2131,7 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
       memory_size = (1.0 * m * k * num_heads + 1.0 * k * n + 1.0 * m * n * num_heads) * input->precision_byte;
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       exec_status.compute_duration += compute_duration;
       accumul_compute_duration += compute_duration;
 
@@ -2191,13 +2204,13 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
       memory_size = (1.0 * m * k * num_heads + 1.0 * k * n + 1.0 * m * n * num_heads) * input->precision_byte;
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       exec_status.compute_duration += compute_duration;
       accumul_compute_duration += compute_duration;
 
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
       accumul_memory_duration += memory_duration;
-      
+
       accumul_len += n;
     }
 
@@ -2264,12 +2277,12 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
 
       memory_size = (2.0 * m * n * num_heads) * input->precision_byte;
       total_memory_size += memory_size;
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
       if(use_ramulator){
         memory_duration = 0;
-        
+
         ExecStatus temp;
 
         // read input
@@ -2318,7 +2331,7 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
         1.0 * m * n * num_heads) * input->precision_byte;
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       exec_status.compute_duration += compute_duration;
       accumul_compute_duration += compute_duration;
 
@@ -2429,6 +2442,7 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
   std::vector<int> orig_shape = input->shape;
 
   int num_seq = seq_list.size();
+  double batch_m = sequences_metadata->get_gen_process_token();
 
   int accumul_len = 0; // num_seq x seqLen
   time_ns accumul_compute_duration = 0;
@@ -2450,12 +2464,12 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
 
       memory_size = 1.0 * (num_heads * (kv_lora_rank + qk_rope_head_dim) + // query
                     1.0 * n * (kv_lora_rank + qk_rope_head_dim) + // latent kv and pe cache
-                    1.0 * num_heads * kv_lora_rank) * // output 
+                    1.0 * num_heads * kv_lora_rank) * // output
                     input->precision_byte;
       total_memory_size += memory_size;
 
       // Add per-iteration value, not the running sum (running sum causes N²/2 over-count).
-      time_ns iter_compute = flops / compute_peak_flops * 1000 * 1000 * 1000;
+      time_ns iter_compute = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       accumul_compute_duration += iter_compute;
       exec_status.compute_duration += iter_compute;
 
@@ -2518,7 +2532,7 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
       memory_size = (1.0 * m * k * num_heads + 1.0 * k * n + 1.0 * m * n * num_heads) * input->precision_byte;
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       exec_status.compute_duration += compute_duration;
       accumul_compute_duration += compute_duration;
 
@@ -2591,13 +2605,13 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
       memory_size = (1.0 * m * k * num_heads + 1.0 * k * n + 1.0 * m * n * num_heads) * input->precision_byte;
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       exec_status.compute_duration += compute_duration;
       accumul_compute_duration += compute_duration;
 
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
       accumul_memory_duration += memory_duration;
-      
+
       accumul_len += n;
     }
 
@@ -2664,12 +2678,12 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
 
       memory_size = (2.0 * m * n * num_heads) * input->precision_byte;
       total_memory_size += memory_size;
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
 
       if(use_ramulator){
         memory_duration = 0;
-        
+
         ExecStatus temp;
 
         // read input
@@ -2716,10 +2730,10 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
       total_flops += flops;
       memory_size = (1.0 * m * k * num_heads + 1.0 * k * n +
         1.0 * m * n * num_heads) * input->precision_byte;
-    
+
       total_memory_size += memory_size;
 
-      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
+      compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
       exec_status.compute_duration += compute_duration;
       accumul_compute_duration += compute_duration;
 

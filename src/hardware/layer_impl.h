@@ -79,9 +79,16 @@ inline time_ns getLinearMemoryDuration(const SystemConfig& config, double m, dou
 // Pass 0 (or omit) to use config.chunk_size.  Callers that pass layer_info.chunk_size
 // should only do so when the layer graph sets a deliberate per-layer chunk; otherwise
 // use 0 so the global system.chunk_size setting is honored.
-inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric kv_read_size, hw_metric act_size, bool use_chunked_attention = false, int chunk_size_override = 0) {
+// fill_amortize_calls: number of per-layer flash-page-fill calls (e.g. GQA Gen's
+// K-scoring and V-context calls) that together form one dependency-free fetch
+// window, so the pipeline-fill page latency is shared across them instead of
+// each call exposing a full fill. Mirrors program_latency_amortize_calls /
+// weight_stream_ops_per_iter's amortize-across-calls convention. Default 1
+// charges the full page latency per call (legacy behavior).
+inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric kv_read_size, hw_metric act_size, bool use_chunked_attention = false, int chunk_size_override = 0, int fill_amortize_calls = 1) {
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
     auto& hbf = config.hbf_config;
+    int fill_amortize = (fill_amortize_calls > 0) ? fill_amortize_calls : 1;
 
     double kv_read_time = 0;
     if (use_chunked_attention) {
@@ -109,7 +116,7 @@ inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric 
           : 1;
       if (num_chunks < 1) num_chunks = 1;
       double chunk_transfer_ns = chunk_bytes / hbf.flash_read_bandwidth * 1e9;
-      double exposed_latency_ns = (double)hbf.flash_page_read_latency_ns +
+      double exposed_latency_ns = (double)hbf.flash_page_read_latency_ns / fill_amortize +
           (num_chunks - 1) * std::max(0.0, (double)hbf.flash_page_read_latency_ns - chunk_transfer_ns);
       kv_read_time = (kv_read_size / hbf.flash_read_bandwidth * 1e9) + exposed_latency_ns;
     } else {
@@ -122,7 +129,7 @@ inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric 
           : 1;
       if (num_chunks < 1) num_chunks = 1;
       double chunk_transfer_ns = sram_capacity / hbf.flash_read_bandwidth * 1e9;
-      double exposed_latency_ns = (double)hbf.flash_page_read_latency_ns +
+      double exposed_latency_ns = (double)hbf.flash_page_read_latency_ns / fill_amortize +
           (num_chunks - 1) * std::max(0.0, (double)hbf.flash_page_read_latency_ns - chunk_transfer_ns);
       kv_read_time = (kv_read_size / hbf.flash_read_bandwidth * 1e9) + exposed_latency_ns;
     }

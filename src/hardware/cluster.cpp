@@ -601,6 +601,14 @@ std::vector<Stat> Cluster::runIterationMixed(int iter, std::ofstream &csv) {
     time_ns time = maxDeviceTime();
 
     // if no reqeusts, add time
+    // INVARIANT: unreachable in the decode/steady-state harness path this cell
+    // measures -- num_process_token == batch every iteration once warm-up/
+    // hittingQueue has filled the running queue (verified: never hit across
+    // probed presets). If ever hit, this `continue` skips total_time
+    // accumulation for that iteration while the harness still divides by a
+    // fixed iteration count, deflating reported TPOT ~1/iter-count per
+    // occurrence -- a latent hazard only for a caller outside today's
+    // steady-state decode assumption.
     if (scheduler->getNumProcessToken() == 0) {
       time = 20 * 1000 * 1000;
       continue;
@@ -664,6 +672,11 @@ std::vector<Stat> Cluster::runIterationMixed(int iter, std::ofstream &csv) {
     scheduler->fillRunningQueue();
   }
 
+  // Final flush: the loop-top export (above) only writes the PRIOR iteration's
+  // rows, so the last measured iteration's stat_list entries are never written
+  // without this call.
+  exportToCSV(csv, stat_list);
+
   return stat_list;
 }
 
@@ -695,6 +708,14 @@ std::vector<Stat> Cluster::runIterationSumGenSplit(int iter,
     time_ns time = maxDeviceTime();
 
     // if no reqeusts, add time
+    // INVARIANT: unreachable in the decode/steady-state harness path this cell
+    // measures -- num_process_token == batch every iteration once warm-up/
+    // hittingQueue has filled the running queue (verified: never hit across
+    // probed presets). If ever hit, this `continue` skips total_time
+    // accumulation for that iteration while the harness still divides by a
+    // fixed iteration count, deflating reported TPOT ~1/iter-count per
+    // occurrence -- a latent hazard only for a caller outside today's
+    // steady-state decode assumption.
     if (scheduler->getNumProcessToken() == 0) {
       time = 20 * 1000 * 1000;
       continue;
@@ -765,6 +786,11 @@ std::vector<Stat> Cluster::runIterationSumGenSplit(int iter,
       addLatency(stat_list, token_list, stat.time);
     }
   }
+
+  // Final flush: the loop-top export (above) only writes the PRIOR iteration's
+  // rows, so the last measured iteration's stat_list entries are never written
+  // without this call.
+  exportToCSV(csv, stat_list);
 
   return stat_list;
 }
@@ -849,7 +875,27 @@ void Cluster::setStat(Stat &stat) {
 }
 
 void Cluster::setTimeBreakDown(Stat &stat) {
-  TimeBoard &timeboard = get_device(0)->top_module_graph->timeboard;
+  // One representative device per pipeline stage: device index = stage * ne_tp_dg,
+  // mirroring LLM::LLM's pp_stage = (device_total_rank / ne_tp_dg) % pp_dg grouping.
+  // TP/EP are synchronizing collectives (per-layer max() erases intra-group drift,
+  // so any device within a stage's group is representative for those buckets),
+  // but PP stages do NOT synchronize -- each stage's own timeboard entries must
+  // be summed in, or a later stage's work (e.g. lm_head) is silently missing.
+  // Reduces to exactly {device 0} when pp_dg == 1 -- byte-identical to reading
+  // device 0's timeboard alone.
+  int pp_stages = (scheduler->model_config.pp_dg > 0) ? scheduler->model_config.pp_dg : 1;
+  int ne_tp_dg = (scheduler->model_config.ne_tp_dg > 0) ? scheduler->model_config.ne_tp_dg : 1;
+  std::vector<TimeBoard *> stage_timeboards;
+  for (int stage = 0; stage < pp_stages; stage++) {
+    stage_timeboards.push_back(&get_device(stage * ne_tp_dg)->top_module_graph->timeboard);
+  }
+  // Per-stamp energy fields below extrapolate one representative device's
+  // energy to the group of devices sharing that same stamp; now that stamps
+  // come from one device PER STAGE rather than device 0 alone, the per-stamp
+  // multiplier must shrink from the whole cluster to just that stage's device
+  // count so the sum-over-stages still totals num_total_device. Reduces to
+  // num_total_device (unchanged) when pp_stages == 1.
+  int devices_per_stage = num_total_device / pp_stages;
 
   if(scheduler->model_config.qk_nope_head_dim == 0){
     std::vector<TimeStamp *> QKV_gen;    // GPU
@@ -866,29 +912,32 @@ void Cluster::setTimeBreakDown(Stat &stat) {
     std::vector<TimeStamp *> Residual;
     std::vector<TimeStamp *> LmHead;
 
-    timeboard.find_stamp("attn_qkv_proj", QKV_gen);
-    timeboard.find_stamp("AttentionSum", AttnSum);
-    timeboard.find_stamp("AttentionGen", AttnGen);
-    timeboard.find_stamp("attn_o_proj", O_proj);
-    timeboard.find_stamp("feedforward", FFN);
-    timeboard.find_stamp("expertFFN", ExpertFFN);
-    timeboard.find_stamp("moe_scatter", CommInExpertFFN);
-    timeboard.find_stamp("moe_all_reduce_for_e_tp", CommInExpertFFN);
-    timeboard.find_stamp("moe_all_reduce_for_gather", CommInExpertFFN);
-    timeboard.find_stamp("moe_gather", CommInExpertFFN);
-    timeboard.find_stamp("all_reduce", Comm);
-    timeboard.find_stamp("moe_scatter", Comm);
-    timeboard.find_stamp("moe_gather", Comm);
+    for (TimeBoard *tb : stage_timeboards) {
+      tb->find_stamp("attn_qkv_proj", QKV_gen);
+      tb->find_stamp("AttentionSum", AttnSum);
+      tb->find_stamp("AttentionGen", AttnGen);
+      tb->find_stamp("attn_o_proj", O_proj);
+      tb->find_stamp("feedforward", FFN);
+      tb->find_stamp("expertFFN", ExpertFFN);
+      tb->find_stamp("moe_scatter", CommInExpertFFN);
+      tb->find_stamp("moe_all_reduce_for_e_tp", CommInExpertFFN);
+      tb->find_stamp("moe_all_reduce_for_gather", CommInExpertFFN);
+      tb->find_stamp("moe_gather", CommInExpertFFN);
+      tb->find_stamp("all_reduce", Comm);
+      tb->find_stamp("moe_scatter", Comm);
+      tb->find_stamp("moe_gather", Comm);
+      tb->find_stamp("pipeline_stage", Comm);
 
-    timeboard.find_stamp("k_rope", RoPE);
-    timeboard.find_stamp("q_rope", RoPE);
+      tb->find_stamp("k_rope", RoPE);
+      tb->find_stamp("q_rope", RoPE);
 
-    timeboard.find_stamp("input_layer_norm", LayerNorm);
-    timeboard.find_stamp("post_attn_layer_norm", LayerNorm);
-    
-    timeboard.find_stamp("residual_1", Residual);
-    timeboard.find_stamp("residual_2", Residual);
-    timeboard.find_stamp("lm_head", LmHead);
+      tb->find_stamp("input_layer_norm", LayerNorm);
+      tb->find_stamp("post_attn_layer_norm", LayerNorm);
+
+      tb->find_stamp("residual_1", Residual);
+      tb->find_stamp("residual_2", Residual);
+      tb->find_stamp("lm_head", LmHead);
+    }
 
     time_ns qkv_gen = 0;
     time_ns atten_sum = 0;
@@ -913,8 +962,8 @@ void Cluster::setTimeBreakDown(Stat &stat) {
 
     for (auto stamp : QKV_gen) {
       qkv_gen += stamp->get_duration();
-      FC_DRAM += stamp->getDramEnergy() * num_total_device;
-      FC_COMP += stamp->getCompEnergy() * num_total_device;
+      FC_DRAM += stamp->getDramEnergy() * devices_per_stage;
+      FC_COMP += stamp->getCompEnergy() * devices_per_stage;
     }
     stat.qkv_gen = qkv_gen;
 
@@ -924,8 +973,8 @@ void Cluster::setTimeBreakDown(Stat &stat) {
       time_ns stamp_kv = stamp->get_kv_write();
       atten_sum += (stamp_dur - stamp_kv);
       kv_write += stamp_kv;
-      Attn_DRAM += stamp->getDramEnergy() * num_total_device;
-      Attn_COMP += stamp->getCompEnergy() * num_total_device;
+      Attn_DRAM += stamp->getDramEnergy() * devices_per_stage;
+      Attn_COMP += stamp->getCompEnergy() * devices_per_stage;
     }
     stat.atten_sum = atten_sum;
 
@@ -934,23 +983,23 @@ void Cluster::setTimeBreakDown(Stat &stat) {
       time_ns stamp_kv = stamp->get_kv_write();
       atten_gen += (stamp_dur - stamp_kv);
       kv_write += stamp_kv;
-      Attn_DRAM += stamp->getDramEnergy() * num_total_device;
-      Attn_COMP += stamp->getCompEnergy() * num_total_device;
+      Attn_DRAM += stamp->getDramEnergy() * devices_per_stage;
+      Attn_COMP += stamp->getCompEnergy() * devices_per_stage;
     }
     stat.atten_gen = atten_gen;
     stat.kv_write = kv_write;
 
     for (auto stamp : O_proj) {
       o_proj += stamp->get_duration();
-      FC_DRAM += stamp->getDramEnergy() * num_total_device;
-      FC_COMP += stamp->getCompEnergy() * num_total_device;
+      FC_DRAM += stamp->getDramEnergy() * devices_per_stage;
+      FC_COMP += stamp->getCompEnergy() * devices_per_stage;
     }
     stat.o_proj = o_proj;
 
     for (auto stamp : FFN) {
       ffn += stamp->get_duration();
-      FC_DRAM += stamp->getDramEnergy() * num_total_device;
-      FC_COMP += stamp->getCompEnergy() * num_total_device;
+      FC_DRAM += stamp->getDramEnergy() * devices_per_stage;
+      FC_COMP += stamp->getCompEnergy() * devices_per_stage;
     }
     stat.ffn = ffn;
 
@@ -1048,46 +1097,49 @@ void Cluster::setTimeBreakDown(Stat &stat) {
     std::vector<TimeStamp *> Test;
     std::vector<TimeStamp *> LmHead;
 
-    timeboard.find_stamp("attn_q_down_proj", Q_down);
-    timeboard.find_stamp("attn_kv_down_proj", KV_down);
-    timeboard.find_stamp("attn_kr_proj", KR_proj);
+    for (TimeBoard *tb : stage_timeboards) {
+      tb->find_stamp("attn_q_down_proj", Q_down);
+      tb->find_stamp("attn_kv_down_proj", KV_down);
+      tb->find_stamp("attn_kr_proj", KR_proj);
 
-    timeboard.find_stamp("attn_q_up_proj", Q_up);
-    timeboard.find_stamp("attn_qr_proj", QR_proj);
-    timeboard.find_stamp("attn_kv_up_proj", KV_up);
+      tb->find_stamp("attn_q_up_proj", Q_up);
+      tb->find_stamp("attn_qr_proj", QR_proj);
+      tb->find_stamp("attn_kv_up_proj", KV_up);
 
-    // for MLA absorb //
-    timeboard.find_stamp("attn_tr_k_up_proj", tr_K_up);
-    timeboard.find_stamp("attn_v_up_proj", V_up);
+      // for MLA absorb //
+      tb->find_stamp("attn_tr_k_up_proj", tr_K_up);
+      tb->find_stamp("attn_v_up_proj", V_up);
 
-    timeboard.find_stamp("AttentionSum", AttnSum);
-    timeboard.find_stamp("AttentionGen", AttnGen);
+      tb->find_stamp("AttentionSum", AttnSum);
+      tb->find_stamp("AttentionGen", AttnGen);
 
-    timeboard.find_stamp("attn_o_proj", O_proj);
+      tb->find_stamp("attn_o_proj", O_proj);
 
-    timeboard.find_stamp("feedforward", FFN);
-    timeboard.find_stamp("expertFFN", ExpertFFN);
-    timeboard.find_stamp("moe_scatter", CommInExpertFFN);
-    timeboard.find_stamp("moe_all_reduce_for_e_tp", CommInExpertFFN);
-    timeboard.find_stamp("moe_all_reduce_for_gather", CommInExpertFFN);
-    timeboard.find_stamp("moe_gather", CommInExpertFFN);
-    timeboard.find_stamp("all_reduce", Comm);
-    timeboard.find_stamp("moe_scatter", Comm);
-    timeboard.find_stamp("moe_gather", Comm);
+      tb->find_stamp("feedforward", FFN);
+      tb->find_stamp("expertFFN", ExpertFFN);
+      tb->find_stamp("moe_scatter", CommInExpertFFN);
+      tb->find_stamp("moe_all_reduce_for_e_tp", CommInExpertFFN);
+      tb->find_stamp("moe_all_reduce_for_gather", CommInExpertFFN);
+      tb->find_stamp("moe_gather", CommInExpertFFN);
+      tb->find_stamp("all_reduce", Comm);
+      tb->find_stamp("moe_scatter", Comm);
+      tb->find_stamp("moe_gather", Comm);
+      tb->find_stamp("pipeline_stage", Comm);
 
-    timeboard.find_stamp("k_rope", RoPE);
-    timeboard.find_stamp("q_rope", RoPE);
+      tb->find_stamp("k_rope", RoPE);
+      tb->find_stamp("q_rope", RoPE);
 
-    timeboard.find_stamp("input_layer_norm", LayerNorm);
-    timeboard.find_stamp("latent_q_layer_norm", LayerNorm);
-    timeboard.find_stamp("latent_kv_layer_norm", LayerNorm);
-    timeboard.find_stamp("post_attn_layer_norm", LayerNorm);
-    
-    timeboard.find_stamp("residual_1", Residual);
-    timeboard.find_stamp("residual_2", Residual);
-    timeboard.find_stamp("lm_head", LmHead);
+      tb->find_stamp("input_layer_norm", LayerNorm);
+      tb->find_stamp("latent_q_layer_norm", LayerNorm);
+      tb->find_stamp("latent_kv_layer_norm", LayerNorm);
+      tb->find_stamp("post_attn_layer_norm", LayerNorm);
 
-    timeboard.find_stamp("decoder_", Decoders);
+      tb->find_stamp("residual_1", Residual);
+      tb->find_stamp("residual_2", Residual);
+      tb->find_stamp("lm_head", LmHead);
+
+      tb->find_stamp("decoder_", Decoders);
+    }
 
     time_ns q_down_proj = 0;
     time_ns kv_down_proj = 0;
@@ -1124,57 +1176,57 @@ void Cluster::setTimeBreakDown(Stat &stat) {
 
     for (auto stamp : Q_down){
       q_down_proj += stamp->get_duration();
-      Attn_DRAM += stamp->getDramEnergy() * num_total_device;
-      Attn_COMP += stamp->getCompEnergy() * num_total_device;
+      Attn_DRAM += stamp->getDramEnergy() * devices_per_stage;
+      Attn_COMP += stamp->getCompEnergy() * devices_per_stage;
     }
     stat.q_down_proj = q_down_proj;
 
     for (auto stamp : KV_down){
       kv_down_proj += stamp->get_duration();
-      Attn_DRAM += stamp->getDramEnergy() * num_total_device;
-      Attn_COMP += stamp->getCompEnergy() * num_total_device;
+      Attn_DRAM += stamp->getDramEnergy() * devices_per_stage;
+      Attn_COMP += stamp->getCompEnergy() * devices_per_stage;
     }
     stat.kv_down_proj = kv_down_proj;
 
     for (auto stamp : KR_proj){
       kr_proj += stamp->get_duration();
-      Attn_DRAM += stamp->getDramEnergy() * num_total_device;
-      Attn_COMP += stamp->getCompEnergy() * num_total_device;
+      Attn_DRAM += stamp->getDramEnergy() * devices_per_stage;
+      Attn_COMP += stamp->getCompEnergy() * devices_per_stage;
     }
     stat.kr_proj = kr_proj;
 
     for (auto stamp : Q_up){
       q_up_proj += stamp->get_duration();
-      Attn_DRAM += stamp->getDramEnergy() * num_total_device;
-      Attn_COMP += stamp->getCompEnergy() * num_total_device;
+      Attn_DRAM += stamp->getDramEnergy() * devices_per_stage;
+      Attn_COMP += stamp->getCompEnergy() * devices_per_stage;
     }
     stat.q_up_proj = q_up_proj;
 
     for (auto stamp : QR_proj){
       qr_proj += stamp->get_duration();
-      Attn_DRAM += stamp->getDramEnergy() * num_total_device;
-      Attn_COMP += stamp->getCompEnergy() * num_total_device;
+      Attn_DRAM += stamp->getDramEnergy() * devices_per_stage;
+      Attn_COMP += stamp->getCompEnergy() * devices_per_stage;
     }
     stat.qr_proj = qr_proj;
 
     for (auto stamp : KV_up){
       kv_up_proj += stamp->get_duration();
-      Attn_DRAM += stamp->getDramEnergy() * num_total_device;
-      Attn_COMP += stamp->getCompEnergy() * num_total_device;
+      Attn_DRAM += stamp->getDramEnergy() * devices_per_stage;
+      Attn_COMP += stamp->getCompEnergy() * devices_per_stage;
     }
     stat.kv_up_proj = kv_up_proj;
 
     for (auto stamp : tr_K_up){
       tr_k_up_proj += stamp->get_duration();
-      Attn_DRAM += stamp->getDramEnergy() * num_total_device;
-      Attn_COMP += stamp->getCompEnergy() * num_total_device;
+      Attn_DRAM += stamp->getDramEnergy() * devices_per_stage;
+      Attn_COMP += stamp->getCompEnergy() * devices_per_stage;
     }
     stat.tr_k_up_proj = tr_k_up_proj;
 
     for (auto stamp : V_up){
       v_up_proj += stamp->get_duration();
-      Attn_DRAM += stamp->getDramEnergy() * num_total_device;
-      Attn_COMP += stamp->getCompEnergy() * num_total_device;
+      Attn_DRAM += stamp->getDramEnergy() * devices_per_stage;
+      Attn_COMP += stamp->getCompEnergy() * devices_per_stage;
     }
     stat.v_up_proj = v_up_proj;
 
@@ -1184,8 +1236,8 @@ void Cluster::setTimeBreakDown(Stat &stat) {
       time_ns stamp_kv = stamp->get_kv_write();
       atten_sum += (stamp_dur - stamp_kv);
       kv_write += stamp_kv;
-      Attn_DRAM += stamp->getDramEnergy() * num_total_device;
-      Attn_COMP += stamp->getCompEnergy() * num_total_device;
+      Attn_DRAM += stamp->getDramEnergy() * devices_per_stage;
+      Attn_COMP += stamp->getCompEnergy() * devices_per_stage;
     }
     stat.atten_sum = atten_sum;
 
@@ -1194,23 +1246,23 @@ void Cluster::setTimeBreakDown(Stat &stat) {
       time_ns stamp_kv = stamp->get_kv_write();
       atten_gen += (stamp_dur - stamp_kv);
       kv_write += stamp_kv;
-      Attn_DRAM += stamp->getDramEnergy() * num_total_device;
-      Attn_COMP += stamp->getCompEnergy() * num_total_device;
+      Attn_DRAM += stamp->getDramEnergy() * devices_per_stage;
+      Attn_COMP += stamp->getCompEnergy() * devices_per_stage;
     }
     stat.atten_gen = atten_gen;
     stat.kv_write = kv_write;
 
     for (auto stamp : O_proj) {
       o_proj += stamp->get_duration();
-      FC_DRAM += stamp->getDramEnergy() * num_total_device;
-      FC_COMP += stamp->getCompEnergy() * num_total_device;
+      FC_DRAM += stamp->getDramEnergy() * devices_per_stage;
+      FC_COMP += stamp->getCompEnergy() * devices_per_stage;
     }
     stat.o_proj = o_proj;
 
     for (auto stamp : FFN) {
       ffn += stamp->get_duration();
-      FC_DRAM += stamp->getDramEnergy() * num_total_device;
-      FC_COMP += stamp->getCompEnergy() * num_total_device;
+      FC_DRAM += stamp->getDramEnergy() * devices_per_stage;
+      FC_COMP += stamp->getCompEnergy() * devices_per_stage;
     }
     stat.ffn = ffn;
 
