@@ -562,11 +562,25 @@ std::vector<Stat> Cluster::runIteration(int iter, std::string file_name) {
   // hitting
   scheduler->hittingQueue(10000);
 
+  // paper2 KV-bytes accountant: enable counting HERE, right before the TIMED
+  // per-iteration loop begins -- the initial fillRunningQueue() population
+  // above and every admission/decode inside hittingQueue()'s untimed warmup
+  // have already happened and must NOT be counted (see scheduler.h doc
+  // comment on p2_byte_counting_enabled). Both runIterationSumGenSplit and
+  // runIterationMixed below drive the actual timed setMetadata/run/
+  // updateScheduler/fillRunningQueue loop this accountant measures.
+  scheduler->setP2ByteCountingEnabled(true);
+
   if (config.disagg_system) {
     stat_list = runIterationSumGenSplit(iter, csv);
   } else {
     stat_list = runIterationMixed(iter, csv);
   }
+
+  // Disable after the timed loop: nothing outside runIteration should keep
+  // accumulating into these counters (e.g. if a caller ever re-invokes
+  // hittingQueue()/fillRunningQueue() post-hoc).
+  scheduler->setP2ByteCountingEnabled(false);
 
   std::cout << "Total: " << std::to_string(scheduler->total_time) << std::endl;
   std::cout << file_name << std::endl;

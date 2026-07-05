@@ -539,6 +539,30 @@ std::vector<Sequence::Ptr> Scheduler::updateScheduler(time_ns time) {
 
   for (int batch_idx = 0; batch_idx < running_queue.size(); batch_idx++) {
     BatchedSequence::Ptr batch = running_queue.at(batch_idx);
+
+    // paper2 KV-bytes accountant -- decode hook. MUST run BEFORE
+    // batch->update(time) below: that call both advances current_len AND
+    // zeroes num_process_token (Sequence::update), so this is the only point
+    // where "did this sequence just generate a token this step" is still
+    // observable. get_gen() classifies by current_len >= input_len, i.e.
+    // "already past prefill" at this pre-update instant -- the very step a
+    // sequence's prefill *completes* (current_len reaches input_len via THIS
+    // update call) is still classified "sum" going into it, so it is
+    // correctly excluded here: that admission's prefill KV bytes were
+    // already counted once, at admission time, in fillRunningQueue(). The
+    // num_process_token>0 guard excludes gen-classified sequences that
+    // haven't actually started generating yet (gen_start_time > total_time
+    // in setMetadata(), whose num_process_token stays 0) -- they wrote no KV
+    // entry this step.
+    if (p2_byte_counting_enabled) {
+      for (auto& seq : batch->get_gen()) {
+        if (seq->num_process_token > 0) {
+          p2_decode_kv_bytes +=
+              model_config.num_layers * kvBytesPerLayerToken(model_config);
+        }
+      }
+    }
+
     batch->update(time);
 
     // remove seq of which generation is done
@@ -605,6 +629,15 @@ void Scheduler::fillRunningQueue(time_ns time) {
         // this is the sole place that happens. Unconditional upkeep (see
         // scheduler.h doc comment); a plain integer add cannot alter timing.
         admitted_prefill_tokens_this_step += seqPtr->input_len;
+        // paper2 KV-bytes accountant -- admission hook. Same site as the
+        // admission-token counter just above (sole place a sequence
+        // transitions sequence_queue -> running_queue). Guarded by
+        // p2_byte_counting_enabled (see scheduler.h doc comment); a plain
+        // double add cannot perturb timing.
+        if (p2_byte_counting_enabled) {
+          p2_admission_kv_bytes +=
+              perSeqAdmissionKvBytes(model_config, (double)seqPtr->input_len);
+        }
         break;
       }
     }

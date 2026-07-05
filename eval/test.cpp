@@ -1011,6 +1011,22 @@ int main(int argc, char *argv[]) {
   scheduler->getActualArrivalTime(total_iter);
   stat_list = cluster->runIteration(total_iter, file_name);
 
+  // paper2 node-total live KV-bytes-written accountant, counted over the
+  // TIMED iterations only (Cluster::runIteration enables/disables the
+  // scheduler-level counters around exactly that window -- see
+  // scheduler.h's p2_byte_counting_enabled doc comment). Node-total and
+  // LOGICAL-byte by construction (see same doc comment); unconditional,
+  // additive-only emission -- these do not alter any prior stdout line.
+  {
+    double p2_admission_bytes = scheduler->getP2AdmissionKvBytes();
+    double p2_decode_bytes = scheduler->getP2DecodeKvBytes();
+    std::cout << "P2_KV_BYTES_WRITTEN_TOTAL: "
+              << (p2_admission_bytes + p2_decode_bytes) << std::endl;
+    std::cout << "P2_KV_ADMISSION_BYTES: " << p2_admission_bytes << std::endl;
+    std::cout << "P2_KV_DECODE_BYTES: " << p2_decode_bytes << std::endl;
+    std::cout << "P2_TIMED_ITERS: " << total_iter << std::endl;
+  }
+
   // Part E: latency drift harness — compare optimizer prediction vs measured.
   // measured_latency_ms = total simulation time / num_iterations / 1e6.
   // Uses a looser threshold (2x) since the predictive model is coarse-grained.

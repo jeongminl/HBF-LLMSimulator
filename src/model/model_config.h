@@ -147,6 +147,33 @@ inline double effectiveKvLenSumAllLayers(const ModelConfig& mc, double context_l
   return total;
 }
 
+// Per-layer, per-token KV-cache byte width. Model-wide, not per-layer --
+// compressed_kv/kv_lora_rank/qk_rope_head_dim/num_kv_heads/head_dim/
+// precision_byte are all model-level fields, not layer-indexed. Shared unit
+// behind PEC_KV_BYTES_PER_SEQ's admission+decode sum (eval/test.cpp) and the
+// paper2 live node-total KV-bytes-written accountant (Scheduler::
+// p2_admission_kv_bytes / p2_decode_kv_bytes, scheduler.cpp).
+//   standard KV per layer-token: 2 * num_kv_heads * head_dim * precision_byte
+//   compressed KV (MLA):         (kv_lora_rank + qk_rope_head_dim) * precision_byte
+inline double kvBytesPerLayerToken(const ModelConfig& mc) {
+  return mc.compressed_kv
+      ? (double)(mc.kv_lora_rank + mc.qk_rope_head_dim) * mc.precision_byte
+      : 2.0 * mc.num_kv_heads * mc.head_dim * mc.precision_byte;
+}
+
+// Admission-side KV bytes landing in decode-node flash the instant a sequence
+// with `input_len` prefill tokens is admitted into a running batch: the
+// per-layer iRoPE-window-capped length (effectiveKvLenSumAllLayers above)
+// times the per-layer-token byte width. This is exactly the admission HALF of
+// PEC_KV_BYTES_PER_SEQ's per-sequence sum (eval/test.cpp) -- that block's
+// other half is num_layers * output_len tokens, UNCAPPED, matching the decode
+// hook in scheduler.cpp: decode appends are never window-capped (a local
+// layer's window evicts old KV entries on eviction, it does not skip writing
+// new ones), only admission is.
+inline double perSeqAdmissionKvBytes(const ModelConfig& mc, double input_len) {
+  return kvBytesPerLayerToken(mc) * effectiveKvLenSumAllLayers(mc, input_len);
+}
+
 // Returns true if the given (0-indexed) layer is a MoE (routed-expert) layer.
 // Honors both first_k_dense (the first N layers are always dense regardless of
 // expert_freq) and expert_freq (every expert_freq-th layer is MoE). Works for

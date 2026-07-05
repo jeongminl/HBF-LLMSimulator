@@ -130,6 +130,47 @@ class Scheduler : public std::enable_shared_from_this<Scheduler> {
     return admitted_prefill_tokens_this_step;
   }
 
+  // paper2 node-total live KV-bytes-written accountant (lifetime TBW math).
+  // Node-total by construction: running_queue holds ALL dp_degree
+  // BatchedSequence replicas (fillRunningQueue/updateScheduler iterate the
+  // whole running_queue, not a single representative), so this scheduler
+  // instance's counters already sum across the entire node -- unlike the
+  // existing Stat/CSV plumbing, which samples one representative device per
+  // pipeline stage and must NOT be ridden for this purpose. These are
+  // LOGICAL KV bytes (the unit paper2 Eq.(1)/(2) accounts in): with TP>1 the
+  // same logical KV token is sharded across TP ranks, not duplicated per
+  // rank, so no TP multiplier belongs here.
+  //
+  // admission bytes: sum over admitted sequences of perSeqAdmissionKvBytes()
+  // (model_config.h) -- prefill KV landing in decode-node flash on
+  // admission, capped per local iRoPE layer at min(input_len, window).
+  // Counted in fillRunningQueue(), the sole place a sequence transitions
+  // sequence_queue -> running_queue.
+  //
+  // decode bytes: sum over timed decode steps, over sequences that actually
+  // advance (generate a token) that step, of num_layers *
+  // kvBytesPerLayerToken() -- one new KV entry per layer per generated
+  // token, NEVER window-capped (the window evicts old entries on read, it
+  // does not skip writing new ones on append). Counted in updateScheduler()
+  // -- see the hook there for why that is the exact per-step
+  // token-generation site.
+  //
+  // Both guarded by p2_byte_counting_enabled (default false; flipped on by
+  // Cluster::runIteration right before the TIMED per-iteration loop begins,
+  // after hittingQueue()'s untimed warmup and the initial fillRunningQueue()
+  // have already populated the running queue) so only the TIMED window is
+  // counted. Pure counters -- a plain double add cannot alter any timing or
+  // scheduling decision.
+  bool p2_byte_counting_enabled = false;
+  void setP2ByteCountingEnabled(bool enabled) {
+    p2_byte_counting_enabled = enabled;
+  }
+
+  double p2_admission_kv_bytes = 0.0;
+  double p2_decode_kv_bytes = 0.0;
+  double getP2AdmissionKvBytes() const { return p2_admission_kv_bytes; }
+  double getP2DecodeKvBytes() const { return p2_decode_kv_bytes; }
+
   std::vector<Sequence::Ptr> sequence_queue;
   std::vector<BatchedSequence::Ptr> running_queue;
 
