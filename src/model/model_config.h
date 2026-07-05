@@ -233,8 +233,8 @@ static ModelConfig glam = ModelConfig(4096, 128, 32, 32, 32, 8192, 16384, 16384,
                                       1, 2, 64, 0, 2, 2, 2, 0, 0, 0, 0, 0, 256000, false, false, 0.0, "glam");
 
 static ModelConfig deepseekV3 =
-    ModelConfig(7168, 128, 60, 128, 128, 131072, 18432, 2048, 1, 1, 256, 1, 1, 8,
-                3, 3, 1536, 512, 128, 64, 129280, true, true, 0.0,"deepseekV3"); // n_layer = 60 (not consider MTP module)
+    ModelConfig(7168, 128, 61, 128, 128, 131072, 18432, 2048, 1, 1, 256, 1, 1, 8,
+                3, 3, 1536, 512, 128, 64, 129280, true, true, 0.0,"deepseekV3"); // n_layer = 61 per the V3 tech report: 61 transformer layers, EXCLUDING the separate MTP module (the old "60 (not consider MTP module)" comment misread this same count as 60 base + MTP separately, undercounting by one)
 
 // paper2 (Kyung et al., IEEE CAL 2026) §IV evaluates DeepSeek-R1 671B, verbatim
 // "employing BF16 precision for both model weights and KV caches" -- hence
@@ -242,12 +242,12 @@ static ModelConfig deepseekV3 =
 // an exact copy of deepseekV3's architecture (R1 and V3 share the same
 // transformer architecture; R1 is a reasoning-tuned checkpoint of it), except
 // num_layers=61: the DeepSeek-V3/R1 technical report specifies 61 transformer
-// layers EXCLUDING the separate Multi-Token-Prediction (MTP) module -- this is
-// the CORRECTED layer count (see deepseekV3's own num_layers=60, whose comment
-// misread the same tech report; deepseekV3's 60->61 fix is a separate,
-// deliberately-isolated change -- see this file's git history / CHANGES.md --
-// so as not to disturb this preset's addition). KV bytes/token with this
-// preset: (kv_lora_rank + qk_rope_head_dim) * precision_byte * num_layers =
+// layers EXCLUDING the separate Multi-Token-Prediction (MTP) module -- matches
+// deepseekV3's own num_layers above (also 61; see that preset's comment and
+// this file's git history for the 60->61 correction, landed as a separate,
+// deliberately-isolated change so as not to conflate it with this preset's
+// addition). KV bytes/token with this preset:
+// (kv_lora_rank + qk_rope_head_dim) * precision_byte * num_layers =
 // (512 + 64) * 2 * 61 = 68.6 KB/token, matching paper2 §II's own figure.
 // CAVEAT (comment only -- no code change needed): communication.cpp's
 // deepseekV3 FP8 all-to-all dispatch-size adjustment is STRING-MATCHED against
