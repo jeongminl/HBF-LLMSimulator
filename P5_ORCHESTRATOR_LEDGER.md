@@ -603,3 +603,196 @@ SURFACE (no code change without user): skewness (R1 scoping); Fig-6 readings §4
 (F3-C2, cosmetic); live-side shared-expert TP-sharding question (R2). DOC-NOTES: F1-C1
 window bias, F1-C4 sum_stage, F4-3 chunk aggregation, F5-C2/C3, expert_ffn time-vs-energy
 device-0 inconsistency (R4), F2-C1 ruling superseded by fix 4.
+
+## Phase 6 follow-up: sibling-worktree sweep discrepancy investigation (2026-07-05)
+A sibling worktree (worktree-stateful-forging-gem, HEAD at bd6d58a — TWO passes behind this
+worktree, missing both fourth-pass items 51-57 AND this pass's items 58-65) ran its own full
+sweep and reported 4 discrepancy clusters vs the paper. User asked whether items 51-65 explain
+any of them. 3 parallel Opus investigations launched (non-blind, full context/tool access,
+concurrent with this worktree's own Phase 6 full sweep — SWEEP_WORKERS=4/OFFLINE_SWEEP_WORKERS=1).
+
+### Investigate-hbm4-fig6 — Fig-6 "Batch Ratio", HBM4, 4-8 GPU, 29-55% error (RESOLVED)
+**Verdict: fully explained by the already-documented, unresolved Fig-6 Batch-row readings
+problem. NOT a sim bug, NOT explained/caused by items 51-65 (they don't touch it either way).**
+Orchestrator-verified code claims: SENSITIVITY_GPUS=[4,8,16] (run_experiments.py:51, comment
+confirms "HBM4 can't load either model on 1-2 GPUs"), Fig-6 self-normalizes to that SLO's own
+HBM4@8GPU cell (:1510-1513, `base_max_batch_per_gpu` keyed from the HBM4/8GPU/same-SLO
+baseline), error formula `|paper-sim|/sim` (compare_error_rates.py:7), config.yaml num_node:1
+(item 51/52's num_node>1 gate never engages at 4-16 GPU) — all confirmed exact matches.
+Agent's numeric reproduction (llama3 HBM4 LONG batch/GPU 1.75/3.75/3.75 at 4/8/16 GPU; llama4
+16.25/32.0/39.25) cross-validated bit-exact against the concurrently-running Phase-6 sweep's
+own checkpoint_baselines data — strong internal consistency check. Error decomposes as: the
+8-GPU cell (36%) is an unavoidable artifact of self-normalization against a paper bar the
+readings file itself flags as near-zero/imprecise; the 4-GPU cell (51-55%) is explained by the
+paper's OWN Fig-6 batch bar (0.23) contradicting its OWN Fig-3 bar for the same cell (0.474/
+0.534, matching the sim to 1.4-4.8%) — a paper-internal Fig-3-vs-Fig-6 inconsistency, not a sim
+error. No single rescale factor reconciles Fig-6 Batch against Fig-3 (matches the fifth pass's
+own prior finding that the Batch-row overshoot is a SEPARATE, unfixed problem from the TPS-row
+0.843x miscalibration). RECOMMENDATION (not applied, decision for user): correct the readings
+file's §4 Batch rows per-cell against the paper's own internally-consistent Fig-3 bars (mirrors
+the already-proposed-but-unapplied TPS-row fix), rather than any uniform rescale.
+Bonus (unrelated, does not explain the reported issue, noted for future audit only): llama3
+HBM4 16-GPU per-GPU batch is flat vs 8-GPU (TP capped at num_kv_heads=8 → 8→16 GPU can only
+add DP, no further per-GPU KV headroom) vs paper's Fig-3 showing +24% growth; makes 16-GPU
+error SMALLER (13%) not larger, so it's not part of the reported 29-55% pattern.
+
+### Investigate-conv-lowgpu — Fig 4 CONV/llama4_maverick low-GPU-count, 55-89% error
+**STATUS DOWNGRADED TO PARTIAL/OPEN after refutation (see R-conv-lowgpu below) — the
+mechanism and "items 51-65 uninvolved" survive, but the specific probe numbers and the
+recommendation's safety claim do NOT. Do not treat as closed.**
+**Verdict: items 51-65 do NOT explain it — genuinely separate, pre-existing (items 1-50 era)
+root cause: the sim's MoE zero-token expert-weight-skip (correct, physically real sparsity)
+interacts with CONV's slow flash bandwidth to produce a large per-token cost discount at
+low/SLO-capped batch, compounded by substantial paper-extraction noise specific to these
+exact cells.** Orchestrator-verified: CONV preset confirmed 1 HBM+7 flash stacks
+(`hbf_memory_config.h:105`, "3620 GB"; CONV+ 0 HBM+8 flash at :122) — CONV genuinely engages
+`use_hbf` (has flash stacks) so fifth-pass use_hbf-gated fixes are NOT no-ops here, but their
+documented magnitude (0.1-0.7%) is 2+ orders of magnitude short of the 55-89% gap. Zero-token
+expert skip confirmed exact at `linear_impl.cpp:72` (`input->getSize()==0 → return`, matches
+R1's F4/skewness finding's same gate, preset-agnostic). num_node=1 for all GPU counts except
+16 (confirmed exact in run_experiments.py) — items 51/52 (node-aware MoE a2a) are exact no-ops
+at every CONV/1-4-GPU cell in scope.
+Mechanism: at batch B, activated (weight-reading) experts ≈ 128·(1-(127/128)^B) out of 128
+total; CONV's slow BW caps the SLO-feasible batch far below 128 (probe: batch 32 at CONV/
+llama4/MID/1GPU reaches the 0.1s SLO ceiling), so only ~29/128 experts stream weights per
+step — a real, physically-correct sparsity effect, NOT a bug — while the paper's own tool
+evidently prices flash MoE more pessimistically (full-expert streaming and/or unhidden
+per-expert page latency), consistent with the paper's own "CONV underutilization up to 95%"
+narrative (anchor sheet). Probe-confirmed step time 98ms/tps 326 at batch 32 (CONV/llama4/
+MID/1GPU) vs the sweep's reported 334 tps — reproduces closely. Genuine sim-side gap estimated
+~2-3x (not the full 7x implied by the raw 55-89%/658% figures) once corrected for signature
+evidence of paper-extraction noise on these SPECIFIC cells: CONV and CONV+ share one color/
+marker-shape-only distinction on the anchor sheet, the paper's llama4/CONV low-GPU points are
+non-monotonic (2GPU→4GPU drops), one CONV point reads identically to its CONV+ neighbor
+(589=589, likely a mis-plotted/misread marker), and the paper's stated 44 tps would imply
+reading >2x the entire model per step (physically impossible) — the noisiest points in the
+whole figure. CONV+ (fast enough to keep batch>>128, all experts active, no sparsity discount)
+and HBF (same) both match the paper well; only slow-flash+MoE+low-batch cells are affected —
+a tight, mechanism-consistent signature, not scattered noise, but confidence in the EXACT
+magnitude is limited by paper-reading noise on this specific cluster.
+RECOMMENDATION (not applied, decision for user — would be a paper-methodology-conformance
+change, not a bug fix): if pursued, a paper-faithful option is to make flash-tier MoE expert
+weight-reads NOT credit sub-saturation sparsity (or expose per-activated-expert page latency
+without cross-expert amortization) — scoped to flash tiers only so HBF/CONV+/dense-llama3
+cells (which already match) are undisturbed. Validate any such change against a cleaner,
+less noisy anchor than llama4/CONV Fig-4 before committing to a specific magnitude.
+
+### Investigate-hbfp-short — Fig 3/4/7 HBF+/llama4_maverick/SHORT overshoot 30-62% (+ Fig-7
+llama3/HBF+/SHORT PEC 35.3%) (RESOLVED)
+**Verdict: this IS the U7 paper-internal SRAM-accounting inconsistency (F8/R3/V-moe-liveness,
+already established earlier in THIS pass), not anything explained by items 51-65.** The "30-62%"
+band is largely an artifact of `compare_error_rates.py`'s own `|paper-sim|/sim` convention
+(sim as denominator) combined with sim batch GROWING with GPU count while the paper's HBF+
+bar stays FLAT (since 854.7 — confirmed exact at `regression_13cell.py:21` — is a calibrated
+PIXEL-READ of the paper's one SRAM-bound/infeasible-marked bar, not a validated measurement).
+Mechanism confirmed consistent with prior F8/R3 work: the paper's tool evidently charges
+O(context) attention-score/softmax scratch against its 320MB logic-die SRAM pool (confirmed
+exact, `hbf_memory_config.h:100`, HBF+ preset at :88), while this sim's `peakIntermediateBytes`
+deliberately excludes score bytes (per the impossibility proof already on record: no single
+O(ctx) coefficient can bind the paper's SHORT bar while leaving its own MID bar unbound) — so
+SHORT/HBF+ escapes the SRAM ceiling here and binds on the SLO instead, landing higher. Item 58
+(this pass's SRAM footprint fix) collapsed this cell's headroom 93% (already established) but
+stayed slo-bound — consistent, not contradictory. Items 60/61 (LayerNorm, K/V fill — both
+genuine speedups) marginally INCREASE the overshoot (faster decode → slightly higher slo-bound
+batch) — correctly identified as a real, small, expected side effect, not a regression. Items
+51/52/53/59/54/55/56/57/62/63/64/65 all confirmed no-op or unrelated by gating (num_node=1 at
+8 GPU, pp=1, optimizer-seed-only, etc.) Fig-7's 35.3% PEC error is one layer downstream of the
+same mechanism (3-year PEC scales with write-rate/throughput; more admitted batch → more PEC),
+not a separate bug. RECOMMENDATION: flag Fig-3/4/7 HBF+/SHORT cells as "expected U7 paper-
+inconsistency divergence" in error reporting rather than a sim defect; no code change
+recommended (matches this pass's existing U7 disposition — keep the score-exclusive gate,
+since it already matches 5/6 of the paper's other HBF+ bars and adopting score-inclusive
+accounting would regress MID/LONG by 2.8-3x).
+All 3 Phase-6 discrepancy investigations complete: Fig-6 HBM4 = readings-side (not sim,
+CONFIRMED); Fig-3/4/7 HBF+/SHORT = U7, already known and disposed (CONFIRMED); Fig-4 CONV/
+llama4 low-GPU = zero-token MoE sparsity is a real, confirmed mechanism, but the claimed
+magnitude split (~2-3x genuine/rest-noise) and the "CONV+ safely exempt" scoping are REFUTED
+— disposition PARTIAL/OPEN, needs further work (see R-conv-lowgpu). On the one point common
+to all three: items 51-65 are confirmed NOT involved in any of the three discrepancies,
+across both the original investigations and all refutation attempts.
+Sonnet refuter wave launched against all 3 diagnoses; 2/3 CONFIRMED, 1/3 PARTIAL/OPEN.
+
+## Refuter verdicts (Phase 6 discrepancy investigations)
+
+### R-hbm4-fig6: CONFIRMED (with a scope correction, not an overturn)
+Independently re-derived all 5 code claims (self-normalization, SENSITIVITY_GPUS=[4,8,16],
+error formula, num_node scoping, num_kv_heads=8-both-models/TP-cap mechanism) — all exact
+matches. Live-probed HBM4/LONG at 4/8GPU × all 3 online SLOs directly: confirmed flat/
+SLO-invariant (bound=flash) for both models, ratios matching Fig-3-derived values to
+1.5-5.1%, reproducing the reported 36%/50.7%/54.7% errors almost exactly. **Correction to
+the original "bonus" note:** that note checked ONLY llama3 at 16-GPU (correctly flat, 13%
+error, below the reported band) but did NOT check llama4 at 16-GPU — the refuter did, and
+found llama4/16GPU batch/GPU grows 32.0→39.25 (+22.7%, matching paper's own Fig-3 growth of
++24.6% to within 1.5% — a real, correct, capacity-driven optimizer choice, NOT a bug), yet
+Fig-6's paper reading at 16GPU (0.87) is a *decline* from 8-GPU baseline — the same Fig3-vs-
+Fig6 internal paper contradiction, now shown to also reach 16-GPU/llama4 (error 29.1%,
+inside the reported band). Net: widens the CONFIRMED scope (readings-side, not sim) rather
+than reopening the sim as suspect. Ledger's "16-GPU error smaller, not part of the pattern"
+claim narrowed to apply to llama3 only, per this correction.
+
+### R-hbfp-short: CONFIRMED (clean, memory-safe reproduction)
+First attempt was killed mid-probe by the same OOM event that took the first sweep; relaunched
+as refute-hbfp-short-2, carrying forward its already-verified static claims (854.7 anchor,
+320MB SRAM, footprint.h terms, error formula, impossibility-proof re-examination, items 60/61
+magnitude cross-check, Fig-7 PEC dimensional consistency — all previously spot-checked by
+orchestrator and confirmed accurate). New work: instead of repeating the expensive unconstrained
+bisection search that was running at OOM time, called `run_simulation()` directly at two FIXED
+adjacent batch points (2378/GPU success, tpot 0.099999s; 2379/GPU fail, "SLO Violated 0.100s >
+0.100s") using the known-winning tp1/pp1/ep1/dp8 config — memory-cheap (2 runs, no bisection),
+confirmed exact reproduction of the ledger's recorded 2378/GPU figure, and confirmed via direct
+`classify_failure()` code read (orchestrator-verified: line 479 "Activations exceed" vs line
+484 "SLO Violated" are the actual distinguishing markers) that the failure is unambiguously
+slo-bound, not sram-bound — the boundary sits exactly where predicted, never engaging the
+~2409/GPU ceiling. Counter-example search (SHORT-specific alternative bug) found nothing:
+prefill/decode/KV-admission re-confirmed clean (matches F7); the success/fail boundary is a
+smooth single-increment SLO crossing (rules out a search-convergence bug); SHORT's outsized
+gap vs MID/LONG is fully explained by the existing impossibility-proof reasoning (SHORT has
+the smallest context, so it's where the paper's O(ctx) SRAM-scratch convention and the sim's
+score-exclusive convention diverge most in relative terms) with no new gap found on
+re-examination. No code change recommended; RESOLVED entry stands as written.
+
+### R-conv-lowgpu: PARTIAL — mechanism survives, probe numbers and safety claim do NOT
+Orchestrator-verified bandwidth constants exactly (`hbf_memory_config.h`: HBF 11.2e12, CONV
+2.45e12, CONV+ 2.80e12 — CONV+ only 14% above CONV, HBF 4.57x above CONV). Refuter findings:
+1. **Routing/placement degenerate-case check: no bug found (survives).** Static per-device
+   expert split correctly reduces to "all 128 on device 0" at 1 GPU (trivially correct, only
+   one device exists); real per-token routing verified deterministic, no off-by-one/double-
+   count. Items 51-65 non-involvement: unchanged, confirmed.
+2. **Original probe numbers (batch 32, 98ms, tps 326) REFUTED — do not reproduce.** Refuter's
+   direct probe (same binary/config, 2 deterministic trials): batch 32 → 85.73ms/373.3 tps,
+   NOWHERE NEAR the SLO ceiling (batch 34/36/38 all still succeed). Running the actual
+   `find_max_batch_size` algorithm gives the TRUE cell operating point: **batch=39,
+   tpot=99.47ms, tps=392.1** — ~22% higher batch, ~17-20% higher tps than originally claimed.
+   Likely a coarse step-size artifact in the original probe (e.g. testing 8/16/24/32/40 and
+   stopping at 32 without checking 33-39), not a methodology difference.
+3. **Paper-noise evidence: CONFIRMED independently** (anchor sheet marker legend, non-monotonic
+   2→4GPU drop, exact CONV/CONV+ duplicate reading, "physically impossible" 44.1 tps reading —
+   all re-derived directly from the readings files, not accepted on faith).
+4. **Recommendation's "CONV+ is safely exempt" claim REFUTED — significant finding.** Probed
+   CONV+/llama4/MID/1GPU directly: batch=47 (SLO-bound) — NOT >>128, expected activated
+   experts ≈39/128, essentially the SAME sub-saturation regime as CONV (≈34/128 active) since
+   CONV+'s BW is only 14% above CONV's (nowhere near HBF's 4.5x, which DOES genuinely reach
+   saturation at batch=332). Yet CONV+ matches the paper to 13% error while CONV (same
+   sub-saturation regime) is off by ~89% at the analogous cell. **This is a real logical hole:
+   if MoE-sparsity-skip were the dominant driver of CONV's error, CONV+ should show a
+   comparably large error too, since it activates almost the same fraction of experts — but it
+   doesn't.** Two live possibilities, neither yet resolved: (a) the proposed fix (make
+   flash-tier MoE reads not credit sub-saturation sparsity) would likely also move CONV+'s
+   throughput and could break its currently-good match — directly contradicting the "CONV+
+   undisturbed" scoping claim; and/or (b) something CONV-specific beyond the shared sparsity
+   mechanism (CONV's mixed 1-HBM+7-flash config vs CONV+'s pure 0-HBM+8-flash) is a real,
+   separate driver of CONV's outsized gap, meaning the "~2-3x genuine sim-side gap, rest is
+   paper noise" split is not well-supported — the true genuine/noise split is UNKNOWN pending
+   further work.
+5. **Side anomaly flagged (not yet investigated):** `sram_diag_ceiling_per_gpu` (recall: a
+   DIAGNOSTIC-ONLY value, never gates capacity — see the earlier HBF+/SHORT investigation's
+   finding on this same field) prints 288.5 for CONV+ vs 33234.1 for CONV at the analogous
+   cell — a ~115x gap between two structurally similar presets. Both cells are correctly
+   `bound=slo` (diagnostic doesn't gate), so this doesn't corrupt any reported number, but the
+   magnitude gap is large enough to warrant a separate look at why, later.
+**DISPOSITION: this item is NOT resolved.** Recommend, before any further action: (a) re-run
+the cell sweep at the CORRECT batch values (39, not 32) before quoting a magnitude anywhere;
+(b) do not adopt the "~2-3x genuine gap" estimate as-is; (c) if the MoE-sparsity fix is ever
+prototyped, explicitly check its effect on CONV+ rather than assuming exemption; (d) treat
+CONV's mixed-tier (1 HBM + 7 flash) configuration as a candidate independent variable worth
+isolating, since it's the one structural difference from CONV+ that survives this refutation.
