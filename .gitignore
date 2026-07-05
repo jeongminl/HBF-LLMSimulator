@@ -8,3 +8,5 @@ __pycache__/
 config_temp.yaml
 run
 error_rates_detail.csv
+paper2_results/
+scratch/
