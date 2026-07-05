@@ -137,6 +137,17 @@ int main(int argc, char *argv[]) {
         system_config.hbf_config = conv_preset;
       } else if (mem_type == "CONV+") {
         system_config.hbf_config = conv_plus_preset;
+      } else if (mem_type == "P2_HBM") {
+        // paper2 device_HBM: all-HBM, no flash stacks -- every flash-only code
+        // path stays off exactly like HBM4 above.
+        system_config.hbf_config = paper2_hbm_preset;
+        system_config.paper2_mode = true;
+      } else if (mem_type == "P2_HBF") {
+        system_config.hbf_config = paper2_hbf_preset;
+        system_config.paper2_mode = true;
+      } else if (mem_type == "P2_HBF_HALF") {
+        system_config.hbf_config = paper2_hbf_half_preset;
+        system_config.paper2_mode = true;
       } else {
         fail("Unsupported memory_type: " + mem_type);
       }
@@ -164,6 +175,86 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  // ---- paper2 config plumbing (all optional; paper1 config.yaml files that
+  // omit these keys entirely get the in-class defaults -- see
+  // hardware_config.h's paper2_mode/cpu_kv_offload/c2c_*/expose_first_expert_latency
+  // block for what each default is and why it's paper1-neutral). ----------
+  if (config["system"]["cpu_kv_offload"]) {
+    system_config.cpu_kv_offload = config["system"]["cpu_kv_offload"].as<bool>();
+  }
+  // NVLink-C2C generation -> per-direction bandwidth. Kept separate from the
+  // GPU-GPU nvlink_gen block above: c2c_bandwidth models the CPU<->GPU
+  // superchip link paper2's CPU-offload path uses, not device_ict_bandwidth
+  // (GPU<->GPU).
+  if (config["system"]["c2c_nvlink_gen"]) {
+    int c2c_gen = config["system"]["c2c_nvlink_gen"].as<int>();
+    if (c2c_gen == 5) {
+      system_config.c2c_bandwidth = 900e9;
+    } else if (c2c_gen == 6) {
+      system_config.c2c_bandwidth = 1800e9;
+    } else {
+      fail("Not support NVLink-C2C generation: " + std::to_string(c2c_gen));
+    }
+  }
+  // Explicit override, applied AFTER c2c_nvlink_gen so it always wins regardless
+  // of key order in the yaml file.
+  if (config["system"]["c2c_bandwidth_gbps"]) {
+    system_config.c2c_bandwidth =
+        config["system"]["c2c_bandwidth_gbps"].as<double>() * 1e9;
+  }
+  if (config["system"]["cpu_memory_capacity_gb"]) {
+    // "_gb" suffix follows this codebase's GiB convention (see mem_cap_limit-
+    // adjacent GB/GiB usage elsewhere in this file) -- GiB, not decimal GB.
+    system_config.cpu_memory_capacity =
+        config["system"]["cpu_memory_capacity_gb"].as<double>() * 1024.0 * 1024.0 * 1024.0;
+  }
+  if (config["system"]["expose_first_expert_latency"]) {
+    system_config.expose_first_expert_latency =
+        config["system"]["expose_first_expert_latency"].as<bool>();
+  }
+  if (config["system"]["c2c_read_composition"]) {
+    std::string composition = config["system"]["c2c_read_composition"].as<std::string>();
+    if (composition == "sum") {
+      system_config.c2c_read_composition = 0;
+    } else if (composition == "max") {
+      system_config.c2c_read_composition = 1;
+    } else {
+      fail("Unsupported system.c2c_read_composition: " + composition +
+           " (expected \"sum\" or \"max\")");
+    }
+  }
+
+  // paper2 stochastic workload sampler flags (parsed now; consumed by a later
+  // change -- see hardware_config.h's paper2_workload/workload_* block).
+  if (config["simulation"]["workload_mode"]) {
+    if (config["simulation"]["workload_mode"].as<std::string>() == "paper2") {
+      system_config.paper2_workload = true;
+    }
+  }
+  if (config["simulation"]["context_mean"]) {
+    system_config.workload_context_mean =
+        config["simulation"]["context_mean"].as<double>();
+  }
+  if (config["simulation"]["context_cv"]) {
+    system_config.workload_context_cv =
+        config["simulation"]["context_cv"].as<double>();
+  }
+  if (config["simulation"]["context_trunc_sigmas"]) {
+    system_config.workload_context_trunc_sigmas =
+        config["simulation"]["context_trunc_sigmas"].as<double>();
+  }
+  if (config["simulation"]["lout_mean_ratio"]) {
+    system_config.workload_lout_mean_ratio =
+        config["simulation"]["lout_mean_ratio"].as<double>();
+  }
+  if (config["simulation"]["lout_beta_kappa"]) {
+    system_config.workload_lout_beta_kappa =
+        config["simulation"]["lout_beta_kappa"].as<double>();
+  }
+  if (config["simulation"]["workload_seed"]) {
+    system_config.workload_seed =
+        config["simulation"]["workload_seed"].as<unsigned int>();
+  }
 
   system_config.high_processor_type = ProcessorType::GPU;
   system_config.low_processor_type = ProcessorType::LOGIC;
@@ -245,6 +336,8 @@ int main(int argc, char *argv[]) {
     model_config = grok1;
   } else if (!model_name.compare("deepseekV3")) {
     model_config = deepseekV3;
+  } else if (!model_name.compare("deepseekR1")) {
+    model_config = deepseekR1;
   }else if (!model_name.compare("llama4_scout")) {
     model_config = llama4_scout;
   }else if (!model_name.compare("llama4_maverick")) {
@@ -252,6 +345,22 @@ int main(int argc, char *argv[]) {
   } 
   else {
     fail("No model configuration of " + model_name);
+  }
+
+  // paper2 §II "we focus on standard full attention"; Fig5's baselines are all
+  // non-iRoPE (confirmed against Maverick's own Fig5 numbers). Forces full
+  // global attention on every layer by zeroing attn_chunk_size (0 already means
+  // "no windowing" -- see isGlobalAttentionLayer()/effectiveKvLen(),
+  // model_config.h) and resetting attn_global_interval to 1, its "every layer
+  // is global" backward-compat value, purely for belt-and-suspenders clarity
+  // (isGlobalAttentionLayer already short-circuits on attn_chunk_size==0 alone).
+  // Must run AFTER model preset selection above so it overrides
+  // llama4_maverick/llama4_scout's iRoPE presets; optional and false by
+  // default, so every existing config.yaml (which omits this key) is unaffected.
+  if (config["simulation"]["disable_irope"] &&
+      config["simulation"]["disable_irope"].as<bool>()) {
+    model_config.attn_chunk_size = 0;
+    model_config.attn_global_interval = 1;
   }
 
   model_config.e_tp_dg =

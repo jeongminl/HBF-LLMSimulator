@@ -216,6 +216,68 @@ class SystemConfig {
   // Parsed from config.yaml: simulation.mfu_max / simulation.mfu_m_half.
   double mfu_max = 1.0;
   double mfu_m_half = 0.0;
+
+  // ---------------------------------------------------------------------
+  // paper2 (Kyung et al., IEEE CAL 2026) config plumbing.
+  // All fields below are additive: paper1-preserving defaults, defaulted
+  // member initializers only (NOT constructor args, to avoid disturbing the
+  // existing positional ctor and every one of its call sites above). Set by
+  // test.cpp's P2_* memory_type branches / new optional config.yaml keys;
+  // every existing paper1 config.yaml omits these keys entirely and gets the
+  // exact defaults below, i.e. bit-identical paper1 behavior.
+  // ---------------------------------------------------------------------
+
+  // True for the paper2_hbm_preset / paper2_hbf_preset / paper2_hbf_half_preset
+  // memory_type branches (test.cpp). Gates every paper2-only behavior change
+  // (exposure zeroing in layer_impl.h / parallelism_optimizer.cpp, etc.) so
+  // paper1 presets (this flag false) are provably unaffected by any of it.
+  bool paper2_mode = false;
+
+  // paper2 §IV: KV cache can be offloaded to CPU memory over NVLink-C2C, freeing
+  // device-local capacity. Parsed from config.yaml: system.cpu_kv_offload.
+  // Currently PARSING ONLY -- no timing/capacity effect yet (a later change
+  // wires the actual offload accounting); false is a complete no-op.
+  bool cpu_kv_offload = false;
+
+  // NVLink-C2C bandwidth (B/s per direction) for the CPU-offload path above.
+  // Default matches NVLink-C2C gen 5 (900 GB/s, GB200-class). Parsed from
+  // config.yaml: system.c2c_nvlink_gen (5 -> 900e9, 6 -> 1800e9) or overridden
+  // directly via system.c2c_bandwidth_gbps.
+  double c2c_bandwidth = 900e9;
+
+  // paper2 §IV: "sufficient CPU memory" via NVLink-C2C (GB200-like superchip)
+  // -- modeled as an 8-TiB default, large enough to never bind unless a config
+  // explicitly narrows it via system.cpu_memory_capacity_gb.
+  double cpu_memory_capacity = 8.0 * 1024 * 1024 * 1024 * 1024.0;
+
+  // When true, the first activated MoE expert's flash-read latency is charged
+  // explicitly at its call site (double-buffering can't hide a cold expert's
+  // very first fetch) instead of being folded into the blanket paper2_mode
+  // exposure-zeroing in layer_impl.h. Parsed from config.yaml:
+  // system.expose_first_expert_latency. Currently PARSING ONLY -- the actual
+  // first-expert charge is wired in a later change.
+  bool expose_first_expert_latency = false;
+
+  // How CPU-offloaded KV reads over NVLink-C2C compose with the device-local
+  // flash/HBM read they run alongside: 0 = SUM (serial, conservative default),
+  // 1 = MAX (fully overlapped). Physically ambiguous which is correct without
+  // vendor-published overlap details; SUM was adopted after an adversarial
+  // review hand-computed both against paper2's Fig5 NVLink6 TPOT anchors and
+  // found SUM the better match. Parsed from config.yaml:
+  // system.c2c_read_composition ("sum" -> 0, "max" -> 1).
+  int c2c_read_composition = 0;
+
+  // ---- paper2 stochastic workload sampler (parsed now; consumed by a later
+  // change). Parsed from config.yaml: simulation.workload_mode ("paper2" sets
+  // paper2_workload=true) / simulation.context_mean / context_cv /
+  // context_trunc_sigmas / lout_mean_ratio / lout_beta_kappa / workload_seed.
+  bool paper2_workload = false;
+  double workload_context_mean = 8192.0;
+  double workload_context_cv = 0.1;
+  double workload_context_trunc_sigmas = 2.0;
+  double workload_lout_mean_ratio = 0.75;
+  double workload_lout_beta_kappa = 90.0;
+  unsigned int workload_seed = 777;
 };
 
 // MFU(M) = mfu_max * M / (M + mfu_m_half) -- see SystemConfig::mfu_max/mfu_m_half above.

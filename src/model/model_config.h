@@ -236,6 +236,28 @@ static ModelConfig deepseekV3 =
     ModelConfig(7168, 128, 60, 128, 128, 131072, 18432, 2048, 1, 1, 256, 1, 1, 8,
                 3, 3, 1536, 512, 128, 64, 129280, true, true, 0.0,"deepseekV3"); // n_layer = 60 (not consider MTP module)
 
+// paper2 (Kyung et al., IEEE CAL 2026) §IV evaluates DeepSeek-R1 671B, verbatim
+// "employing BF16 precision for both model weights and KV caches" -- hence
+// precision_byte=2 here (deepseekV3 above uses precision_byte=1/FP8). Otherwise
+// an exact copy of deepseekV3's architecture (R1 and V3 share the same
+// transformer architecture; R1 is a reasoning-tuned checkpoint of it), except
+// num_layers=61: the DeepSeek-V3/R1 technical report specifies 61 transformer
+// layers EXCLUDING the separate Multi-Token-Prediction (MTP) module -- this is
+// the CORRECTED layer count (see deepseekV3's own num_layers=60, whose comment
+// misread the same tech report; deepseekV3's 60->61 fix is a separate,
+// deliberately-isolated change -- see this file's git history / CHANGES.md --
+// so as not to disturb this preset's addition). KV bytes/token with this
+// preset: (kv_lora_rank + qk_rope_head_dim) * precision_byte * num_layers =
+// (512 + 64) * 2 * 61 = 68.6 KB/token, matching paper2 §II's own figure.
+// CAVEAT (comment only -- no code change needed): communication.cpp's
+// deepseekV3 FP8 all-to-all dispatch-size adjustment is STRING-MATCHED against
+// model_name=="deepseekV3"; a future FP8 variant of R1 would silently miss
+// that adjustment under model_name=="deepseekR1". Not applicable today since
+// this preset is BF16 (precision_byte=2), which never takes that FP8 branch.
+static ModelConfig deepseekR1 =
+    ModelConfig(7168, 128, 61, 128, 128, 131072, 18432, 2048, 1, 2, 256, 1, 1, 8,
+                3, 3, 1536, 512, 128, 64, 129280, true, true, 0.0, "deepseekR1");
+
 // precision_byte=2 (BF16): matches the paper's explicit "no 1-/2-GPU segments in all HBM4
 // bars" claim, which requires llama3_405B's real footprint to exceed 2x288GB=576GB -- only
 // consistent with native BF16 (~810GB), not FP8 (~405GB, which fits under 576GB and would

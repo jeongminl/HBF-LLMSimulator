@@ -57,6 +57,14 @@ inline time_ns getLinearMemoryDuration(const SystemConfig& config, double m, dou
     double weight_exposed_latency_ns =
         (double)hbf.flash_page_read_latency_ns / weight_fill_amortize +
         (weight_num_chunks - 1) * std::max(0.0, (double)hbf.flash_page_read_latency_ns - weight_chunk_transfer_ns);
+    // paper2 §IV assumes double-buffering fully hides HBF read latency (except
+    // the first activated MoE expert, charged separately at its call site --
+    // placeholder for a later change). Zero the ENTIRE exposed term (both the
+    // pipeline-fill and any per-chunk residual), not just the fill, so no page
+    // latency of any kind leaks into paper2_mode's weight-read time.
+    if (config.paper2_mode) {
+      weight_exposed_latency_ns = 0.0;
+    }
     double weight_read_time = (weight_size / hbf.flash_read_bandwidth * 1e9) + weight_exposed_latency_ns;
 
     // Activations: input and output are on HBM or logic-die SRAM.
@@ -118,6 +126,13 @@ inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric 
       double chunk_transfer_ns = chunk_bytes / hbf.flash_read_bandwidth * 1e9;
       double exposed_latency_ns = (double)hbf.flash_page_read_latency_ns / fill_amortize +
           (num_chunks - 1) * std::max(0.0, (double)hbf.flash_page_read_latency_ns - chunk_transfer_ns);
+      // paper2 §IV assumes double-buffering fully hides HBF read latency (except
+      // the first activated MoE expert, charged separately at its call site --
+      // placeholder for a later change). Zero the ENTIRE exposed term (fill AND
+      // residual), not just the fill.
+      if (config.paper2_mode) {
+        exposed_latency_ns = 0.0;
+      }
       kv_read_time = (kv_read_size / hbf.flash_read_bandwidth * 1e9) + exposed_latency_ns;
     } else {
       // No chunked attention: still double-buffer by SRAM-sized chunks (plane-level
@@ -131,6 +146,13 @@ inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric 
       double chunk_transfer_ns = sram_capacity / hbf.flash_read_bandwidth * 1e9;
       double exposed_latency_ns = (double)hbf.flash_page_read_latency_ns / fill_amortize +
           (num_chunks - 1) * std::max(0.0, (double)hbf.flash_page_read_latency_ns - chunk_transfer_ns);
+      // paper2 §IV assumes double-buffering fully hides HBF read latency (except
+      // the first activated MoE expert, charged separately at its call site --
+      // placeholder for a later change). Zero the ENTIRE exposed term (fill AND
+      // residual), not just the fill.
+      if (config.paper2_mode) {
+        exposed_latency_ns = 0.0;
+      }
       kv_read_time = (kv_read_size / hbf.flash_read_bandwidth * 1e9) + exposed_latency_ns;
     }
 

@@ -7,6 +7,7 @@
 // header — that would create an include cycle.
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <string>
 
 #include "hardware/hardware_config.h"
@@ -36,6 +37,17 @@ struct CapacityResult {
 // For plain HBM             → full memory_capacity (acts not separately bounded).
 inline double scarceTierActivationLimit(const SystemConfig& s) {
   if (s.use_hbf && s.hbf_config.num_flash_stacks > 0) {
+    // paper2 (Kyung et al., IEEE CAL 2026) §IV: on-chip SRAM is an
+    // assumed-sufficient resource whose REQUIRED size is an output of the
+    // analysis, not an input capacity constraint (see hbf_memory_config.h's
+    // unbounded_sram_gate). Signal "no limit" with +infinity so every caller's
+    // `act > limit` comparison (checkCapacity below, cluster.cpp's Part C)
+    // simply never binds, with zero change to either caller's comparison
+    // logic. Paper1 presets never set this field, so this branch is dead for
+    // every existing config -- paper1 takes the exact same path as before.
+    if (s.hbf_config.unbounded_sram_gate) {
+      return std::numeric_limits<double>::infinity();
+    }
     if (s.hbf_config.num_hbm_stacks > 0) {
       return static_cast<double>(s.hbf_config.num_hbm_stacks) *
              static_cast<double>(s.hbf_config.hbm_per_stack_bytes);
