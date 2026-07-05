@@ -171,6 +171,25 @@ class Scheduler : public std::enable_shared_from_this<Scheduler> {
   double getP2AdmissionKvBytes() const { return p2_admission_kv_bytes; }
   double getP2DecodeKvBytes() const { return p2_decode_kv_bytes; }
 
+  // paper2 CPU-memory/NVLink-C2C KV offload tier: running average of the
+  // per-dp-shard offloaded-KV byte fraction (BatchedSequence::
+  // p2_kv_offload_fraction), sampled once per running batch per setMetadata()
+  // call -- see that function's doc comment for the full derivation. Guarded
+  // by p2_byte_counting_enabled so only the TIMED window is averaged, same
+  // convention as p2_admission_kv_bytes/p2_decode_kv_bytes above. The
+  // fraction itself (BatchedSequence::p2_kv_offload_fraction) is still
+  // recomputed on EVERY setMetadata() call (including untimed warmup) when
+  // cpuKvOffloadActive() holds, since the attention timing paths consume it
+  // every step, not just the timed ones -- only this running-average
+  // accountant is restricted to the timed window.
+  double p2_offload_fraction_sum = 0.0;
+  long long p2_offload_fraction_samples = 0;
+  double getP2AvgOffloadFraction() const {
+    return p2_offload_fraction_samples > 0
+        ? p2_offload_fraction_sum / (double)p2_offload_fraction_samples
+        : 0.0;
+  }
+
   std::vector<Sequence::Ptr> sequence_queue;
   std::vector<BatchedSequence::Ptr> running_queue;
 

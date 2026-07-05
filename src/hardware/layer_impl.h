@@ -165,6 +165,35 @@ inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric 
   return 0;
 }
 
+// paper2 §IV CPU-memory/NVLink-C2C KV offload tier: EXCESS KV beyond this
+// device's local HBM-KV budget lives in CPU memory and is read directly over
+// NVLink-C2C during attention. f_off is BatchedSequence::p2_kv_offload_fraction
+// (Scheduler::setMetadata(), reservation-based, recomputed once per step per
+// dp-shard -- see that function's doc comment). The resident (HBM-local)
+// fraction of the KV read, plus ALL activation traffic, goes over this
+// device's own memory_bandwidth exactly like the non-offload path; only the
+// offloaded fraction of the KV read goes over config.c2c_bandwidth.
+//
+// How the two composes is genuinely ambiguous without vendor-published
+// overlap details: SUM (serial, the default -- config.c2c_read_composition
+// == 0) was adopted after an adversarial review hand-fit both compositions
+// against paper2 Fig5's NVLink6.0 TPOT anchors and found SUM the better
+// match; MAX (fully overlapped independent channels, == 1) is kept for the
+// confirmation experiment.
+//
+// Only the READ path is modeled here. Writes are deliberately un-modeled on
+// C2C: a newly generated token's KV entry always lands in local HBM (never
+// offloaded on write), and lifetime write volume is ~1/avg_context of read
+// volume -- 3-4 orders of magnitude below the read bottleneck -- so this
+// matches paper2 §IV, which discusses only the read path.
+inline time_ns hbmKvOffloadReadDuration(const SystemConfig& config, hw_metric kv_read_size, hw_metric act_size, double f_off) {
+  double resident_time = (kv_read_size * (1.0 - f_off) + act_size) / config.memory_bandwidth * 1e9;
+  double offload_time = (kv_read_size * f_off) / config.c2c_bandwidth * 1e9;
+  return (config.c2c_read_composition == 1)
+      ? std::max(resident_time, offload_time)
+      : resident_time + offload_time;
+}
+
 // program_latency_amortize_calls: number of per-layer calls whose writes together
 // form ONE contiguous flash write stream per decode iteration (= attention layers
 // per pipeline stage on this device). The KV write is fire-and-forget: no layer

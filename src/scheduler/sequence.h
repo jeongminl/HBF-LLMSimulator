@@ -124,6 +124,16 @@ class BatchedSequence {
   std::vector<Sequence::Ptr> sequence;
   std::vector<int> seq_ids;
   Scheduler_ptr scheduler;
+
+  // paper2 CPU-memory/NVLink-C2C KV offload tier: fraction of this dp-shard's
+  // reservation-based total KV bytes that live in CPU memory (beyond the
+  // local HBM-KV budget), recomputed once per scheduler step in
+  // Scheduler::setMetadata() -- see that function's doc comment. 0.0 (the
+  // default) whenever cpuKvOffloadActive() is false, i.e. a complete no-op
+  // for paper1 and every non-offload paper2 config. Consumed by the GPU
+  // attention gen paths (attention_gen_impl.cpp) via
+  // hbmKvOffloadReadDuration() (hardware/layer_impl.h).
+  double p2_kv_offload_fraction = 0.0;
 };
 
 }  // namespace llm_system

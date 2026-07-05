@@ -1,5 +1,6 @@
 #include <memory>
 
+#include "common/assert.h"
 #include "common/type.h"
 #include "dram/dram_interface.h"
 #include "dram/dram_request.h"
@@ -39,6 +40,15 @@ ExecStatus AttentionMixedExecutionGPU(Device_Ptr device,
   time_ns memory_duration;
   time_ns total_duration = 0;
   time_ns total_compute_duration = 0;  // track total compute for KV write overlap
+
+  // paper2 CPU-memory/NVLink-C2C KV offload tier: SelfAttentionMixed::Create
+  // (module/attention.h) has zero call sites anywhere in this tree -- this
+  // GPU path is dead code today, never reached regardless of decode_mode.
+  // Fail loudly rather than silently mis-time it if it's ever wired up with
+  // the offload tier on.
+  if (cpuKvOffloadActive(config)) {
+    fail("cpu_kv_offload: unmodeled attention path AttentionMixedExecutionGPU");
+  }
 
   // Scoring //
   int num_seq = sequences_metadata->sequence.size();
@@ -259,6 +269,14 @@ ExecStatus MultiLatentAttentionMixedExecutionGPU(Device_Ptr device,
   time_ns compute_duration;
   time_ns memory_duration;
   time_ns total_duration = 0;
+
+  // paper2 CPU-memory/NVLink-C2C KV offload tier: MultiLatentAttentionMixed::
+  // Create has zero call sites anywhere in this tree -- this GPU path is dead
+  // code today, never reached regardless of decode_mode. Fail loudly rather
+  // than silently mis-time it if it's ever wired up with the offload tier on.
+  if (cpuKvOffloadActive(config)) {
+    fail("cpu_kv_offload: unmodeled attention path MultiLatentAttentionMixedExecutionGPU");
+  }
 
   // Scoring //
   int num_seq = sequences_metadata->sequence.size();

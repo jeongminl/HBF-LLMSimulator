@@ -479,6 +479,42 @@ std::vector<BatchedSequence::Ptr> Scheduler::setMetadata() {
   // paper2 alike); harmless since nothing reads the counter yet.
   admitted_prefill_tokens_this_step = 0;
 
+  // paper2 CPU-memory/NVLink-C2C KV offload tier: reservation-based offloaded
+  // byte fraction, recomputed once per step per dp-shard (running batch).
+  // Each request reserves a contiguous KV region for its FULL context
+  // (total_len = input_len + output_len - 1, Sequence's ctor) at admission;
+  // batches fill the local HBM-KV budget first, and the remainder is modeled
+  // as living in CPU memory. Guarded by cpuKvOffloadActive() (hardware_config.h)
+  // so paper1 and every non-offload/HBF paper2 config leaves
+  // BatchedSequence::p2_kv_offload_fraction at its default-initialized 0.0 --
+  // a complete no-op.
+  if (cpuKvOffloadActive(system_config)) {
+    // ne_tp_degree_of_the_shard: paper2's mapping has model_config.ne_tp_dg==1,
+    // so this reduces to exactly "one device's HBM minus its resident
+    // weights". The multiplier generalizes to TP>1, where a dp-shard's KV
+    // cache is sharded across the whole ne_tp group backing it (dp_degree's
+    // own derivation above, ctor line 18-19, shows the same ne_tp_dg driving
+    // the dp/TP split) -- paper2 itself never exercises TP>1 (ne_tp=1).
+    double hbm_kv_budget =
+        (system_config.memory_capacity - system_config.weight_bytes_per_device) *
+        (double)model_config.ne_tp_dg;
+    for (auto& batch : running_queue) {
+      double reserved_total = 0.0;
+      for (auto& seq : batch->get_seq()) {
+        reserved_total +=
+            perSeqAdmissionKvBytes(model_config, (double)seq->total_len);
+      }
+      double f_off = (reserved_total > 0.0)
+          ? std::max(0.0, reserved_total - hbm_kv_budget) / reserved_total
+          : 0.0;
+      batch->p2_kv_offload_fraction = f_off;
+      if (p2_byte_counting_enabled) {
+        p2_offload_fraction_sum += f_off;
+        p2_offload_fraction_samples += 1;
+      }
+    }
+  }
+
   bool process_gen = true;
   bool process_sum = true;
 

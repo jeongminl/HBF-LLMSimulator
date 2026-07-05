@@ -104,11 +104,25 @@ inline CapacityResult checkCapacity(const SystemConfig& s,
   } else {
     // Plain HBM: lumped check against memory_capacity
     double total = act + weight + kv;
-    if (total > s.memory_capacity) {
+    // paper2 §IV CPU-memory/NVLink-C2C KV offload tier: excess KV beyond
+    // memory_capacity is modeled as living in CPU memory (cpu_memory_capacity),
+    // read over NVLink-C2C -- see hbmKvOffloadReadDuration (layer_impl.h).
+    // Extending the KV-side limit by cpu_memory_capacity here is safe because
+    // weights-fit-in-HBM-alone is guaranteed separately, by construction: the
+    // caller never lets weight alone exceed memory_capacity (both paper2
+    // models' weight_bytes_per_device -- 125GB/198GB -- are well under the
+    // 256GB HBM4 preset). cpuKvOffloadActive()'s HBF exclusion is redundant
+    // here (this branch is only reached when !hasScarceTier(s)) but keeping
+    // the same guard function everywhere avoids drift.
+    double limit = s.memory_capacity;
+    if (cpuKvOffloadActive(s)) {
+      limit += s.cpu_memory_capacity;
+    }
+    if (total > limit) {
       return {true,
               "HBM capacity exceeded (" +
               std::to_string(total / 1073741824.0) + " GiB > " +
-              std::to_string(s.memory_capacity / 1073741824.0) + " GiB)"};
+              std::to_string(limit / 1073741824.0) + " GiB)"};
     }
     return {false, ""};
   }

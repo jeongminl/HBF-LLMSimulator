@@ -1,5 +1,6 @@
 #include <memory>
 
+#include "common/assert.h"
 #include "common/type.h"
 #include "dram/dram_interface.h"
 #include "dram/dram_request.h"
@@ -38,6 +39,15 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
   ExecStatus exec_status;
   if (input->getSize() == 0) {
     return exec_status;
+  }
+
+  // paper2 CPU-memory/NVLink-C2C KV offload tier: this Sum (prefill) GPU path
+  // is unreachable under decode_mode (paper2's Fig5 device_HBM harness runs
+  // decode_mode on, injection_rate 0), so it was deliberately left
+  // un-patched. Fail loudly rather than silently mis-time it if it's ever
+  // reached with the offload tier on (e.g. a mixed prefill+decode run).
+  if (cpuKvOffloadActive(config)) {
+    fail("cpu_kv_offload: unmodeled attention path AttentionSumExecutionGPU");
   }
 
   std::vector<Sequence::Ptr> seq_list = sequences_metadata->get_sum();
@@ -734,6 +744,15 @@ ExecStatus MultiLatentAttentionSumExecutionGPU(Device_Ptr device,
   ExecStatus exec_status;
   if (input->getSize() == 0) {
     return exec_status;
+  }
+
+  // paper2 CPU-memory/NVLink-C2C KV offload tier: this Sum (prefill) GPU path
+  // is unreachable under decode_mode (paper2's Fig5 device_HBM harness runs
+  // decode_mode on, injection_rate 0), so it was deliberately left
+  // un-patched. Fail loudly rather than silently mis-time it if it's ever
+  // reached with the offload tier on (e.g. a mixed prefill+decode run).
+  if (cpuKvOffloadActive(config)) {
+    fail("cpu_kv_offload: unmodeled attention path MultiLatentAttentionSumExecutionGPU");
   }
 
   std::vector<Sequence::Ptr> seq_list = sequences_metadata->get_sum();
@@ -2126,6 +2145,15 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
   ExecStatus exec_status;
   if (input->getSize() == 0) {
     return exec_status;
+  }
+
+  // paper2 CPU-memory/NVLink-C2C KV offload tier: this Sum (prefill) GPU path
+  // is unreachable under decode_mode (paper2's Fig5 device_HBM harness runs
+  // decode_mode on, injection_rate 0), so it was deliberately left
+  // un-patched. Fail loudly rather than silently mis-time it if it's ever
+  // reached with the offload tier on (e.g. a mixed prefill+decode run).
+  if (cpuKvOffloadActive(config)) {
+    fail("cpu_kv_offload: unmodeled attention path AbsorbMLASumExecutionGPU");
   }
 
   std::vector<Sequence::Ptr> seq_list = sequences_metadata->get_sum();

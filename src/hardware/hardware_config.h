@@ -278,7 +278,29 @@ class SystemConfig {
   double workload_lout_mean_ratio = 0.75;
   double workload_lout_beta_kappa = 90.0;
   unsigned int workload_seed = 777;
+
+  // Per-device weight footprint (bytes), under the CONFIGURED parallelism
+  // mapping (ne_tp_dg/e_tp_dg/pp_dg/dp as finally resolved in eval/test.cpp).
+  // Stashed by test.cpp BEFORE Scheduler::Create (via ParallelismOptimizer::
+  // EvaluateConfig's pred_weight_bytes -- same computation that already backs
+  // the P2_WEIGHT_BYTES_NODE marker) so Scheduler::setMetadata() can derive
+  // this device's HBM-KV budget for the CPU-offload fraction below without
+  // re-running the optimizer probe live every step. Default 0.0 is a no-op:
+  // only consumed when cpu_kv_offload is true (see cpuKvOffloadActive()).
+  double weight_bytes_per_device = 0.0;
 };
+
+// paper2 §IV CPU-memory/NVLink-C2C KV offload tier's master guard: true only
+// when cpu_kv_offload is requested AND this is not an HBF (flash) config --
+// HBF already has its own device-local flash offload story (weights+KV on
+// flash), so the two tiers are mutually exclusive by construction. Every
+// offload-path behavioral change (Scheduler::setMetadata's f_off, the
+// attention GPU timing paths, the capacity gates) is gated by this single
+// function so paper1 and non-offload paper2 configs are provably unaffected.
+inline bool cpuKvOffloadActive(const SystemConfig& config) {
+  return config.cpu_kv_offload &&
+      !(config.use_hbf && config.hbf_config.num_flash_stacks > 0);
+}
 
 // MFU(M) = mfu_max * M / (M + mfu_m_half) -- see SystemConfig::mfu_max/mfu_m_half above.
 // m <= 0 (degenerate/empty op) returns mfu_max rather than 0 to avoid a divide-by-zero

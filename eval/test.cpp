@@ -758,6 +758,27 @@ int main(int argc, char *argv[]) {
   system_config.weight_stream_ops_per_iter =
       weightReadOpsPerIteration(model_config, num_node * num_device);
 
+  // paper2 CPU-memory/NVLink-C2C KV offload tier: stash this device's weight
+  // footprint into system_config BEFORE Scheduler::Create (Scheduler stores
+  // system_config BY VALUE, so anything set after Create is invisible to it)
+  // so Scheduler::setMetadata() can derive the local HBM-KV budget
+  // (memory_capacity - weight_bytes_per_device) without re-running the
+  // optimizer probe live every step. Reuses ParallelismOptimizer::
+  // EvaluateConfig's pred_weight_bytes -- the same computation that also
+  // backs the P2_WEIGHT_BYTES_NODE marker below (see that block's extensive
+  // comment for the full derivation/caveats); harmless/unused whenever
+  // cpu_kv_offload is off.
+  int total_gpus_for_weight = num_node * num_device;
+  {
+    int dp_for_weight = total_gpus_for_weight /
+        (model_config.ne_tp_dg * model_config.pp_dg);
+    ParallelConfig weight_probe = ParallelismOptimizer::EvaluateConfig(
+        model_config, system_config, total_gpus_for_weight,
+        model_config.ne_tp_dg, model_config.pp_dg, dp_for_weight,
+        model_config.e_tp_dg, max_batch_size, input_len + output_len);
+    system_config.weight_bytes_per_device = weight_probe.pred_weight_bytes;
+  }
+
   // long max_batch_size = 128;
   if (max_process_token == 0) {
     // max_process_token = 8192 * 16;
@@ -996,15 +1017,14 @@ int main(int argc, char *argv[]) {
     // For pp_dg>1 this remains the same representative-heaviest-stage
     // approximation the optimizer itself uses for its capacity gate elsewhere
     // (EvaluateConfig's own moe_layers_in_stage comment, cpp:180-194).
-    int total_gpus_for_weight = num_node * num_device;
-    int dp_for_weight = total_gpus_for_weight /
-        (model_config.ne_tp_dg * model_config.pp_dg);
-    ParallelConfig weight_probe = ParallelismOptimizer::EvaluateConfig(
-        model_config, system_config, total_gpus_for_weight,
-        model_config.ne_tp_dg, model_config.pp_dg, dp_for_weight,
-        model_config.e_tp_dg, max_batch_size, input_len + output_len);
+    //
+    // The probe itself was moved BEFORE Scheduler::Create (see
+    // system_config.weight_bytes_per_device's assignment above) so the
+    // paper2 CPU-offload tier's Scheduler::setMetadata() can consume it too;
+    // this marker just reuses the stashed per-device value instead of
+    // re-running the same probe a second time.
     double weight_bytes_node =
-        weight_probe.pred_weight_bytes * total_gpus_for_weight;
+        system_config.weight_bytes_per_device * total_gpus_for_weight;
     std::cout << "P2_WEIGHT_BYTES_NODE: " << weight_bytes_node << std::endl;
   }
 
@@ -1025,6 +1045,14 @@ int main(int argc, char *argv[]) {
     std::cout << "P2_KV_ADMISSION_BYTES: " << p2_admission_bytes << std::endl;
     std::cout << "P2_KV_DECODE_BYTES: " << p2_decode_bytes << std::endl;
     std::cout << "P2_TIMED_ITERS: " << total_iter << std::endl;
+    // paper2 CPU-memory/NVLink-C2C KV offload tier: average offloaded-KV byte
+    // fraction over the timed window (Scheduler::p2_offload_fraction_sum /
+    // _samples -- see scheduler.h's doc comment). Emitted UNCONDITIONALLY
+    // (0.0 whenever cpu_kv_offload is off or nothing overflowed the local
+    // HBM-KV budget) so every regression diff against a pre-offload baseline
+    // differs by exactly this one added line, never a presence/absence flip.
+    std::cout << "P2_KV_OFFLOAD_FRACTION: "
+              << scheduler->getP2AvgOffloadFraction() << std::endl;
   }
 
   // Part E: latency drift harness — compare optimizer prediction vs measured.

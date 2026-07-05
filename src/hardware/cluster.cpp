@@ -326,6 +326,13 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
   if (hasScarceTier(config)) {
     capacity_limit -= (double)config.hbf_config.num_hbm_stacks *
                       (double)config.hbf_config.hbm_per_stack_bytes;
+  } else if (cpuKvOffloadActive(config)) {
+    // paper2 §IV CPU-memory/NVLink-C2C KV offload tier: excess KV beyond
+    // memory_capacity is modeled as living in CPU memory, read over
+    // NVLink-C2C -- mirrors footprint.h checkCapacity()'s plain-HBM branch.
+    // Weights-fit-in-HBM-alone is guaranteed separately, by construction (see
+    // that function's comment for both paper2 models' weight footprints).
+    capacity_limit += config.cpu_memory_capacity;
   }
   double size_for_capacity_gate = hasScarceTier(config) ? (size - activation_size) : size;
   if (size_for_capacity_gate > capacity_limit) {
