@@ -88,6 +88,13 @@ class FeedForward2Way : public Module {
     return ptr;
   };
 
+ public:
+  // paper2 §IV: forwards the arm to ffn_up_proj -- the first weight-bearing
+  // projection FeedForward2Way::forward() executes (see layer.cpp).
+  void armExposeFirstExpertPageLatency() override {
+    get_module("ffn_up_proj")->armExposeFirstExpertPageLatency();
+  }
+
  private:
   FeedForward2Way(std::string& prefix, std::string& name,
                   const ModelConfig& model_config, Scheduler::Ptr scheduler,
@@ -118,6 +125,16 @@ class FeedForward3Way : public Module {
     ptr->set_tensor_module();
     return ptr;
   };
+
+ public:
+  // paper2 §IV: forwards the arm to gate_proj -- the first weight-bearing
+  // projection FeedForward3Way::forward() executes (see layer.cpp). Present
+  // under both the ColumnParallelLinear (use_dp==false, the expert path) and
+  // plain-Linear (use_dp==true) constructions -- both register a module named
+  // "gate_proj", and virtual dispatch picks the right override either way.
+  void armExposeFirstExpertPageLatency() override {
+    get_module("gate_proj")->armExposeFirstExpertPageLatency();
+  }
 
  private:
   FeedForward3Way(std::string& prefix, std::string& name,

@@ -14,7 +14,20 @@
 
 namespace llm_system {
 
-inline time_ns getLinearMemoryDuration(const SystemConfig& config, double m, double k, double n, int precision, hw_metric total_memory_size, hw_metric memory_bandwidth, int num_heads = 1, bool duplicated_input = false) {
+// expose_full_page_latency: paper2 §IV MoE first-activated-expert exception.
+// Armed by the caller (linearCore, hardware/linear_impl.cpp) from the weight
+// tensor's one-shot exposeFirstExpertPageLatency flag (tensor.h), itself set
+// by Route::forward (module/route.cpp) on exactly the first locally-owned
+// expert that receives nonzero routed tokens each decode step -- Route, not
+// ExpertFFN, because Route is the graph_execution leaf that actually
+// re-runs every decode step with live per-step token counts (see
+// module/expert.cpp's ctor comment for why ExpertFFN::forward can't be used
+// for this). Every existing call site (layernorm.cpp, lm_head.cpp, and
+// linearCore's own non-expert calls) never passes true, so this parameter
+// defaults false and is a complete no-op for every non-MoE-expert Linear
+// call and for every paper1
+// config (expose_first_expert_latency defaults false in SystemConfig too).
+inline time_ns getLinearMemoryDuration(const SystemConfig& config, double m, double k, double n, int precision, hw_metric total_memory_size, hw_metric memory_bandwidth, int num_heads = 1, bool duplicated_input = false, bool expose_full_page_latency = false) {
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
     auto& hbf = config.hbf_config;
     // Weight (k×n) is on flash; batched linear (num_heads>1) has num_heads
@@ -58,12 +71,28 @@ inline time_ns getLinearMemoryDuration(const SystemConfig& config, double m, dou
         (double)hbf.flash_page_read_latency_ns / weight_fill_amortize +
         (weight_num_chunks - 1) * std::max(0.0, (double)hbf.flash_page_read_latency_ns - weight_chunk_transfer_ns);
     // paper2 §IV assumes double-buffering fully hides HBF read latency (except
-    // the first activated MoE expert, charged separately at its call site --
-    // placeholder for a later change). Zero the ENTIRE exposed term (both the
+    // the first activated MoE expert, charged separately just below via
+    // expose_full_page_latency). Zero the ENTIRE exposed term (both the
     // pipeline-fill and any per-chunk residual), not just the fill, so no page
     // latency of any kind leaks into paper2_mode's weight-read time.
     if (config.paper2_mode) {
       weight_exposed_latency_ns = 0.0;
+    }
+    // paper2 §IV MoE sub-block exception: "double buffering hides HBF read
+    // latency for all layers except the MoE sub-block, where it is exposed
+    // only when loading the first activated expert." Nothing precedes the
+    // first activated expert's weight fetch to prefetch behind (the
+    // double-buffer has nothing queued yet), so its page-read latency is NOT
+    // hidden -- unlike every other weight tensor in the per-iteration stream,
+    // which the pipeline-fill amortization above already accounts for.
+    // Un-amortized (the full hbf.flash_page_read_latency_ns, not divided by
+    // weight_stream_ops_per_iter): this is a structurally distinct, one-time
+    // charge per MoE layer per step, not part of the cross-op amortized
+    // stream. Added independently of the paper2_mode zeroing directly above
+    // -- gated only on the two conditions in the comment above the function
+    // signature -- so it applies whether or not that zeroing already ran.
+    if (expose_full_page_latency && config.expose_first_expert_latency) {
+      weight_exposed_latency_ns += (double)hbf.flash_page_read_latency_ns;
     }
     double weight_read_time = (weight_size / hbf.flash_read_bandwidth * 1e9) + weight_exposed_latency_ns;
 

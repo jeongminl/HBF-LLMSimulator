@@ -65,11 +65,26 @@ ExpertFFN::ExpertFFN(std::string& prefix, std::string& name,
     expert_device_list.push_back(device_list.at(idx));
   }
 
-  auto moe_route =
-      Route::Create(module_map_name, "moe_route", num_expert_per_device,
-                    expert_offset, device_list, device);
-  add_module(moe_route);
-
+  // paper2 §IV first-activated-expert page-latency exposure: built BEFORE
+  // moe_route (below) specifically so their Module::Ptrs exist to pass into
+  // Route::Create -- Route::forward() is the module that actually gets
+  // re-invoked every decode step (ExpertFFN itself is a plain, non-leaf
+  // Module: its forward() runs exactly once, at module-graph CONSTRUCTION
+  // time, to record the op sequence -- see module/module_graph.cpp's
+  // TopModuleGraph::run(), which only re-calls forward() on
+  // graph_execution==true LEAF modules like Route/Linear/Activation on every
+  // replay). Route already computes this step's LIVE per-local-expert token
+  // counts (expert_token_list, route.cpp) on every such replay, so it is the
+  // correct (and only) place that can pick "this step's first activated
+  // expert" with real per-step data -- see route.cpp's forward() for the arm
+  // logic. local_expert_ffns is built in the SAME local order (index i ==
+  // global expert expert_offset+i) that Route's expert_token_list uses, so
+  // Route can index directly into it. Pure additive plumbing: this reorders
+  // WHEN these Module objects get constructed, not the CALL order recorded
+  // during the actual forward() graph-build pass below (gate_fn -> ...
+  // -> route -> expert loop, unchanged) -- module_list is a std::map keyed by
+  // name, so construction order has no effect on paper1 behavior.
+  std::vector<Module::Ptr> local_expert_ffns;
   if (model_config.ffn_way == 2) {
     for (int expert_id = expert_offset;
          expert_id < expert_offset + num_expert_per_device; expert_id++) {
@@ -77,6 +92,7 @@ ExpertFFN::ExpertFFN(std::string& prefix, std::string& name,
           module_map_name, "expert_FFN_" + std::to_string(expert_id),
           model_config, scheduler, expert_device_list, device, false, true);
       add_module(expert_ffn);
+      local_expert_ffns.push_back(expert_ffn);
     }
   } else if (model_config.ffn_way == 3) {
     for (int expert_id = expert_offset;
@@ -85,8 +101,14 @@ ExpertFFN::ExpertFFN(std::string& prefix, std::string& name,
           module_map_name, "expert_FFN_" + std::to_string(expert_id),
           model_config, scheduler, expert_device_list, device, false, true);
       add_module(expert_ffn);
+      local_expert_ffns.push_back(expert_ffn);
     }
   }
+
+  auto moe_route =
+      Route::Create(module_map_name, "moe_route", num_expert_per_device,
+                    expert_offset, device_list, device, local_expert_ffns);
+  add_module(moe_route);
 
   num_shared_expert = model_config.num_shared_expert;
   for(int shared_expert_idx = 0 ; shared_expert_idx < num_shared_expert; shared_expert_idx ++){
@@ -173,6 +195,13 @@ Tensor::Ptr ExpertFFN::forward(const Tensor::Ptr input,
   Module::Ptr all_reduce_for_gather = get_module("moe_all_reduce_for_gather");
 
   TensorVec expert_out;
+
+  // paper2 §IV first-activated-expert page-latency exposure is armed inside
+  // Route::forward() (module/route.cpp), NOT here -- see this file's ctor
+  // comment on local_expert_ffns for why: this ExpertFFN::forward() method
+  // only ever runs ONCE (at module-graph construction), while Route is a
+  // graph_execution leaf that genuinely re-runs every decode step with live
+  // per-expert token counts, which is what "first ACTIVATED expert" needs.
 
   for (int expert_id = expert_offset;
        expert_id < expert_offset + num_expert_per_device; expert_id++) {

@@ -37,6 +37,19 @@ class Tensor : public std::enable_shared_from_this<Tensor> {
 
   // for MoE layers
   bool perform_with_optimal;
+
+  // paper2 §IV: "double buffering hides HBF read latency for all layers
+  // except the MoE sub-block, where it is exposed only when loading the
+  // first activated expert." One-shot arm/consume flag on a Linear module's
+  // persistent weight tensor ("A" in linear.cpp): ExpertFFN::forward
+  // (module/expert.cpp) sets this to true, per MoE layer per decode step, on
+  // exactly the first locally-owned expert that receives a nonzero number of
+  // routed tokens this step (see Module::armExposeFirstExpertPageLatency()).
+  // linearCore (hardware/linear_impl.cpp) reads and unconditionally resets it
+  // to false on every call to this weight tensor -- consumed exactly once,
+  // regardless of code path taken, so it can never leak into a later step.
+  // Default false: paper1 code paths never touch this field, bit-identical.
+  bool exposeFirstExpertPageLatency = false;
   
   // for parallel execution
   bool parallel_execution;
