@@ -329,23 +329,16 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
           /*has_moe_layer=*/model_config.num_routed_expert > 0,
           /*has_dense_layer=*/hasDenseFfnLayer(model_config));
 
-      // A/B experiment: optionally charge the KV-write on-chip staging burst
-      // against the same scarce tier (footprint.h::kvWriteStagingBytes). Off by
-      // default (side A). layers_per_stage is this representative stage's layer
-      // count (num_layers/pp), matching the weight/KV terms above.
-      if (system_config.kv_write_sram_gate) {
-        act_size += kvWriteStagingBytes(model_config, batch_size_per_gpu, tp,
-                                        layers_per_stage);
-      }
-
-      // FULL faithful paper-1 intermediate-data gate: add the complete resident
-      // intermediate set (footprint.h::intermediateExtrasBytes) on top of
-      // peakIntermediateBytes. Off by default. Independent of kv_write_sram_gate;
-      // mirrors the live-sim gate (cluster.cpp) so the two never drift.
-      if (system_config.faithful_intermediate_gate) {
-        act_size += intermediateExtrasBytes(model_config, batch_size_per_gpu, tp,
-                                            layers_per_stage);
-      }
+      // Full faithful paper-1 intermediate-data accounting: add the complete
+      // resident intermediate set (footprint.h::intermediateExtrasBytes --
+      // KV-write on-chip staging + score tile + all-reduce scratch + MoE
+      // dispatch/GateOut + tiled LM-head logits) on top of
+      // peakIntermediateBytes. layers_per_stage is this representative
+      // stage's layer count (num_layers/pp), matching the weight/KV terms
+      // above. Mirrors the live-sim gate (cluster.cpp) so the two never
+      // drift.
+      act_size += intermediateExtrasBytes(model_config, batch_size_per_gpu, tp,
+                                          layers_per_stage);
 
       // ---- Memory limit verification (via shared checkCapacity) ---------------
       // Uses hbm_per_stack_bytes and the same partitioning rule as cluster.cpp (via footprint.h).

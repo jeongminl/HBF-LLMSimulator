@@ -1590,6 +1590,38 @@ question remaining, per the "that doc holds only still-open or explained-not-a-b
     session's vector-extraction pass for the Batch-row correction (see `paper_figure_readings.md`
     §4 for the corrected 24-row table).
 
+## Faithful intermediate-data SRAM gate merged, defaulted on, then flag removed (2026-07-06) — item 76
+
+76. **`peakIntermediateBytes()`'s under-count (BUGS.md item 9 / U7) is fixed and unconditional.** The
+    `faithful-intermediate-gate` branch (`intermediateExtrasBytes` in `footprint.h` — KV-write on-chip
+    staging + flash-attn score tile + TP all-reduce scratch + MoE dispatch/GateOut + tiled LM-head
+    logits, all single-buffered) was merged into `main` (clean merge, no conflicts — the branch only
+    touched `eval/test.cpp`, `src/hardware/cluster.cpp`, `src/hardware/hardware_config.h`,
+    `src/model/footprint.h`, `src/optimizer/parallelism_optimizer.cpp`). It landed behind
+    `system.faithful_intermediate_gate` (default false in the branch). Per-conversation decision: since
+    this is the paper-conformant SRAM accounting rather than an experimental A/B toggle, the flag was
+    first defaulted to `true`, then **removed entirely** — `cluster.cpp` and `parallelism_optimizer.cpp`
+    now call `intermediateExtrasBytes` unconditionally, and the older, now-fully-subsumed
+    `kv_write_sram_gate` flag (its KV-write term is one of `intermediateExtrasBytes`'s five charges)
+    was deleted at the same time rather than left as a second, redundant knob. **Verified:** clean
+    rebuild (`cmake --build build`); a smoke run (`./build/run build/cfg_mid_OFF_llama3.yaml`)
+    completes normally with no crash and produces a plausible, non-zero `ACT:` figure. **Not yet the
+    architecturally-correct version** — this is a hand-coded formula-based fix, not the liveness-
+    maximum sweep over the real op graph; that more rigorous implementation exists on the separate,
+    NOT-yet-merged `liveness-sweep` branch (`TopModuleGraph::livenessPeakActBytes()`, worktree
+    `agent-aaedd3e8f91fe883f`) and is a candidate follow-up merge.
+
+    **Consequence — every prior sim-vs-paper comparison in this session is now stale.** All of Figs
+    3–7's regenerated PNGs, `checkpoint_*.json`, `error_rates_detail.csv`/`error_rates_by_figure.png`,
+    and this session's six new `PAPER_INCONSISTENCIES.md` "Still open" findings (the Fig-4 plain-HBF
+    flat bias, both Fig-5 llama3 mismatches, the Fig-6 0.05s-SLO ordering flip, the Fig-7 36-cell PEC
+    comparison, and the Fig-7 online≈offline split verdict) were computed against the OLD
+    under-counting SRAM gate, before this merge. Any cell where the gate changes the winning
+    parallelism config or flips SLO-bound↔SRAM-bound needs re-deriving against this build before
+    those findings' numbers can be trusted — **not done yet, pending a decision on re-sweep scope/cost**
+    (a full sweep was previously deferred by the user as too expensive; a targeted re-check of the
+    specific cells above is cheaper and likely sufficient).
+
 ## Paper-inconsistencies doc cleanup (2026-07-06) — consolidated detail moved out of PAPER_INCONSISTENCIES.md
 
 `PAPER_INCONSISTENCIES.md` was reorganized to hold ONLY still-open and explained-not-bug items, each
@@ -1648,6 +1680,30 @@ proof cited STALE pixel bars (854.7/745.1 → vector 766.6/742.0, margin ~6× no
 excludes O(context)-linear charges so cannot finalize U7; "327 reconciled exactly" is numerology; the
 maverick-tp8 impact numbers were miscomputed (missing `/e_tp`). HELD: the score-tile "comment is
 false" claim, the inventory magnitudes, RoPE-zero-for-GQA, and all older dispositions.
+
+**(E) Attention-phase over-count — cross-team finding (2026-07-06, paper2-extension worktree).** The
+paper2-extension team (Kyung et al. CAL 2026 replication, which also consumes
+`peakIntermediateBytes` for its own Fig-5 required-SRAM output) surfaced the counterpart bug: the
+function is correct to `max()` across the attention/FFN phases, but WITHIN the attention phase it
+SUMS every intermediate sub-tensor (`footprint.h:186-200`, `use_absorb` branch; `compressed_kv` and
+GQA-base branches sum analogously) as if all are simultaneously resident, when they actually form a
+dataflow chain and are freed as consumed — the true peak is the max over that chain, not the sum.
+Verified on the DeepSeek-R1 preset (MLA, H=7168, num_heads=128, tp=1): coded sum = 204,864 element-
+units (matches the binary's `P2_SRAM_ACT_BYTES` exactly); true peak-of-chain (at score computation:
+`H + kv_lora + qk_rope + query_proj + tr_k_up`) = 114,240 — a **1.79× (45.8%) over-count**, batch-
+and context-independent. Architecture-dependent: MLA (many attention intermediates) is badly over-
+counted; GQA (few) barely — which is why, as a required-SRAM output, paper2's DeepSeek-R1 (MLA)
+over-shoots (+9…+21%) while Llama-4-Maverick (GQA, FFN-bound anyway) under-shoots (−23…−41%). Fixing
+only this (switching sum→peak) does NOT converge for paper2 either — it flips R1 from +21% to −20%,
+because this over-count and this section's under-count inventory (LM-head logits, score tile,
+KV-write staging) partly cancel in the current sum; the paper's own figure sits between the two
+errors. **Both fixes must land together, as a single graph-based per-tensor liveness pass** (def/
+last-use intervals over the module graph's existing producer→consumer edges,
+`set_dependency_tensor`/`dependency_tensor_list` in `module_graph.cpp`, with a max-concurrency
+sweep) — not two independent patches. For paper1 (this repo's own llama3/llama4, GQA, FFN-bound) the
+over-count is **inert** — U7's scope is unaffected, and for the scarce-tier OOM gate the current sum
+is conservative-safe regardless. Full writeup:
+`.claude/worktrees/paper2-extension/FINDING_peakIntermediateBytes_attention_overcount.md`.
 
 ### Ruled out as causes (moved from PAPER_INCONSISTENCIES.md)
 

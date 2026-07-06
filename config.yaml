@@ -30,7 +30,6 @@ system:
     pipeline_degree: 1
   gpu_gen: Rubin
   infiniband_gen: 800
-  kv_write_sram_gate: false
   memory_type: HBM
   num_device: 8
   num_node: 1

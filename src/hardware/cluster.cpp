@@ -129,23 +129,13 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
         /*has_moe_layer=*/device->model_config.num_routed_expert > 0,
         /*has_dense_layer=*/hasDenseFfnLayer(device->model_config));
 
-    // A/B experiment: optionally add the KV-write on-chip staging burst to the
-    // scarce-tier activation footprint (footprint.h::kvWriteStagingBytes). Off
-    // by default. Mirrors the optimizer gate (parallelism_optimizer.cpp) so the
-    // two never drift.
-    if (config.kv_write_sram_gate) {
-      int pp = device->model_config.pp_dg > 0 ? device->model_config.pp_dg : 1;
-      int layers_per_stage = device->model_config.num_layers / pp;
-      if (layers_per_stage < 1) layers_per_stage = 1;
-      activation_size += (long long)kvWriteStagingBytes(
-          device->model_config, batch_size_per_dp, ne_tp_dg, layers_per_stage);
-    }
-
-    // FULL faithful paper-1 intermediate-data gate: add the complete resident
-    // intermediate set (footprint.h::intermediateExtrasBytes) on top of
-    // peakIntermediateBytes. Off by default. Independent of kv_write_sram_gate;
-    // mirrors the optimizer gate so the two never drift.
-    if (config.faithful_intermediate_gate) {
+    // Full faithful paper-1 intermediate-data accounting: add the complete
+    // resident intermediate set (footprint.h::intermediateExtrasBytes --
+    // KV-write on-chip staging + score tile + all-reduce scratch + MoE
+    // dispatch/GateOut + tiled LM-head logits) on top of peakIntermediateBytes.
+    // Mirrors the optimizer gate (parallelism_optimizer.cpp) so the two never
+    // drift.
+    {
       int pp = device->model_config.pp_dg > 0 ? device->model_config.pp_dg : 1;
       int layers_per_stage = device->model_config.num_layers / pp;
       if (layers_per_stage < 1) layers_per_stage = 1;

@@ -286,7 +286,7 @@ inline bool hasDenseFfnLayer(const ModelConfig& model) {
 }
 
 // ---------------------------------------------------------------------------
-// KV-write on-chip staging buffer (A/B experiment, 2026-07-06).
+// KV-write on-chip staging buffer.
 // ---------------------------------------------------------------------------
 // Per decode step each sequence generates ONE new token whose K,V for every
 // layer on this pipeline stage must be buffered on-chip before the once-per-
@@ -297,12 +297,9 @@ inline bool hasDenseFfnLayer(const ModelConfig& model) {
 // admission-side (input_len-scaled) write timing. Per GPU (TP rank holds
 // num_kv_heads/tp KV heads):
 //   batch_per_gpu * layers_per_stage * kvBytesPerLayerToken(/tp)
-// This function is gated behind SystemConfig.kv_write_sram_gate: when false
-// (default) the scarce-tier gate is unchanged (side A); when true it is added
-// to the activation footprint charged against the SRAM/HBM scarce tier (side
-// B). Mirrors paper2-extension's P2_SRAM_KVWRITE_BYTES formula. Both the
-// optimizer (parallelism_optimizer.cpp) and live sim (cluster.cpp) call it so
-// the two gates never drift.
+// Mirrors paper2-extension's P2_SRAM_KVWRITE_BYTES formula. Folded into the
+// faithful intermediate-data gate below (intermediateExtrasBytes calls this
+// directly); no longer has its own standalone gate flag.
 inline double kvWriteStagingBytes(const ModelConfig& model,
                                   double batch_per_gpu,
                                   int tp,
@@ -314,12 +311,13 @@ inline double kvWriteStagingBytes(const ModelConfig& model,
 }
 
 // ---------------------------------------------------------------------------
-// FULL faithful paper-1 intermediate-data SRAM gate (2026-07-06).
+// Full faithful paper-1 intermediate-data SRAM accounting (added 2026-07-06,
+// unconditional since 2026-07-06).
 // ---------------------------------------------------------------------------
 // peakIntermediateBytes UNDER-counts the resident intermediate set: it excludes
 // the short-lived compute tiles and communication scratch buffers that paper 1
 // sizes the 320-MB logic SRAM by (peak occupancy). This helper returns the SUM
-// of the additional per-GPU resident terms the faithful gate must add on TOP of
+// of the additional per-GPU resident terms that must be added on TOP of
 // peakIntermediateBytes. All SINGLE-buffered (paper 1 sizes by peak occupancy,
 // no double buffering); all per-seq terms scaled by batch_per_gpu:
 //   - KV-write staging  : kvWriteStagingBytes(...)  (context-independent burst)
@@ -328,9 +326,11 @@ inline double kvWriteStagingBytes(const ModelConfig& model,
 //   - MoE dispatch input (MoE only): top_k x hidden_dim x precision
 //   - MoE GateOut (MoE only): top_k x (expert_intermediate_dim/e_tp) x precision
 //   - Tiled LM-head logits: 2048 x precision  (argmax-consistent greedy-decode row)
-// Gated behind SystemConfig.faithful_intermediate_gate (default false). Added in
-// BOTH cluster.cpp (live sim) and parallelism_optimizer.cpp (optimizer) so the
-// two scarce-tier gates never drift. Independent of kv_write_sram_gate.
+// Always added in BOTH cluster.cpp (live sim) and parallelism_optimizer.cpp
+// (optimizer) so the two scarce-tier gates never drift -- this is the
+// paper-conformant SRAM accounting, not an experimental toggle, so there is no
+// flag to disable it (the older KV-write-only flag, kv_write_sram_gate, was
+// removed since this function's first term already subsumes it).
 inline double intermediateExtrasBytes(const ModelConfig& model,
                                       double batch_per_gpu,
                                       int tp,

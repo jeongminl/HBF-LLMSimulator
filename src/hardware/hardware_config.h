@@ -189,22 +189,6 @@ class SystemConfig {
   // Parsed from config.yaml: system.chunk_size.
   int chunk_size = 0;
 
-  // A/B experiment flag (2026-07-06): when true, the KV-write on-chip staging
-  // burst (footprint.h::kvWriteStagingBytes) is added to the activation
-  // footprint charged against the scarce SRAM/HBM tier in BOTH the optimizer
-  // capacity gate and the live-sim checkMemorySize gate. Default false = side A
-  // (baseline, unchanged). Parsed from config.yaml: system.kv_write_sram_gate.
-  bool kv_write_sram_gate = false;
-
-  // Faithful paper-1 intermediate-data gate (2026-07-06): when true, the FULL
-  // faithful resident intermediate set (footprint.h::intermediateExtrasBytes:
-  // KV-write staging + score tile + all-reduce scratch + MoE dispatch/GateOut +
-  // tiled LM-head logits) is added to peakIntermediateBytes and charged against
-  // the scarce SRAM/HBM tier in BOTH the optimizer and live-sim gates. Default
-  // false. Independent of kv_write_sram_gate. Parsed from config.yaml:
-  // system.faithful_intermediate_gate.
-  bool faithful_intermediate_gate = false;
-
   // Length of the per-iteration consecutive weight-read stream on one device
   // (count of linear weight tensors read back-to-back from flash each decode
   // step). getLinearMemoryDuration divides the flash page-read PIPELINE-FILL

@@ -142,13 +142,42 @@ the **LM-head logits** (a step-level tensor the layer-scoped formula can't see),
 all-reduce scratch + MoE dispatch/GateOut. This is the mechanism behind `PAPER_INCONSISTENCIES.md`'s
 U7 (sim HBF+ batch grows/SLO-bound vs the paper's flat/SRAM-bound bars).
 
-**Partially addressed:** KV-write staging is implemented behind `system.kv_write_sram_gate` (default
-off) and an A/B run reproduces the paper's SHORT SRAM-bound bars (shape + cross-model ratio, ~+20-30%
-absolute). **Intended full fix** (recipe in `CHANGES.md`'s "doc cleanup" section): add KV-write
-(single-buffered — paper1 sizes by peak occupancy, no double-buffer), score tile (O(chunk),
-hardware-set), all-reduce scratch (`batch×hidden/tp`), and MoE dispatch/GateOut; model logits as a
-small argmax-consistent tile (NOT full vocab); mirror in `parallelism_optimizer.cpp`. The
-architecturally-correct version is a liveness-maximum sweep over the op graph (see U7).
+**RESOLVED (2026-07-06): merged to `main`, unconditional, no flag.** The `faithful-intermediate-gate`
+branch (`footprint.h::intermediateExtrasBytes` — KV-write staging + score tile + all-reduce scratch +
+MoE dispatch/GateOut + tiled LM-head logits, all single-buffered) was merged into `main`. It first
+landed behind `system.faithful_intermediate_gate` (default false, then default true), but since this
+is the paper-conformant accounting rather than an experimental A/B toggle, the flag itself (and the
+now-fully-subsumed older `kv_write_sram_gate`) was removed entirely — `cluster.cpp` and
+`parallelism_optimizer.cpp` both add `intermediateExtrasBytes` unconditionally on top of
+`peakIntermediateBytes`. Verified: clean rebuild, smoke-run completes without error. **Still not the
+architecturally-correct version** — this is a hand-coded formula, not the liveness-maximum sweep over
+the op graph (see U7 and the companion over-count note below); that more rigorous alternative exists
+in the separate `liveness-sweep` branch (`agent-aaedd3e8f91fe883f` worktree,
+`TopModuleGraph::livenessPeakActBytes()`) but is NOT yet merged. **Consequence: every figure
+regeneration, checkpoint, and error-rate comparison produced earlier in this session (Figs 3–7,
+`error_rates_detail.csv`, and this session's six new `PAPER_INCONSISTENCIES.md` findings) was computed
+under the OLD under-counting behavior and is now stale for any cell where this gate changes the
+winning config or bound reason — re-sweep before trusting those numbers against this build.**
+
+**Companion over-count found by the paper2-extension team (2026-07-06,
+`.claude/worktrees/paper2-extension/FINDING_peakIntermediateBytes_attention_overcount.md`):** the
+same function also SUMS every attention-phase intermediate as if concurrently resident
+(`footprint.h:186-200`), when in reality they form a def→last-use dataflow chain and the true peak
+is the max over that chain, not the sum. Architecture-dependent — badly over-counts MLA (many
+attention intermediates: DeepSeek-R1 measured 204,864 summed vs. 114,240 true peak-of-chain, a
+1.79× / 45.8% over-count, batch/context-independent), barely affects GQA (llama3/llama4, this repo's
+paper1 models — few attention intermediates, and both are FFN-bound anyway so the over-count is
+inert for U7's current scope). Replacing the sum with the rigorous peak-liveness value does NOT by
+itself converge on paper2's reported SRAM figure — it flips R1 from +21% to −20% — because the
+under-count inventory above (items this section already tracks) is simultaneously in effect; the two
+errors partially cancel, which is very likely why paper figures land between a naive sum and a
+rigorous peak. **The two fixes are not independent and must land together**: a graph-based per-
+tensor liveness pass (max-concurrency sweep over def/last-use intervals, using the module graph's
+existing producer→consumer edges — `set_dependency_tensor`/`dependency_tensor_list` in
+`module_graph.cpp`) that both (a) stops over-counting attention's dataflow chain as a sum and (b)
+adds the currently-missing tensors (LM-head logits, score tile, KV-write staging) as their own
+liveness intervals. FFN is NOT over-counted (gate/up genuinely coexist for the SiLU multiply) — this
+finding is attention-specific and orthogonal to the FFN-side accounting.
 
 ## 10. `LmHead::forward` bypasses `device->execution()` — its FLOPs/DRAM-energy are uncounted
 
