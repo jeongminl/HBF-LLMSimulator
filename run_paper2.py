@@ -254,7 +254,7 @@ FAIL_MARKERS = ["Out of Memory", "Activations exceed", "Flash capacity exceeded"
                 "capacity exceeded", "Assertion", "terminate called", "fail(", "[FAIL]"]
 
 
-def run_binary(cfg, tag, timeout=1800, keep_on_failure=True):
+def run_binary(cfg, tag, timeout=5400, keep_on_failure=True):
     """Write a per-tag temp config + isolated output dir under BUILD_DIR,
     invoke ./run (cwd=BUILD_DIR), parse markers. Mirrors run_simulation's
     temp-config + worker-tag isolation pattern (see module docstring)."""
@@ -844,6 +844,24 @@ def _pct_err(sim, paper):
     return (sim - paper) / paper * 100.0
 
 
+def _sim_baseline_rec(bar_recs, model, ctx):
+    """The paper's Fig5 'baseline throughput' (Fig4_Fig5_extracted_numbers.md
+    'Baseline throughputs' table) is the DENOMINATOR its normalized bars are
+    plotted against -- i.e. the leftmost, weakest bar of each group, which sits
+    at 1.0x by construction. That bar is the device_HBM + NVLink5.0 CPU-offload
+    config at the 512GB (budget=2x) reservation, run at/near the 200ms SLO --
+    NOT the synthetic all-in-HBM batch=648 no-offload probe the harness also
+    computes (that is a different, higher operating point: it fits entirely in
+    HBM so it never pays the slow C2C read, giving ~2.5x the paper baseline).
+    Cross-checked: sim NVLink5.0-512GB = 9,687 tok/s vs paper 9,843 for
+    Maverick 8K (-1.6%); the paper-implied served batch at the 200ms SLO for
+    all four (model,ctx) baselines matches compute_batch's NVLink5.0-512GB
+    batch to a few percent (see PAPER2_NOTES.md). One baseline per (model,ctx),
+    budget-independent -- matches the paper's single per-(model,ctx) number, so
+    the 768GB group's bars normalize against this same 512GB reference."""
+    return bar_recs.get(fig5_bar_id(model, ctx, 2, "NVLink5.0"))
+
+
 def write_fig4_table():
     recs = {}
     if os.path.exists(FIG4_JSONL):
@@ -916,17 +934,24 @@ def write_fig5_table():
 
     lines = ["# Fig5 replication: sim vs paper\n"]
     lines.append("## Baseline throughputs\n")
-    lines.append("| Model | Context | Sim tok/s | Paper tok/s | %err |")
-    lines.append("|---|---|---|---|---|")
+    lines.append("Paper baseline denominator = sim's **NVLink5.0 device_HBM @ 512GB** bar (at/near the "
+                 "200ms SLO), NOT the synthetic all-in-HBM no-offload probe (last column, a different "
+                 "operating point kept only as a diagnostic). See `_sim_baseline_rec` / PAPER2_NOTES.md.\n")
+    lines.append("| Model | Context | Sim NVLink5.0-512GB tok/s | Paper tok/s | %err | "
+                 "(diag) all-in-HBM probe tok/s |")
+    lines.append("|---|---|---|---|---|---|")
     for model in MODELS:
         for ctx in FIG5_CONTEXTS:
-            r = base_recs.get(fig5_baseline_id(model, ctx))
+            r = _sim_baseline_rec(bar_recs, model, ctx)
+            probe = base_recs.get(fig5_baseline_id(model, ctx))
+            probe_s = f"{probe['throughput_tok_s']:.0f}" if probe else "NOT RUN"
             paper = PAPER_FIG5_BASELINE[(model, ctx)]
             if r:
                 err = _pct_err(r["throughput_tok_s"], paper)
-                lines.append(f"| {model} | {ctx} | {r['throughput_tok_s']:.0f} | {paper} | {err:+.1f}% |")
+                lines.append(f"| {model} | {ctx} | {r['throughput_tok_s']:.0f} | {paper} | "
+                             f"{err:+.1f}% | {probe_s} |")
             else:
-                lines.append(f"| {model} | {ctx} | NOT RUN | {paper} | - |")
+                lines.append(f"| {model} | {ctx} | NOT RUN | {paper} | - | {probe_s} |")
 
     lines.append("\n## Per-group bars\n")
     for model in MODELS:
@@ -938,18 +963,25 @@ def write_fig5_table():
                 lines.append("| Device | Sim SLO-bound | Sim TPOT(ms) | Sim tok/s | Sim norm-tok/s | "
                               "Sim CPU/HBM ratio | Paper SLO-bound | Paper TPOT(ms) | Paper ratio | SRAM MB (sim) |")
                 lines.append("|---|---|---|---|---|---|---|---|---|---|")
-                paper_base = PAPER_FIG5_BASELINE[(model, ctx)]
+                # Self-consistent normalization: divide by the SIM's own
+                # NVLink5.0-512GB baseline (so NVLink5.0-512 reads ~1.0x, exactly
+                # as the paper's own axis is built), NOT the paper's absolute
+                # number -- keeps "sim normalized bars" comparable to "paper
+                # normalized bars" without importing the paper's value.
+                sim_base_rec = _sim_baseline_rec(bar_recs, model, ctx)
+                sim_base = sim_base_rec["throughput_tok_s"] if sim_base_rec else None
                 for device in FIG5_DEVICES:
                     r = bar_recs.get(fig5_bar_id(model, ctx, budget, device))
                     p_slo, p_tpot = paper["bars"][device]
                     p_ratio = paper["ratio"].get(device)
                     if r:
-                        norm = r["throughput_tok_s"] / paper_base if paper_base else None
+                        norm = r["throughput_tok_s"] / sim_base if sim_base else None
+                        norm_s = f"{norm:.2f}" if norm is not None else "n/a"
                         sram_mb = (r.get("sram_required_bytes_per_device") / 1e6
                                    if r.get("sram_required_bytes_per_device") else None)
                         lines.append(
                             f"| {device} | {r['slo_bound']} | {r['tpot_ms']:.1f} | {r['throughput_tok_s']:.0f} | "
-                            f"{norm:.2f} | {r.get('cpu_hbm_ratio')} | {p_slo} | {p_tpot} | {p_ratio} | {sram_mb} |")
+                            f"{norm_s} | {r.get('cpu_hbm_ratio')} | {p_slo} | {p_tpot} | {p_ratio} | {sram_mb} |")
                     else:
                         lines.append(f"| {device} | NOT RUN | - | - | - | - | {p_slo} | {p_tpot} | {p_ratio} | - |")
                 paper_sram = PAPER_FIG5_SRAM_MB.get((model, budget, ctx))

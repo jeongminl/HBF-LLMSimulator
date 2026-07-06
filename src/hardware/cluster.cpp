@@ -239,21 +239,33 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
   // activation-buffer term).
   double p2_sram_act_bytes = (double)activation_size;
 
-  // P2_SRAM_DBUF_BYTES: the read double-buffer pool that hides HBF page-read
-  // latency (getLinearMemoryDuration / getAttentionMemoryDuration in
-  // layer_impl.h) = 2 x effective chunk bytes (double-buffered: one chunk
-  // draining while the next fills). effective chunk mirrors those functions'
-  // own chunk-size resolution exactly: an explicit system.chunk_size,
-  // clamped to the full per-stack SRAM staging capacity (a double-buffer
-  // can't stage more than the SRAM holds); 0 on non-flash presets (no HBF
-  // staging SRAM at all).
-  double p2_staging_capacity_bytes =
-      (double)config.hbf_config.sram_per_stack_bytes * config.hbf_config.num_flash_stacks;
+  // P2_SRAM_DBUF_BYTES: the read double-buffer that hides HBF page-read latency
+  // (tR) in getAttentionMemoryDuration / getLinearMemoryDuration (layer_impl.h)
+  // = 2 x effective chunk bytes (one chunk draining while the next fills). The
+  // REQUIRED buffer is the MINIMAL chunk that fully hides tR, which is the
+  // bandwidth-delay product of the flash read pipeline: the KV bytes that stream
+  // in during one tR window at the flash read bandwidth. This is precisely the
+  // timing model's own break-even -- a chunk whose transfer time (chunk_bytes /
+  // flash_read_bandwidth) is >= tR exposes ZERO per-chunk read residual, so only
+  // the single pipeline-fill tR is ever charged (layer_impl.h:156); any chunk
+  // >= flash_read_bandwidth * tR meets that bound. The timing model, when
+  // system.chunk_size==0, streams through full-staging-capacity chunks for
+  // simplicity, but does NOT need that much SRAM to hide tR -- reporting the
+  // minimal required buffer (not the full physical staging capacity) is what the
+  // paper's "required SRAM per device" metric means, and the decode timing is
+  // identical either way (residual == 0 in both). An explicit system.chunk_size
+  // overrides the bandwidth-delay chunk; either way it is capped at the physical
+  // per-device staging-SRAM capacity (a double-buffer can't stage more than the
+  // SRAM holds). 0 on non-flash presets (no HBF staging SRAM at all).
   double p2_effective_chunk_bytes = 0.0;
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0 &&
-      p2_staging_capacity_bytes > 0) {
+      config.hbf_config.flash_read_bandwidth > 0) {
+    double p2_staging_capacity_bytes =
+        (double)config.hbf_config.sram_per_stack_bytes * config.hbf_config.num_flash_stacks;
+    double p2_bandwidth_delay_bytes = config.hbf_config.flash_read_bandwidth *
+        ((double)config.hbf_config.flash_page_read_latency_ns * 1e-9);
     double requested_chunk_bytes = (config.chunk_size > 0)
-        ? (double)config.chunk_size : p2_staging_capacity_bytes;
+        ? (double)config.chunk_size : p2_bandwidth_delay_bytes;
     p2_effective_chunk_bytes = std::min(requested_chunk_bytes, p2_staging_capacity_bytes);
   }
   double p2_sram_dbuf_bytes = 2.0 * p2_effective_chunk_bytes;
