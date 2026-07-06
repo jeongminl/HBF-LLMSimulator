@@ -24,12 +24,15 @@ decision trail in `PAPER2_NOTES.md`.
   share and context. Both components are honest, neither is a bug.
 - **Fig5 (throughput bars + TPOT + SRAM):** after correcting the harness's
   baseline denominator (§3), the sim's baseline throughput matches the paper to
-  **−1.6…−4.8%** (all four model/context baselines), and the 19 offload-
-  independent bar TPOTs match to a median **−7.1%** (range −4…−11%; these are all
-  at the fixed 1:3 workload, where the efficiency effect is tightest). One real
-  code bug (SRAM double-buffer over-report) was found and fixed (§5); the
-  resulting SRAM sizing is the one metric that only lands to ±40%, scattered in
-  both directions (§5) — but it is output-only and affects no headline result.
+  **−1.0…−3.2%** (all four model/context baselines), and the 19 offload-
+  independent bar TPOTs match to a median **−8.5%** (range −4…−11%; these are all
+  at the fixed 1:3 workload, where the efficiency effect is tightest). Most
+  decisively, the paper's normalized-throughput **bar heights** — a quantity
+  *nowhere printed as text*, recovered from the figure's vector geometry (§7) —
+  match the sim's normalized throughput to a **median 0.8%** across all 32 bars.
+  One real code bug (SRAM double-buffer over-report) was found and fixed (§5);
+  the resulting SRAM sizing is the one metric that only lands to ±40%, scattered
+  in both directions (§5) — but it is output-only and affects no headline result.
 - **One qualitative edge case is NOT reproduced (§6):** the paper's distinctive
   "even ½-HBF becomes SLO-bound" case (R1 768GB/8K) is not SLO-bound in the sim
   (20 ms of headroom) — a direct downstream consequence of the ~8–10% TPOT
@@ -48,10 +51,11 @@ qualitative mismatch (§6).
 |---|---|---|
 | KV bytes/token (Maverick) | 196,608 B, exact | 2·8·128·2·48, paper-exact |
 | KV bytes/token (R1, BF16) | 70,272 B, exact | (512+64)·2·61 |
-| Fig5 baseline throughput (all 4) | −1.6 … −4.8% | after §3 denominator fix |
+| **Fig5 normalized-throughput bar heights (32)** | **median 0.8%, max 5.3%** | vector-extracted (§7); the paper's own plotted quantity |
+| Fig5 baseline throughput (all 4) | −1.0 … −3.2% | after §3 denominator fix + deterministic workload |
 | Fig4 normalized lifetime trend | tracks within a few % | e.g. Mav CV0.1 (1.0, 1.99, 3.79) vs (1.0, 2.04, 4.14) |
-| Fig4 DeepSeek-R1 @ 8K | +5.8% … −6.3% | near-exact at short context |
-| Fig5 bar TPOTs (19, offload-independent) | median −7.1% (−4…−11%) | all at fixed 1:3 workload |
+| Fig4 DeepSeek-R1 @ 8K | +6% … −6% | near-exact at short context |
+| Fig5 bar TPOTs (19, offload-independent) | median −8.5% (−4…−11%) | all at fixed 1:3 workload |
 | Fig4 lifetime, 60 cells | median −10%, 87% within ±20% | worst −36% at one extreme corner |
 | Fig4 TPOT, 60 cells | median −11%, range +3…−26% | workload-dependent, not flat (§4b) |
 | First-activated-expert tR exposure | exact to the ns | 24×3µs Maverick / 58×3µs R1 per step |
@@ -211,20 +215,58 @@ above only.
 The paper highlights one distinctive edge case: for **DeepSeek-R1, 768 GB, 8K**,
 *even* ½-HBF becomes SLO-bound (the only HBF/½-HBF bar in Fig5 that is). The sim
 does **not** reproduce this: `deepseekR1|ctx8192|budget3x|1/2-HBF` measures
-TPOT 179.9 ms — 20 ms *under* the 200 ms SLO, not bound.
+TPOT 178.5 ms — 21 ms *under* the 200 ms SLO, not bound.
 
 This is an honest, disclosed consequence of §4a: the sim runs this R1 bar ~8–10%
 faster than the paper (in line with R1's bar-TPOT deviations elsewhere,
 −9.7…−10.7%). Applying the paper's implicit ~8–10% bandwidth derate would push
-179.9 ms to ~197–200 ms — right at the SLO boundary, where the paper places it
+178.5 ms to ~196–200 ms — right at the SLO boundary, where the paper places it
 just above and the sim places it just below. So the single binary SLO-bound flag
 flips. We do not patch it (that would be the §4a tuning-to-target); we flag it as
 the one qualitative disagreement with the paper. No other SLO-bound flag differs.
 
 ---
 
-## 7. Documented modeling choices & discrepancies (not deviations from data)
+## 7. Vector bar-height validation (Fig5 normalized throughput)
 
+Fig5's y-axis ("Normalized throughput", 0–6) is the paper's headline performance
+quantity, but the bar heights are **never printed as text** — only visually
+encoded. Fig5 is a fully vector figure (PDF page 3: 0 raster images, 36
+rectangles), so the bar geometry is extracted directly and calibrated against the
+printed 0–6 tick labels (≈4.83 pt/unit; bars baselined at the 0 gridline). This
+recovers the paper's own normalized-throughput values and compares them to the
+sim's normalized throughput (each bar ÷ the sim's NVLink5.0-512GB bar per
+(model,ctx) — the same reference the paper's axis is built on).
+
+Across all **32 bars: median |error| 0.8%, mean 1.4%, max 5.3%** — the tightest
+agreement of any metric in the replication. Two internal-consistency checks pass:
+all 8 NVLink5.0 bars read ≈1.01× (the ~1.0 reference by construction, validating
+both the calibration and the §3 baseline-denominator choice), and the
+HBF/½-HBF/NVLink6.0 heights track the sim per bar (e.g. Maverick 512GB/8K: paper
+4.22 / 2.15 / 1.74 vs sim 4.26 / 2.14 / 1.74). The max 5.3% is the R1 768GB/8K
+SLO-edge group (§6). This is the most direct throughput comparison available — no
+intermediate assumptions — and it independently confirms the sim reproduces the
+paper's plotted bars to ~1%.
+
+---
+
+## 8. Documented modeling choices & discrepancies (not deviations from data)
+
+- **Fig5 workload = deterministic mean length (no dispersion).** Paper §VI-B:
+  "…for each Lin and Lout configuration, we use the average sequence length within
+  a batch…" — a single homogeneous mean-length batch. Dispersion (CV/κ) is a
+  Fig4-only construct (its stochastic heterogeneous-request lifetime sweep). The
+  harness runs Fig5 with `FIG5_CV=0, FIG5_KAPPA=0`, which triggers the sampler's
+  exact deterministic path. (Verified negligible vs the earlier low-dispersion
+  0.1/90 assumption: <1% TPOT, since CV=0.1 was already near-deterministic — but
+  this matches the paper's stated method exactly.)
+- **First-activated-expert exposure is now in the Fig4 dataset.** An earlier Fig4
+  sweep binary predated that feature; its committed lifetimes/TPOTs were ~0.15%
+  (Maverick, 24×3µs) / ~0.29% (R1, 58×3µs) too fast. Both figures were re-run on
+  the final binary so the entire dataset is reproducible from committed source and
+  includes every modeled paper2 mechanism. Aggregate deviations are essentially
+  unchanged (the correction is marginal); it is a correctness/reproducibility fix,
+  not a numbers change.
 - **V_weight** taken from the simulator's own mapping accounting (Maverick
   999.73 GB, R1 1581.70 GB), not the paper's label-inversion (~910 / ~1454 GB).
   Consequence: our printed CPU/HBM ratios run ~1.95 where the paper prints ~1.8
@@ -237,9 +279,36 @@ the one qualitative disagreement with the paper. No other SLO-bound flag differs
 - **iRoPE disabled** for paper2 Maverick (full attention per paper §II); paper1's
   iRoPE Maverick path is untouched.
 
+- **Attention-score/softmax tile placement in the required-SRAM total (open
+  question, 2026-07-06).** Paper2's `P2_REQUIRED_SRAM_BYTES_PER_DEVICE`
+  (`cluster.cpp:289`) correctly sums the three buffers the paper's §III-System
+  assumes — activation (`P2_SRAM_ACT_BYTES` = `peakIntermediateBytes`), read
+  double-buffer (`P2_SRAM_DBUF_BYTES`), and per-stage KV-write buffer
+  (`P2_SRAM_KVWRITE_BYTES`). But where the `Q·Kᵀ` score/softmax matrix lives in
+  this total is *asserted, not sized*: the comment at `cluster.cpp:236-239` says
+  the score staging "shares the same physical double-buffer as P2_SRAM_DBUF_BYTES,"
+  i.e. it is folded into the flash-read double-buffer (sized by the flash
+  bandwidth-delay product, `2 × flash_read_bandwidth × tR`), and NOT added to the
+  activation term. This is a *third, distinct* placement hypothesis vs. the two in
+  paper1's `PAPER_INCONSISTENCIES.md` U7: (a) paper1-main charges the score tile
+  **0** on HBF+/CONV+; (b) the rejected `ab-score-accounting` A/B charged the full
+  **O(context)** matrix against the activation pool; (c) paper2 here folds it into
+  the read double-buffer. None of the three sizes an actual FlashAttention-style
+  **O(chunk)** compute tile — the physically-correct invariant (one chunk of `S`
+  resident on-die, independent of both context length and flash-read timing).
+  Consequence for paper2's Fig-5 SRAM sizing: because the score tile is folded into
+  DBUF (which is flash-timing-sized, not batch-scaled), the reported required-SRAM
+  is **batch-independent** in its score component — but a real O(chunk) score tile
+  scales with batch (`batch × heads/tp × chunk × precision`). This may be part of
+  the batch-scaled residual noted in §5 ("the remaining gap is in the batch-scaled
+  term"). Not patched: resolving it requires the same dedicated compute-tile knob
+  proposed for paper1 (`PAPER_INCONSISTENCIES.md` U7 "SEVENTH-PASS" recipe); doing
+  it here without that shared knob would be an unstated assumption. Flagged for a
+  joint paper1+paper2 score-tile pass.
+
 ---
 
-## 8. Discipline
+## 9. Discipline
 
 Every proposed change was adversarially pre-screened; the two systematic biases
 (§4a, §4b) were each traced to a mechanism and left unpatched precisely because
