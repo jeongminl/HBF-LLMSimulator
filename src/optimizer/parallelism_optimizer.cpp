@@ -329,6 +329,15 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
           /*has_moe_layer=*/model_config.num_routed_expert > 0,
           /*has_dense_layer=*/hasDenseFfnLayer(model_config));
 
+      // A/B experiment: optionally charge the KV-write on-chip staging burst
+      // against the same scarce tier (footprint.h::kvWriteStagingBytes). Off by
+      // default (side A). layers_per_stage is this representative stage's layer
+      // count (num_layers/pp), matching the weight/KV terms above.
+      if (system_config.kv_write_sram_gate) {
+        act_size += kvWriteStagingBytes(model_config, batch_size_per_gpu, tp,
+                                        layers_per_stage);
+      }
+
       // ---- Memory limit verification (via shared checkCapacity) ---------------
       // Uses hbm_per_stack_bytes and the same partitioning rule as cluster.cpp (via footprint.h).
       {

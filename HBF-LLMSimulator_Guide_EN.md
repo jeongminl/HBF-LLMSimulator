@@ -7,8 +7,9 @@
 > al., *"Exploring High-Bandwidth Flash for Modern LLM Inference: Opportunities and Challenges"*
 > (IEEE CAL 2026; the PDF is in this repo and is the ground-truth spec). This guide describes
 > what the simulator does today, not how it got there — for the history of bugs found and fixed,
-> see `CHANGES.md`; for currently-known bugs and open paper-comparison gaps, see `BUGS.md`,
-> `BUGS_HIDDEN_BY_FLAGS.md`, and `PAPER_INCONSISTENCIES.md`.
+> see `CHANGES.md`; for currently-known bugs and open paper-comparison gaps, see `BUGS.md` and
+> `PAPER_INCONSISTENCIES.md`. Raw investigation/adjudication trails (superseded by the docs above,
+> kept for full derivations) live under `ledgers/`.
 >
 > This guide is a companion to `LLMSimulator_Guide_EN.md` (the upstream guide, still accurate for
 > the base simulator's unmodified subsystems). Sections 6–7 (HBF memory model, parallelism
@@ -616,11 +617,12 @@ New/changed files relative to the upstream file map (base guide has the full ups
 | `run_experiments.py` | Sweep driver — the paper-comparison harness (§14) |
 | `compare_error_rates.py` | Reusable comparison tool: `paper_figure_readings.md` vs. `experiment_results.md` (§14) |
 | `CHANGES.md` | Full history of bugs found and fixed, with rationale and paper cross-references |
-| `BUGS.md` | Currently-known unfixed/dormant bugs |
-| `BUGS_HIDDEN_BY_FLAGS.md` | Bugs masked by pinned config flags, not yet exercised |
+| `BUGS.md` | Currently-known unfixed/dormant bugs (including those formerly masked by pinned config flags) |
 | `PAPER_INCONSISTENCIES.md` | Still-open and explained-not-bug paper-comparison gaps |
 | `experiment_results.md` | This repo's simulator output, in the paper's figure format |
 | `paper_figure_readings.md` | Values read directly off the paper's own figures |
+| `PAPER_GROUND_TRUTH.md` | Non-figure paper ground truth: hardware constants, methodology, prose claims |
+| `ledgers/` | Raw investigation/adjudication trails (bug-hunt passes, orchestrator ledgers) |
 
 All other files match the upstream file map exactly (base guide has the full reference).
 
@@ -645,8 +647,9 @@ guide's own quirks section for the original description of each):
   `getNumInjection`/`getPoissondistribution` (no call sites).
 - Memory-limited batch shrinking (`mem_cap_limit`) happens once at startup, not dynamically at
   runtime (`cluster.cpp`).
-- `gpu_gen: A100` has no Ramulator DRAM-config branch in `device.cpp` and would crash if selected
-  (§8.1, `BUGS.md` item 1) — dormant, no current sweep uses it.
+- `gpu_gen: A100` previously had no Ramulator DRAM-config branch in `device.cpp` and would crash
+  if selected — **fixed 2026-07-02** (`CHANGES.md` item 70); an A100 branch now exists, mirroring
+  the Rubin pattern.
 
 HBF-specific simplifications, new to this fork:
 
@@ -654,15 +657,20 @@ HBF-specific simplifications, new to this fork:
   local-window trajectory (§9.1) — a deliberate simplification that empirically tracks the paper's
   reported anchors more closely than the sawtooth's lower average would.
 - **`page_size_bytes` is vestigial config surface**: no timing formula currently computes with the
-  literal 4 KiB page size; it remains as hardware-geometry documentation only (`BUGS.md` item 5).
+  literal 4 KiB page size; it remains as hardware-geometry documentation only (`BUGS.md` item 7).
 - **Disaggregated path (`disagg_system=on`, currently unused by any sweep)** does not model a
   one-time prefill→decode KV-transfer event; the per-decode-step KV-write penalty (§6.2) is
-  present and correct on both execution paths regardless (`BUGS.md` item 3).
+  present and correct on both execution paths regardless (`BUGS.md` item 1).
 - **`checkHeteroMemorySize()`** (§8.3) has its own, separately-maintained capacity-check logic,
-  not reconciled with `checkMemorySize`'s scarce-tier gate (`BUGS.md` item 6).
-- **`runIterationMixed` has no internal defensive check** that `decode_mode: on` is set — decode-
-  only TPOT correctness currently depends on this convention holding, not on a structural
-  guarantee (`BUGS.md` item 2).
+  not reconciled with `checkMemorySize`'s scarce-tier gate — confirmed dead code (zero call sites)
+  with a latent capacity-math bug if ever revived (`BUGS.md` item 3).
+- **`runIterationMixed` has no internal structural guard** that `decode_mode: on` is set — decode-
+  only TPOT correctness currently depends on this convention holding; a runtime warning was added
+  (`CHANGES.md` item 73) but no hard guard exists (`BUGS.md` item 2).
+- **MLA prefill attention on flash never models KV-read timing** (`BUGS.md` item 4) and
+  **`logic_x`/`pim_x` speedup multipliers are inconsistent between the routing heuristic and the
+  timing model** (`BUGS.md` item 5) — both dormant, requiring `parallel_execution: on` and/or an
+  MLA model in prefill mode.
 
 See `PAPER_INCONSISTENCIES.md` for simulator-vs-paper numeric gaps (both still-open and
-explained-as-not-a-bug), and `BUGS.md`/`BUGS_HIDDEN_BY_FLAGS.md` for the full current bug list.
+explained-as-not-a-bug), and `BUGS.md` for the full current bug list.

@@ -644,8 +644,9 @@ established practice of retaining superseded analysis with a pointer to the corr
     larger batches it lets the sequence be built with the minimum valid length so the run proceeds
     to the real SLO/capacity check instead of aborting. Verified batches 8193/9000/15000 now
     terminate on a legitimate SLO violation or capacity rejection rather than the assert. Same bug
-    *class* as the sibling worktree's activation-overflow fixes (`BUGS_FIXES.md` T2), but a distinct
-    site (scheduler metadata construction, not the activation-size formula). **Impact on the paper
+    *class* as the sibling worktree's activation-overflow fix (item 67 above; full trail in
+    `ledgers/BUGS_FIXES.md` T2), but a distinct site (scheduler metadata construction, not the
+    activation-size formula). **Impact on the paper
     comparison:** materially changed U7's HBF+/CONV+ shape (the old monotonic-growth-to-2149 anchor
     was partly the crash capping the search at 8192; post-fix the per-GPU batch peaks at 4 GPU and
     declines to an SRAM-bound ceiling by 16 GPU — a much closer match to the paper's flat/SRAM-bound
@@ -1060,10 +1061,11 @@ decision"); nothing calibrated to a target.
 ## Third-pass independent bug hunt (2026-07-03) — items 41-50
 
 Run blind to this file and PAPER_INCONSISTENCIES.md (independence protocol; post-hoc convergence
-check), against a fresh extraction of the paper's ground truth (`PAPER_ANCHOR_SHEET.md`). Every
+check), against a fresh extraction of the paper's ground truth (`PAPER_ANCHOR_SHEET.md`, renamed
+`PAPER_GROUND_TRUTH.md` in the 2026-07-06 documentation reorganization). Every
 finding was adversarially verified by independent refuter agents before any fix was applied. Full
 finding records, refuter verdicts, and the convergence classification live in
-`FINDINGS_REGISTER.md`. All fixes are grounded in technical correctness or the paper's stated
+`ledgers/FINDINGS_REGISTER.md`. All fixes are grounded in technical correctness or the paper's stated
 methodology; nothing was calibrated to a paper number.
 
 41. **Optimizer TP all-reduce latency hops: ring → recursive-doubling** (`parallelism_optimizer
@@ -1132,7 +1134,8 @@ methodology; nothing was calibrated to a paper number.
     out" note, which was only ever verified at U1's capacity-bound point.**
 
 **Post-fix 13-cell regression (throughput-max search, 0.1 s SLO; paper anchors =
-PAPER_ANCHOR_SHEET.md exact red labels, visual bars ±0.1-0.15 norm):**
+`PAPER_ANCHOR_SHEET.md`'s exact red labels, now reproduced in `paper_figure_readings.md`
+Sections 1/2; visual bars ±0.1-0.15 norm):**
 
 | Cell | batch/GPU (Δ vs paper) | TPS/GPU (Δ) | bound |
 |---|---|---|---|
@@ -1159,7 +1162,7 @@ deliberate). llama4 HBM4 SHORT batch +6.2%: the search now reaches TP=2's true c
 Run with the same independence protocol as the third pass (10 blind Opus finder tracks + 6
 Sonnet adversarial refuters + targeted verification runs; finders saw only the SUBJECTS of prior
 findings, never the explanations; convergence checked post-hoc). Full finding records, refuter
-verdicts, verification-run numbers and the convergence ledger live in `FINDINGS_REGISTER.md`'s
+verdicts, verification-run numbers and the convergence ledger live in `ledgers/FINDINGS_REGISTER.md`'s
 "Fourth-pass register". Blind re-investigations of U5, U7 and Residual-1 all CONVERGED on the
 documented dispositions with sharper evidence (see PAPER_INCONSISTENCIES.md). All fixes below are
 grounded in technical correctness or the paper's stated methodology; nothing was calibrated to a
@@ -1229,7 +1232,7 @@ fix predicts.
   (Fig-5 is time-based; Fig-7 PEC is geometry-based; the paper reports no energy figure). Also:
   the ramulator YAML is chosen by gpu_gen only — every preset maps to an HBM3-class config, so
   enabling `use_ramulator` for a flash preset would silently model HBM3E (landmine documented in
-  FINDINGS_REGISTER). `data_object.cpp` confirmed dead. power.h's `X4`/`X16` comments disagree 2×
+  ledgers/FINDINGS_REGISTER.md). `data_object.cpp` confirmed dead. power.h's `X4`/`X16` comments disagree 2×
   with the ×8/×32 code factors, and `kMAC` is uncited with an unexplained /2 — provenance notes
   only, on unread columns.
 - **GB-vs-GiB capacities: undecidable from the paper, binary convention kept** — Table I's
@@ -1270,9 +1273,10 @@ fix predicts.
 
 Run with the same independence protocol as the third/fourth passes (9 blind Opus finder tracks +
 6 Sonnet adversarial refuters + targeted verification runs; finders were denied all analysis docs
-and git history, allowed only the paper PDF, `PAPER_ANCHOR_SHEET.md`, `paper_figure_readings.md`,
-and `src/eval` harness code). Full finding records, refuter verdicts, the V-moe-liveness
-adjudication, and the convergence ledger live in `FINDINGS_REGISTER.md`'s "Fifth-pass register".
+and git history, allowed only the paper PDF, `PAPER_ANCHOR_SHEET.md` (renamed
+`PAPER_GROUND_TRUTH.md`), `paper_figure_readings.md`, and `src/eval` harness code). Full finding
+records, refuter verdicts, the V-moe-liveness
+adjudication, and the convergence ledger live in `ledgers/FINDINGS_REGISTER.md`'s "Fifth-pass register".
 All fixes below are grounded in technical correctness or the codebase's own existing conventions;
 nothing was calibrated to a paper number. **Gate:** 13-cell regression re-run post-fix — 6/13
 cells (all HBM4) bit-identical; the remaining 7/13 (all HBF/HBF+/CONV+ cells) moved by <1% each,
@@ -1285,7 +1289,7 @@ been predicted, by item 58's follow-on adjudication, to flip from slo- to sram-b
 slo-bound post-fix, but its SRAM headroom collapsed from +450/GPU (~16%) to +31/GPU (~1.3%) against
 the ceiling — a near-miss that quantitatively confirms the fix engaged at the predicted magnitude
 without crossing zero for this specific auto-selected parallelism config (full reconciliation in
-`FINDINGS_REGISTER.md`).
+`ledgers/FINDINGS_REGISTER.md`).
 
 58. **SRAM/capacity footprint under-counted two phase-spanning MoE FFN-phase tensors: the
     persistent residual carry, and the shared expert's re-read of the original block input**
@@ -1298,7 +1302,7 @@ without crossing zero for this specific auto-selected parallelism config (full r
     under the model's own existing convention of summing (not maxing) routed+shared costs as
     logically-parallel live branches, this tensor cannot be modeled as freed once routing starts,
     the same reasoning that already justifies counting the residual carry (see the V-moe-liveness
-    adjudication in `FINDINGS_REGISTER.md`). **Fix:** both terms added once to `ffn_total` after
+    adjudication in `ledgers/FINDINGS_REGISTER.md`). **Fix:** both terms added once to `ffn_total` after
     the phase max (the `max(a+c,b+c) = max(a,b)+c` identity), the block-input term gated to
     `has_moe_layer && model.num_shared_expert > 0` so it never touches dense llama3 or any
     non-shared-expert MoE config. **Verified:** maverick tp1/ep1/dp8 analytic ceiling
@@ -1321,7 +1325,7 @@ without crossing zero for this specific auto-selected parallelism config (full r
     carried in this same doc's third-pass item 43, which claimed the runtime TP-shards the shared
     expert citing this identical 106.020 GiB figure — that claim was factually wrong, and the
     erroneous `/tp` this item removes was very likely introduced by that same third-pass edit
-    under the mistaken belief (see `FINDINGS_REGISTER.md`'s CONTRADICTS-DOC entry).
+    under the mistaken belief (see `ledgers/FINDINGS_REGISTER.md`'s CONTRADICTS-DOC entry).
 
 60. **LayerNorm's weight-read cost was hand-rolled outside the shared amortized weight-stream
     mechanism** that Linear/QKVO layers already use (`layernorm.cpp:53` charged a flat page-read
@@ -1394,3 +1398,261 @@ without crossing zero for this specific auto-selected parallelism config (full r
     instantiated by llama3/llama4. `cluster.cpp`'s decode idle-iteration guard (which would
     deflate tpot if ever hit, but is provably unreachable in decode since
     `num_process_token==batch` always) got an explanatory invariant comment; no behavior change.
+
+## Bug-fixes session (2026-07-02) — items 66-74
+
+Ran concurrently with the second-pass paper-comparison work, in an isolated worktree
+(`worktree-bugs-fixes`), so it wouldn't collide with the paper-inconsistency session on the main
+tree. Root-caused and fixed every item in the former `BUGS.md`/`BUGS_HIDDEN_BY_FLAGS.md` that
+could be fixed without a live repro of the currently-untriggerable case (three items couldn't be
+and remain open — see `BUGS.md`'s reorganized list). Every fix lives in branches gated off in
+every real sweep (`decode_mode: on`, `disagg_system: off`, `parallel_execution: off`, only
+non-MLA models run) — that's why they were bugs nobody had hit. Each was verified by reverting the
+fix in-place, rebuilding, and reproducing the original crash/stall/corruption, then restoring and
+confirming the fixed behavior; the default pinned-flag regression suite was confirmed
+byte-identical (stdout + CSV diff) before/after every round. Full verification transcripts,
+before/after evidence, and the two comment-only guide quirks (§16 G1/G2, Poisson-vs-exponential
+inter-arrival and dead request-length jitter — left as comments per explicit instruction, not
+fixed) live in `ledgers/BUGS_FIXES.md`.
+
+66. **MLA `num_kv_heads` divisibility guard missing in the parallel wrappers → SIGFPE**
+    (`src/module/parallel.cpp`). `MultiLatentAttentionParallel`/`AbsorbMLAParallel` asserted only
+    `num_heads % parallel_num == 0`, unlike `SelfAttentionParallel`'s matching `num_heads`/
+    `num_kv_heads` pair, yet still computed `num_kv_heads / parallel_num` and passed it down;
+    flooring to 0 makes `attention_group_size = num_heads / num_kv_heads`
+    (`attention.cpp`'s `AbsorbMLASum`/`MultiLatentAttentionSum::forward`) divide by zero on the
+    first decode step. Masked because `deepseekV3`'s preset sets `num_kv_heads = num_heads = 128`
+    (trivially divisible), not MLA's real "one shared latent KV" semantics. **Fix:** added the
+    matching `num_kv_heads` guard to both MLA wrapper constructors. **Verified:** temporarily
+    patched the preset to `num_kv_heads = 1` (the physically-accurate MLA value) — pre-fix, TP=2
+    reproduced `Floating point exception` (SIGFPE, exit 136); post-fix, a clean assert-and-exit 1.
+    Preset and guard restored; default regression re-confirmed byte-identical.
+
+67. **32-bit int overflow in the prefill/mixed-mode activation-footprint formula**
+    (`src/hardware/cluster.cpp`'s `checkMemorySize()` non-decode branch). Terms like
+    `batch_size_per_dp * input_len * input_len * num_heads / ne_tp_dg` were computed entirely in
+    `int` before any `double` operand appeared, overflowing `INT_MAX` at realistic `input_len`
+    (thousands) and `num_heads` (128) — corrupting the printed `ACT:`/`Total:` values and the
+    scarce-tier OOM gate. The decode-path formula (`peakIntermediateBytes`) was already all-`double`
+    and immune. Masked because `decode_mode: on` is pinned in every real run. **Fix:** every
+    product now leads with a `(double)` cast so the whole chain evaluates in `double`, matching the
+    decode-path formula's convention. **Verified:** `decode_mode: off`, `prefill_mode: on`,
+    `input_len: 8192` (batch×input_len²×num_heads ≈ 130,000×`INT_MAX`) went from silent corruption
+    to a sane `ACT: 77.1172GB` and a completed run; decode-path regression unaffected.
+
+68. **Scheduler prefill token allocator floors to zero → infinite stall**
+    (`src/scheduler/scheduler.cpp`). `num_process = max_process_token / num_sum_seq` is integer
+    division; `config.yaml`'s default `max_process_token: 0` made every prefill sequence's
+    per-step token allowance floor to 0 forever, so `current_len` never advances and `hasSumSeq()`
+    stays permanently true, spinning the whole `iter` loop with zero progress. **Fix:**
+    `max_process_token <= 0` now means "no per-step cap" (`num_process = INT_MAX`, still clamped by
+    the existing per-sequence `std::min` immediately below); `max_process_token > 0` keeps the
+    original divided allowance, now floored at 1 instead of 0. **Verified:** `decode_mode: off`,
+    tiny `input_len: 128`, `iter: 50` — pre-fix timed out at 25s with zero progress; post-fix
+    completed in full. Default regression (`decode_mode: on`) unaffected, since it never reaches
+    this branch. A related, still-open gap in a sibling function (`Scheduler::getMaxMetadata`) is
+    tracked separately in `BUGS.md`.
+
+69. **`getIdxHigh` hard-asserts (crash) for expert-per-device counts >4 not divisible by 4**
+    (`src/module/route.cpp`). `list.size() % 4 == 0` was asserted unconditionally; any EP split
+    producing e.g. 10 or 20 experts/device under a heterogeneous assignment aborted. Its sibling
+    `getIdxHighOptimal` (already the `<= 4` fallback) has no such size constraint — per-expert
+    scoring, no grouping assumption. **Fix:** fall back to `getIdxHighOptimal` when
+    `list.size() % 4 != 0` instead of asserting. **Verified by code inspection + reachability
+    check** (no live repro attempted: `deepseekV3`'s `num_routed_expert = 256` means every EP
+    degree that survives the optimizer's own divisibility asserts is a power of 2, always
+    `% 4 == 0` once `> 4`); `getIdxHighOptimal`'s algorithm read in full has no size dependency, so
+    correctness for arbitrary N is structural. `parallel_execution: on` regression (item 71's
+    verification config) exercised the surrounding `Route::forward` path without error at the
+    default EP count.
+
+70. **`gpu_gen: A100` crashed on `YAML::LoadFile("")`** (`src/hardware/device.cpp`). The
+    `dram_cfg_path`/`memory_scale_factor` switch had branches for H100/B100/B200/Rubin but none for
+    `A100` (a valid preset in `hardware_config.h`), leaving `dram_cfg_path` empty and throwing an
+    uncaught `YAML::BadFile`. **Fix:** mirrored the existing Rubin pattern — added an `A100` branch
+    pointing at `dram_config_HBM3_80GB.yaml` (inert placeholder matching the real A100-80GB SKU's
+    capacity, since `use_ramulator` is always false) with an estimated `memory_scale_factor =
+    0.355` (~2.4 Gbps HBM2e, scaled proportionally from H100's documented 5.2 Gbps → 0.76923); also
+    added a defensive `else { fail(...) }` so any future unmapped `gpu_gen` gets a clear error
+    instead of the same empty-path crash. **Verified:** pre-fix reproduced `YAML::BadFile`/SIGABRT
+    (exit 134) exactly; post-fix, `gpu_gen: A100` completes normally (exit 0). Default regression
+    (`gpu_gen: Rubin`) unaffected.
+
+71. **PIM decode-attention latency formula diverged from the GPU/LOGIC roofline formula, and
+    silently skipped softmax time** (`src/hardware/attention_gen_impl.cpp`'s
+    `AttentionGenExecutionPIM`, the base GQA/MHA kernel used by non-MLA models). Used
+    `total_duration += accumul_memory_duration * opb` (`opb = flops/memory_size`) at the Scoring
+    and Context sections instead of `max(compute, memory)` (every other kernel's convention,
+    including PIM's own MLA siblings); its Softmax section was a bare comment with no code. **Fix:**
+    replaced both sites with `std::max(accumul_compute_duration, accumul_memory_duration)`, removed
+    the now-dead `opb` locals, and added a Softmax compute charge mirroring the GPU kernel's
+    `flops = 7.0 * m * n * num_heads`. **Verified:** only reachable via `parallel_execution: on` +
+    `processor_type: GPU+PIM` + a non-MLA model; with `llama3_405B` under that config, fixed build
+    → `Total: 166042852.392729` vs. pre-fix baseline `Total: 166014897.803638` (small, expected
+    delta from the previously-missing softmax term). Every config that doesn't reach this function
+    was byte-identical pre/post-fix.
+
+72. **Disaggregated-path ("sum"/prefill) CSV rows never populated**
+    (`Cluster::runIterationSumGenSplit`, `src/hardware/cluster.cpp`). The prefill branch built a
+    `Stat` but never called `setStat`/`setTimeBreakDown` and never filled energy fields, unlike the
+    sibling "gen" branch — timing (`sum_machine_time`) was correct and didn't leak into
+    `total_time`, but every prefill row's batch/energy/breakdown columns were zeroed. **Fix:**
+    populate the energy fields via `getTotalEnergy()`, set `seq_queue_size`, and call
+    `setStat`/`setTimeBreakDown`, mirroring the gen branch. **Verified:** `disagg_system: on`,
+    `decode_mode: off`, `prefill_mode: on` — pre-fix, `time`/`latency` populated but every other
+    field zero; post-fix, `time`/`latency` bit-for-bit identical, `batchsize`/energy/breakdown now
+    populated with plausible values. Confirms the fix only fills previously-missing fields.
+    `disagg_system: off` (default) never reaches this branch.
+
+73. **`runIterationMixed` had no defensive check for `decode_mode`** (`src/hardware/cluster.cpp`).
+    Decode-only TPOT correctness depends entirely on the convention that `decode_mode: on` keeps
+    `hasSumSeq()` false; no in-function guard existed. **Fix:** added a one-time (`static bool`)
+    stderr warning when `!config.disagg_system && scheduler->hasSumSeq()` — the exact contamination
+    condition — without changing `total_time`'s accumulation (a silent behavior change here was
+    judged riskier than a loud warning, since a future legitimate use might intentionally want this
+    path). **This is a mitigation, not a structural fix** — the underlying lack of a hard guard
+    remains and is tracked as still-open in `BUGS.md`. **Verified:** warning fires exactly once,
+    on the first offending iteration, under `decode_mode: off`/`disagg_system: off`; silent on
+    every default-config (`decode_mode: on`) regression run.
+
+74. **`head_dim`/`qk_nope_head_dim` confusion at two sites (both MLA-absorb-only, both dormant on
+    every current preset).** `src/model/footprint.h` (`peakIntermediateBytes`'s absorb/
+    compressed_kv branches): the query-projection-output term used `head_dim` (V's up-projected
+    width) where `qk_nope_head_dim` (Q's non-rope width) was meant — the GQA-base branch's
+    `head_dim` usage is correct as-is and was left alone. `src/module/layer.cpp`
+    (`attn_mla_absorbed` wiring): `attn_o_up_proj`'s declared input width was
+    `num_heads * qk_nope_head_dim` but must match `attn_v_up_proj`'s output width just above it
+    (`num_heads * head_dim`), since attention output is a weighted sum of V vectors, not Q_nope
+    vectors — corroborated against the sibling non-absorb `MultiLatentAttention` branch, which
+    already wires this with `head_dim`. **Fix:** both sites corrected. **Verified:** numerically a
+    no-op on every model this repo runs (only `deepseekV3` sets `use_absorb`/`compressed_kv: on`,
+    and its `qk_nope_head_dim == head_dim`); default regression byte-identical. Not independently
+    exercised with a diverged config (none exists in this codebase) — verified by architectural
+    cross-reference (V-projection output width, sibling non-absorb branch) rather than a numeric
+    before/after; a structural correction for future MLA presets where the two dimensions differ.
+
+## Fig-6 ground-truth extraction fix (2026-07-06, sixth pass) — item 75
+
+This is a **documentation/ground-truth fix**, not a simulator code change — the bug was in this
+repo's own transcription of the paper's Fig. 6, not in the simulator. Recorded here (rather than
+left in `PAPER_INCONSISTENCIES.md`) because both sub-errors are now fully resolved with no open
+question remaining, per the "that doc holds only still-open or explained-not-a-bug items" rule.
+
+75. **Both axes of the readings-file's Fig-6 transcription (`paper_figure_readings.md` §4) were
+    wrong, for two independent reasons, discovered on the same day.** Fig. 6 plots per-SLO TPS and
+    per-GPU batch, each normalized to that SLO's own 8-GPU HBM4 cell — the paper's caption states
+    this baseline ≡ 1.0 for every row-group.
+    - **TPS rows** read uniformly ~0.843× low (a pixel-extraction miscalibration). Diagnosed
+      2026-07-04 (fifth pass): the printed HBF+@8GPU@0.1s cell read 1.090 in the readings file;
+      1.090/0.843 = 1.293, exactly the independent Fig-4 ratio (189.5/146.6) for the same cell, and
+      an independent anchor-sheet extraction of the same figure read HBM4@8GPU ≈ 1.0 where the
+      original readings file read 0.834-0.855. Rescaling by `1/0.843` (≈×1.186) recovers the
+      caption's own 1.0 baseline to ±1.2% across every SLO and cross-validates against both the
+      independent Fig-4 ratios (mean |dev| 0.97%) and the anchor sheet (≤2.4%). Applied directly to
+      `paper_figure_readings.md` §4 on 2026-07-06.
+    - **Batch rows** read HBM4@8GPU ≈ 0.64, not 1.0 — a second, independent miscalibration on the
+      same figure, initially left open (2026-07-04) as "possibly a genuine paper-side scale
+      anomaly, possibly a second extraction error, unresolved." Resolved same-day (2026-07-06):
+      the paper's PDF turned out to be pure vector graphics with zero embedded raster images
+      (confirmed via `pdfimages -list`), enabling exact-coordinate extraction from the PDF's own
+      drawing commands instead of pixel-color sampling on a rendered page. The vector data gives
+      HBM4@8GPU = exactly 1.0 on the Batch axis, confirmed 8 independent ways (both models × all 4
+      SLOs, 0.0000pt spread) — decisive proof the 0.64 reading was a plain pixel-extraction error,
+      not a second real miscalibration needing its own mechanism. The corrected HBM4 batch curve is
+      0.48/1.00/1.26 (Llama3) and 0.55/1.00/1.26 (Llama4) at 4/8/16 GPU, cross-validated against
+      this repo's own fresh sim sweep (`experiment_results.md`)
+      to within a few percent.
+
+    **Fix:** both rows of `paper_figure_readings.md` §4 corrected in place (TPS rescaled ×1/0.843;
+    Batch rows replaced with the vector-exact values). **Verified:** every corrected cell
+    cross-validates against at least one other independent extraction (Fig-4 ratios, the anchor
+    sheet, or this repo's own sim sweep) to within a few percent; no open question remains on
+    either axis. **Consequence:** `compare_error_rates.py`'s Fig-6 group errors previously carried
+    a structural ~16-19% (TPS) / up-to-56% (Batch) floor that was pure reading error, not simulator
+    error or paper-side anomaly — both floors are gone as of this fix. Full derivation:
+    `ledgers/FINDINGS_REGISTER.md`'s "Fifth-pass register" (F3) for the TPS-row rescale, and this
+    session's vector-extraction pass for the Batch-row correction (see `paper_figure_readings.md`
+    §4 for the corrected 24-row table).
+
+## Paper-inconsistencies doc cleanup (2026-07-06) — consolidated detail moved out of PAPER_INCONSISTENCIES.md
+
+`PAPER_INCONSISTENCIES.md` was reorganized to hold ONLY still-open and explained-not-bug items, each
+in a Divergence / Current-explanation / Disproved-arguments format. The resolved paper-comparison
+records (U1/U2/U4/U6/U8/U9, Residuals 2–4, Fig-6) already live above ("Paper-comparison items
+resolved"). The technical detail below was moved here so the tracker stays scannable.
+
+### U7 intermediate-data-accounting — technical detail (7th/8th/9th-pass analyses)
+
+The U7 divergence (sim HBF+/CONV+ per-GPU batch grows/SLO-bound vs paper flat/SRAM-bound) traces to
+`peakIntermediateBytes()` (`src/model/footprint.h`) being a hand-coded, layer-scoped `max(attn,ffn)`
+gate that undercounts what must be resident in the 320-MB logic SRAM. Three analyses:
+
+**(A) Score-tile O(chunk) — proposed correctness fix, NOT yet implemented.** The Q·Kᵀ score/softmax
+matrix is charged **0 bytes** on HBF+/CONV+ (`getAttentionMemoryDuration`, `layer_impl.h:137-140`,
+staging-chunks only `kv_read_size`; `act_size` billed 0 when `num_hbm_stacks==0`). FlashAttention
+keeps it at **O(chunk)**, not 0 and not O(context). Correct charge = single-buffered tile ADDED to
+`attn_total`: `(num_heads/tp) × chunk_tokens × precision`, chunk_tokens ≈ 256 (a compute-tile size,
+NOT `attn_chunk_size`=8192 which is the iRoPE window, and NOT `config.chunk_size` which is the flash-
+read staging chunk). Single-buffered (no ×2): the paper's double-buffering is flash-read-latency-only
+and every other pool tensor is single-counted. Impact (tp1): maverick 2409→2101/GPU (−13%), llama3
+1205→975 (−19%) — a correctness improvement that does NOT reproduce the paper (needs ~6–8×). Recipe:
+add the term to both `footprint.h::peakIntermediateBytes` and the optimizer mirror
+(`parallelism_optimizer.cpp`), behind a new `system.attn_score_tile_tokens` knob; capacity-only, do
+not touch the timing path.
+
+**(B) Full uncounted-intermediate inventory (batch=1000, tp=pp=dp=1, BF16).** Counted layer peak ~133
+MB (maverick) / ~266 MB (llama3). Uncounted:
+| tensor | maverick | llama3 | status |
+|---|---|---|---|
+| LM-head logits (`batch × n_vocab/tp`) | 385 MB | 245 MB | gated against NO tier; sim materializes full tensor but a correct tiled LM head keeps only `batch × vocab_tile` (~4 KB/seq) resident — the FULL term must not be gated (vocab-scaling corrupts cross-model ratios) |
+| KV-write on-chip staging (`batch × 2·n_kv·head_dim × layers/stage`) | 187 MB | 492 MB | timed but zero byte reservation in main; = paper2 `P2_SRAM_KVWRITE_BYTES`; both papers describe it as an on-chip buffer (footnote-2 "overlap" is a LATENCY claim, orthogonal to capacity) so omitting the capacity is a genuine gap, NOT paper-conformant |
+| TP all-reduce scratch (`batch × hidden`) | ~10 MB | ~31 MB | uncounted, all presets |
+| MoE per-expert dispatch input + extra GateOut | ~10 + ~16 MB | n/a | concurrent w/ expert FFN, uncounted |
+| Embedding output | ~10 MB | ~31 MB | uncounted, no charge |
+Fine as-is: residual carries (counted), RMSNorm (in-place), RoPE (0 for GQA), softmax stats (by-
+analogy, not code-traceable). Correct model = liveness-aware step-level peak over the op graph
+(needs new last-use tracking; `Tensor.ready` only tracks producer-has-run).
+
+**(C) KV-write A/B experiment (RUN 2026-07-06 — reproduces the paper's SHORT bars).** Implemented
+behind a `system.kv_write_sram_gate` flag (`footprint.h::kvWriteStagingBytes` + both the optimizer and
+`cluster.cpp` gates). Side B (charge the KV-write burst) HBF+/SHORT under the full optimizer+sim
+search: maverick 999/999/915 seq/GPU at 1/8/16-GPU (sram-bound), llama3 404(slo)/390/390 (sram);
+cross-model ratio 2.47/2.56/2.35 vs paper 2.35; both models ~20–30% above paper (single-buffer 1×
+offset; maverick/1g = 999 = base 136 + kvwrite 192 KB/seq, byte-exact). Reproduces all three paper
+signatures — SLO→SRAM flip, flat across GPU count (vs side-A ~730→2149 growth), and the cross-model
+ratio. Open: the ~25% absolute overshoot (double-buffering over-corrects) and MID/LONG (untested,
+different regime). Driver `kvwrite_sideB.py`; results `kvwrite_sideB_results.txt`. This is now the
+leading, A/B-supported explanation for U7's SHORT SRAM-bound bars.
+
+**(D) Ninth-pass refuter verdicts (what held / was refuted).** A six-agent adversarial panel upheld
+the older items but refuted several recent claims: the "KV-write ratio structurally fits both models"
+claim is downgraded to an unverified hypothesis (mis-attributed formula; the 2.6× cross-model ratio
+is pure `num_layers`; single-workload SHORT fit; unsupported by paper text); the U7 impossibility
+proof cited STALE pixel bars (854.7/745.1 → vector 766.6/742.0, margin ~6× not 1.5×) and only
+excludes O(context)-linear charges so cannot finalize U7; "327 reconciled exactly" is numerology; the
+maverick-tp8 impact numbers were miscomputed (missing `/e_tp`). HELD: the score-tile "comment is
+false" claim, the inventory magnitudes, RoPE-zero-for-GQA, and all older dispositions.
+
+### Ruled out as causes (moved from PAPER_INCONSISTENCIES.md)
+
+- Batch-search pruning: empirically clean (`HBF_DISABLE_CONFIG_PRUNING=1` on llama4/HBF+/8/LONG
+  reproduces the pruned winner exactly).
+- GB-vs-GiB capacities: paper Table I is exact in both conventions; Residual-1's 460.00 anchor
+  reproduces only under 288 GiB — settled in the code's favor.
+- Energy/ramulator subsystem: `use_ramulator` off everywhere, energy CSV columns unread — no effect
+  on any reported number.
+- Communication cost as a general cause: ≤0.6% of decode time in checked configs — BUT scope this to
+  TP=1/TP=2; the TP=8 ring-latency term WAS U9's root cause (item 37).
+- Steady-state KV capacity sizing (overshoots, wrong direction); decimal-GB capacity constants (wrong
+  direction); the apparent "7.4% optimizer↔live weight drift" (a GiB-vs-GB artifact in the comparison).
+- Routing skew at U1's high-batch operating point (doesn't reach it) — but at llama4 LONG low batch
+  the hot-expert colocation WAS a real artifact (fixed, item 50).
+- MoE activation-divisor bug (item 18): real, but confirmed NOT the cause of U1 (anchors byte-
+  identical before/after).
+
+### U9 reproduction recipe (resolved — item 37; kept for reference)
+
+llama3/HBM4/8-GPU/LONG was −13% TPS; resolved as the AllReduce ring-latency overcharge. To re-probe:
+`run_experiments.find_max_batch_size("llama3_405B","HBM4",8,103500,1100,tpot_slo=0.1,...)` or force
+`run_simulation(...,batch_size=29,distribution={"tp":8,"pp":1,"ep":1})`; diff the winner CSV's
+`type=="t2t"` per-component shares against the SHORT/MID cells at the same TP=8 config.

@@ -1,7 +1,14 @@
-# PAPER GROUND-TRUTH ANCHOR SHEET
+# Paper Ground Truth — Hardware, Methodology, and Prose Claims
+
 "Exploring High-Bandwidth Flash for Modern LLM Inference: Opportunities and Challenges" — IEEE CAL,
-DOI 10.1109/LCA.2026.3705817. Son et al. (POSTECH/ETH). 4-page letter. Fresh extraction from the
-PDF alone (no repo analysis docs consulted). Figures read from 400-DPI crops.
+DOI 10.1109/LCA.2026.3705817. Son et al. (POSTECH/ETH). 4-page letter.
+
+Non-figure ground truth extracted from the paper (fresh extraction from the PDF alone, no repo
+analysis docs consulted). For figure-reading data (Figs. 3-7 tables), see
+`paper_figure_readings.md` — that file's numbers were cross-validated against this extraction and,
+where the two conflicted, corrected in favor of this document's independent re-derivation (see its
+Figure 6 note). This document previously existed as `PAPER_ANCHOR_SHEET.md`; renamed/split
+2026-07-06 so figure-reading data lives in one file and non-figure ground truth in another.
 
 Preset naming (as printed): HBM4, CONV, CONV+, HBF, HBF+. Table I column sub-header reads
 "(HBM/HBF)" — "HBM", not "HBM4".
@@ -128,67 +135,7 @@ closed-form comm equation beyond NVLink/IB bandwidths.
 
 ---
 
-## 4. Figure readings (400-DPI crops; ±0.1–0.15 normalized visual error)
-
-Fig 3 bar-omission rule (exact): "If a larger GPU count does not increase per-GPU batch size, the
-corresponding segment does not appear in Fig. 3 because it is subsumed by the preceding segment.
-All values are normalized to 8-GPU HBM4 for each workload." Plus "the top of each colored segment
-indicates the maximum per-GPU batch size at the corresponding GPU count."
-
-"327" sentence (exact): "…allows HBF+ to support a large batch size (e.g., 327 per Llama 4
-Maverick) despite the limited SRAM capacity (320 MB total)."
-
-### Fig 3 — Per-GPU batch (normalized, 8-GPU HBM4=1.0). Bars: HBM4,CONV,CONV+,HBF,HBF+. Segment
-colors=GPU count: 1=black,2=blue,4=green,8=peach,16=cream. ✕(orange)=SRAM bound.
-Absolute 8-GPU HBM4 reference (red labels) — treat as EXACT:
-| | SHORT | MID | LONG |
-|---|---|---|---|
-| Llama3 | 194 | 61.5 | 3.75 |
-| Llama4 | 460 | 151.5 | 31 |
-
-Normalized bar-tops (approx):
-- Llama3 SHORT: HBM4 ≈1.0 (no 1/2-GPU seg), CONV ≈0.4, CONV+ ≈0.5, HBF ≈1.3, HBF+ ≈1.65
-- Llama3 MID: 1.15 / 0.55 / 0.6 / 2.4 / 3.1
-- Llama3 LONG: 1.0 / 0.6 / 0.75 / 4.25 / 5.1
-- Llama4 SHORT: 1.2 / 0.9 / 0.9 / 3.65 / HBF+ ≈1.65 marked ✕ SRAM-bound
-- Llama4 MID: 1.2 / 0.85 / 1.0 / 4.2 / 4.9
-- Llama4 LONG: 1.2 / 0.85 / 0.9 / 4.7 / 5.5
-- HBM4 bars have NO 1-/2-GPU segments anywhere (needs ≥4 GPUs). ✕ SRAM-bound marker appears ONLY
-  on Llama4-SHORT HBF+.
-
-### Fig 4 — Per-GPU TPS (normalized, 8-GPU HBM4=1.0). Markers: HBM4=orange diamond, HBF=light-green
-triangle, HBF+=dark-green circle, CONV=blue circle (bottom), CONV+=blue triangle (bottom).
-Absolute 8-GPU HBM4 TPS (red labels) — EXACT:
-| | SHORT | MID | LONG |
-|---|---|---|---|
-| Llama3 | 3.3K | 1.8K | 147 |
-| Llama4 | 19K | 6.3K | 1.3K |
-
-Curve reads (norm): Llama3 SHORT HBF+ ≈1.0 flat, HBF ≈0.75 flat, HBM4 4→0.92/8→1.0/16→1.0; Llama3
-LONG HBF+ 1→0.5,2→1.0,16→1.3; Llama4 LONG HBF+ 4-GPU≈1.15 (="15% higher than 8-GPU HBM4"), 16→1.3;
-HBM4 16→1.2. CONV/CONV+ near-floor everywhere.
-
-### Fig 5 — Runtime breakdown at 0.1-s SLO (% decode). Stack: Attention(blue)/FFN(peach)/KV
-Write(gray)/Communication(yellow)/Others(green). Only MID+LONG, only HBM4+HBF+.
-Attention share reads: Llama3 HBM4 MID 42/51/56 (4/8/16); LONG 44/70/73. Llama3 HBF+ MID 56/57/55;
-LONG 80/84/84. Llama4 HBM4 MID 34/62/73; LONG 54/67/78. Llama4 HBF+ MID 69/74/74 (KV-Write gray
-band largest ~10–14%); LONG 76/85/87. Consistent with text KV-Write 5–13.9% in Llama4 HBF+.
-
-### Fig 6 — Effect of SLO (LONG only), norm to 8-GPU HBM4. Lines=TPS: HBM4 diamond/HBF
-triangle/HBF+ circle. Bars=batch (right axis 0–30). x=SLO{0.05,0.1,0.2,offline}×GPU{4,8,16}.
-HBM4 TPS flat across SLO (capacity-bound): Llama3 4-GPU≈0.5, 8≈1.0, 16≈1.07; Llama4 4≈0.8, 8≈1.0,
-16≈1.18. HBF+ rises with relaxation: Llama3 4-GPU 0.05→0.97, 0.1→1.2, 0.2→1.35, offline→1.4. HBF+
-batch bars grow sharply at offline. Text anchor: "from 4.1% to 14.8% in Llama4 16 GPUs."
-
-### Fig 7 — 3-year PEC (×10³), 0–500. Red line "SLC PEC limit" at 100(=100K). 4 bars/group:
-HBF(online),HBF+(online),HBF(offline),HBF+(offline). x=GPU{1,8,16}×{SHORT,MID,LONG}.
-Peaks (×10³): Llama3 SHORT ~200; MID ~285; LONG ~215 (1-GPU HBF-online ~45, BELOW the 100K line).
-Llama4 SHORT ~445–480 (highest); MID ~395–430; LONG ~225. Nearly all exceed 100K. PEC rises with
-higher TPS → shorter context, more GPUs, relaxed SLO, MoE.
-
----
-
-## 5. Every other quantitative prose claim (with section)
+## 4. Every other quantitative prose claim (with section)
 
 §I: 14× per-stack capacity (512 vs 36 GB); Maverick 746 GB vs GPU 288 GB.
 §II: μs-order 4-KiB reads, 1.6 TB/s; HBF <80 W vs HBM 40 W; HBF introduced early 2025 [4].
@@ -210,6 +157,7 @@ retention-relaxed writes [16].
 ---
 
 ## Ambiguities to flag for downstream auditors
+
 1. GB vs GiB never disambiguated — check capacity constants (36, 512, 288, 746).
 2. No GPU FLOPS printed — only "Rubin NVL8 [5]"; any FLOPS constant is unanchored.
 3. No interconnect latencies — only 1,800 GB/s NVLink, 100 GB/s IB.
@@ -221,5 +169,5 @@ retention-relaxed writes [16].
    reserved HBM4 stack (1.6 TB/s, 36 GB).
 7. Figure visual reads ±0.1–0.15 (norm) / ±5% (Fig 5) / ±15×10³ (Fig 7) — red-label absolute
    anchors (194/61.5/3.75/460/151.5/31 and 3.3K/1.8K/147/19K/6.3K/1.3K) are exact; bar heights
-   approximate.
+   approximate. (Figure-reading data itself now lives in `paper_figure_readings.md`.)
 8. ✕ SRAM-bound marker appears ONLY on Llama4-SHORT HBF+ — the canonical SRAM-bound cell.

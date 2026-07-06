@@ -41,15 +41,16 @@ void Scheduler::initRunningQueue() {
 }
 
 void Scheduler::pushDummySeq(int input_len, int output_len, int idx, int count) {
-  // QUIRK (guide §16 / not in BUGS.md or BUGS_HIDDEN_BY_FLAGS.md): this whole block
-  // -- norm_dist_value, the rejection loop below, and delta -- computes a per-sequence
-  // length-jitter value that is NEVER applied: the three lines that would consume it
-  // (input_len = input_len - delta; output_len = output_len + delta;) are commented
-  // out just below. Every call pays the RNG + rejection-loop cost for no effect on
-  // input_len/output_len. Left as dead computation intentionally, not removed: every
-  // reported sweep's results were generated with jitter off, so deleting or enabling
-  // this now would both be behavior changes that need a separate, deliberate decision
-  // (documented, not fixed, per explicit instruction -- see BUGS_FIXES.md).
+  // QUIRK (guide §16 -- not tracked in BUGS.md, this is a deliberate documentation-only
+  // item, not an open bug): this whole block -- norm_dist_value, the rejection loop
+  // below, and delta -- computes a per-sequence length-jitter value that is NEVER
+  // applied: the three lines that would consume it (input_len = input_len - delta;
+  // output_len = output_len + delta;) are commented out just below. Every call pays the
+  // RNG + rejection-loop cost for no effect on input_len/output_len. Left as dead
+  // computation intentionally, not removed: every reported sweep's results were
+  // generated with jitter off, so deleting or enabling this now would both be behavior
+  // changes that need a separate, deliberate decision (documented, not fixed, per
+  // explicit instruction -- see ledgers/BUGS_FIXES.md, item G2).
   double norm_dist_value = getNormaldistribution();
 
   int delta = std::min(256, input_len);
@@ -313,7 +314,7 @@ BatchedSequence::Ptr Scheduler::getMaxMetadata(int num_expert, int top_k,
   BatchedSequence::Ptr sequences_metadata =
       BatchedSequence::Create(num_expert, top_k, scheduler);
   int seq_len = num_max_batched_token / batch_size_per_dp;
-  // Same bug class as the committed T3 fix (BUGS_FIXES.md #3): integer division
+  // Same bug class as the committed fix in CHANGES.md item 68: integer division
   // floors to 0 once batch_size_per_dp > num_max_batched_token (8192, hardcoded at
   // eval/test.cpp's Scheduler::Create call), which makes Sequence::Create(0, 0)
   // trip sequence.cpp's assertTrue(input_len > 0, ...) -> process exit. run_experiments.py
@@ -368,8 +369,9 @@ std::vector<BatchedSequence::Ptr> Scheduler::setMetadata() {
       int num_sum_seq = sum_seq.size();
       // max_process_token <= 0 (config.yaml's default) means "no per-step cap" --
       // integer-dividing by num_sum_seq used to floor to 0, permanently stalling
-      // every prefill sequence's current_len (BUGS_HIDDEN_BY_FLAGS #3). INT_MAX is
-      // then clamped per-sequence by the std::min below, same as an explicit cap.
+      // every prefill sequence's current_len -- fixed 2026-07-02 (CHANGES.md item 68).
+      // INT_MAX is then clamped per-sequence by the std::min below, same as an
+      // explicit cap.
       int num_process = (max_process_token > 0)
           ? std::max(1, max_process_token / num_sum_seq)
           : INT_MAX;
@@ -564,15 +566,15 @@ int Scheduler::getGenSize() {
   }
 
   void Scheduler::getActualArrivalTime(int num_iter) {
-    // QUIRK (guide §16 / not in BUGS.md or BUGS_HIDDEN_BY_FLAGS.md): a Poisson
-    // *process*'s inter-arrival times are exponentially distributed, not
-    // Poisson-distributed -- std::poisson_distribution below draws integer counts
-    // with the right mean (average_ns_per_request) but the wrong shape/variance
-    // for inter-arrival gaps. Also note request_per_second == 0 divides by zero at
-    // average_ns_per_request just below. Not exercised by any run_experiments.py
-    // sweep (injection_rate is always 0 there); live only on a bare
-    // `./run config.yaml` with injection_rate > 0. Documented, not fixed, per
-    // explicit instruction -- see BUGS_FIXES.md for the intended
+    // QUIRK (guide §16 -- not tracked in BUGS.md, this is a deliberate documentation-only
+    // item, not an open bug): a Poisson *process*'s inter-arrival times are
+    // exponentially distributed, not Poisson-distributed -- std::poisson_distribution
+    // below draws integer counts with the right mean (average_ns_per_request) but the
+    // wrong shape/variance for inter-arrival gaps. Also note request_per_second == 0
+    // divides by zero at average_ns_per_request just below. Not exercised by any
+    // run_experiments.py sweep (injection_rate is always 0 there); live only on a bare
+    // `./run config.yaml` with injection_rate > 0. Documented, not fixed, per explicit
+    // instruction -- see ledgers/BUGS_FIXES.md, item G1, for the intended
     // exponential_distribution(1.0 / average_ns_per_request) replacement.
     static unsigned int seed = 777;
     static std::default_random_engine generator(seed);

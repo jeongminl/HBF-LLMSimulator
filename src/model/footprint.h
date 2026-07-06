@@ -285,4 +285,32 @@ inline bool hasDenseFfnLayer(const ModelConfig& model) {
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// KV-write on-chip staging buffer (A/B experiment, 2026-07-06).
+// ---------------------------------------------------------------------------
+// Per decode step each sequence generates ONE new token whose K,V for every
+// layer on this pipeline stage must be buffered on-chip before the once-per-
+// stage stream-write to flash (paper1 footnote 2 / paper2's "KV caches ...
+// buffered on chip and stream-written to HBF once per decode stage"). This is
+// the steady-state DECODE staging burst -- context-INDEPENDENT (one new token,
+// not the full context) -- and is DISTINCT from getKVWriteDuration's
+// admission-side (input_len-scaled) write timing. Per GPU (TP rank holds
+// num_kv_heads/tp KV heads):
+//   batch_per_gpu * layers_per_stage * kvBytesPerLayerToken(/tp)
+// This function is gated behind SystemConfig.kv_write_sram_gate: when false
+// (default) the scarce-tier gate is unchanged (side A); when true it is added
+// to the activation footprint charged against the SRAM/HBM scarce tier (side
+// B). Mirrors paper2-extension's P2_SRAM_KVWRITE_BYTES formula. Both the
+// optimizer (parallelism_optimizer.cpp) and live sim (cluster.cpp) call it so
+// the two gates never drift.
+inline double kvWriteStagingBytes(const ModelConfig& model,
+                                  double batch_per_gpu,
+                                  int tp,
+                                  double layers_per_stage) {
+  double per_layer_token = model.compressed_kv
+      ? (double)(model.kv_lora_rank + model.qk_rope_head_dim) * model.precision_byte
+      : 2.0 * ((double)model.num_kv_heads / (double)tp) * model.head_dim * model.precision_byte;
+  return batch_per_gpu * per_layer_token * layers_per_stage;
+}
+
 }  // namespace llm_system

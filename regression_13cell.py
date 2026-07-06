@@ -13,7 +13,8 @@ import sys
 import run_experiments as rx
 
 # (label, model, mem, gpus, workload, paper_batch_per_gpu, paper_tps_per_gpu)
-# Anchors: PAPER_ANCHOR_SHEET.md exact red labels; None = no exact anchor.
+# Anchors: paper_figure_readings.md's exact red-label anchor tables (Sections 1 & 2,
+# formerly PAPER_ANCHOR_SHEET.md); None = no exact anchor.
 CELLS = [
     ("l4_HBM4_8_SHORT", "llama4_maverick", "HBM4", 8, "SHORT", 460.0, 19000.0),
     ("l4_HBM4_8_MID",   "llama4_maverick", "HBM4", 8, "MID",   151.5, 6300.0),

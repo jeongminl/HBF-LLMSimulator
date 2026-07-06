@@ -164,6 +164,13 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  // A/B experiment flag: charge the KV-write on-chip staging burst against the
+  // scarce SRAM/HBM tier (footprint.h::kvWriteStagingBytes). Default false.
+  if (config["system"]["kv_write_sram_gate"]) {
+    system_config.kv_write_sram_gate =
+        config["system"]["kv_write_sram_gate"].as<bool>();
+  }
+
 
   system_config.high_processor_type = ProcessorType::GPU;
   system_config.low_processor_type = ProcessorType::LOGIC;

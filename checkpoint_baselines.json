@@ -1,0 +1,66 @@
+{
+  "llama3_405B": {
+    "LONG": {
+      "max_batch": 30,
+      "max_batch_per_gpu": 3.75,
+      "tps": 140.14176810608384,
+      "tpot": 0.0267586177245983,
+      "csv_file": "/home/arcuser/jeongmin/HBF-LLMSimulator/.claude/worktrees/bughunt-fifth-pass/data/w72816/llama3_405B_synthesis_103500_1100_GPU_N1_D8_TP8_DP1_EP1_MEMHBM4_maxbatch30_maxprocess524288_iter10_skew8_precision_byte2_parallel_execution0_decode.csv",
+      "pec_kv_bytes": 53983600000.0,
+      "pec_capacity": 309238000000.0,
+      "bound_reason": "flash"
+    },
+    "MID": {
+      "max_batch": 503,
+      "max_batch_per_gpu": 62.875,
+      "tps": 1897.381091746899,
+      "tpot": 0.0331377814786336,
+      "csv_file": "/home/arcuser/jeongmin/HBF-LLMSimulator/.claude/worktrees/bughunt-fifth-pass/data/w72814/llama3_405B_synthesis_5900_499_GPU_N1_D8_TP8_DP1_EP1_MEMHBM4_maxbatch503_maxprocess524288_iter10_skew8_precision_byte2_parallel_execution0_decode.csv",
+      "pec_kv_bytes": 3302500000.0,
+      "pec_capacity": 309238000000.0,
+      "bound_reason": "flash"
+    },
+    "SHORT": {
+      "max_batch": 1583,
+      "max_batch_per_gpu": 197.875,
+      "tps": 3653.251575172769,
+      "tpot": 0.0541640771045564,
+      "csv_file": "/home/arcuser/jeongmin/HBF-LLMSimulator/.claude/worktrees/bughunt-fifth-pass/data/w72815/llama3_405B_synthesis_1660_373_GPU_N1_D8_TP8_DP1_EP1_MEMHBM4_maxbatch1583_maxprocess524288_iter10_skew8_precision_byte2_parallel_execution0_decode.csv",
+      "pec_kv_bytes": 1049220000.0,
+      "pec_capacity": 309238000000.0,
+      "bound_reason": "flash"
+    }
+  },
+  "llama4_maverick": {
+    "LONG": {
+      "max_batch": 256,
+      "max_batch_per_gpu": 32.0,
+      "tps": 1324.3350077273901,
+      "tpot": 0.024163070381197,
+      "csv_file": "/home/arcuser/jeongmin/HBF-LLMSimulator/.claude/worktrees/bughunt-fifth-pass/data/w72814/llama4_maverick_synthesis_103500_1100_GPU_N1_D8_TP8_DP1_EP1_MEMHBM4_maxbatch256_maxprocess524288_iter10_skew8_precision_byte2_parallel_execution0_decode.csv",
+      "pec_kv_bytes": 6511460000.0,
+      "pec_capacity": 309238000000.0,
+      "bound_reason": "flash"
+    },
+    "MID": {
+      "max_batch": 1240,
+      "max_batch_per_gpu": 155.0,
+      "tps": 6265.449451799461,
+      "tpot": 0.0247388477382869,
+      "csv_file": "/home/arcuser/jeongmin/HBF-LLMSimulator/.claude/worktrees/bughunt-fifth-pass/data/w72816/llama4_maverick_synthesis_5900_499_GPU_N1_D8_TP2_DP4_EP1_MEMHBM4_maxbatch1240_maxprocess524288_iter10_skew8_precision_byte2_parallel_execution0_decode.csv",
+      "pec_kv_bytes": 1258090000.0,
+      "pec_capacity": 309238000000.0,
+      "bound_reason": "flash"
+    },
+    "SHORT": {
+      "max_batch": 3908,
+      "max_batch_per_gpu": 488.5,
+      "tps": 19279.90278194464,
+      "tpot": 0.025337264690850698,
+      "csv_file": "/home/arcuser/jeongmin/HBF-LLMSimulator/.claude/worktrees/bughunt-fifth-pass/data/w72817/llama4_maverick_synthesis_1660_373_GPU_N1_D8_TP2_DP4_EP1_MEMHBM4_maxbatch3908_maxprocess524288_iter10_skew8_precision_byte2_parallel_execution0_decode.csv",
+      "pec_kv_bytes": 399704000.0,
+      "pec_capacity": 309238000000.0,
+      "bound_reason": "flash"
+    }
+  }
+}

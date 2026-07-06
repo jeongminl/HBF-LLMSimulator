@@ -128,6 +128,18 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
         num_routed_expert_per_device,
         /*has_moe_layer=*/device->model_config.num_routed_expert > 0,
         /*has_dense_layer=*/hasDenseFfnLayer(device->model_config));
+
+    // A/B experiment: optionally add the KV-write on-chip staging burst to the
+    // scarce-tier activation footprint (footprint.h::kvWriteStagingBytes). Off
+    // by default. Mirrors the optimizer gate (parallelism_optimizer.cpp) so the
+    // two never drift.
+    if (config.kv_write_sram_gate) {
+      int pp = device->model_config.pp_dg > 0 ? device->model_config.pp_dg : 1;
+      int layers_per_stage = device->model_config.num_layers / pp;
+      if (layers_per_stage < 1) layers_per_stage = 1;
+      activation_size += (long long)kvWriteStagingBytes(
+          device->model_config, batch_size_per_dp, ne_tp_dg, layers_per_stage);
+    }
   }
   else{ // prefill mode & colocated system (mixed)
     if(device->model_config.use_absorb){
@@ -402,13 +414,13 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
   return false;
 }
 
-// AUDIT (BUGS.md #6): grep-confirmed zero call sites anywhere in this tree --
+// AUDIT (BUGS.md item 3): grep-confirmed zero call sites anywhere in this tree --
 // this function is dead code, not merely "unclear if used." Its capacity math
 // (hardcoded "3.3 GB Non MoE weight" magic-number subtraction, no activation
 // term in the `size` OOM check) diverges from checkMemorySize()'s scarce-tier
 // gate and should not be trusted if it's ever wired back up. Left in place
 // (not deleted) pending an explicit decision on whether it's still needed --
-// see BUGS_FIXES.md.
+// full audit trail in ledgers/BUGS_FIXES.md (T9).
 bool Cluster::checkHeteroMemorySize() {
   Device::Ptr device = get_device(0);
   auto module = module_map.at(0).at("::LLM");
@@ -622,14 +634,14 @@ std::vector<Stat> Cluster::runIterationMixed(int iter, std::ofstream &csv) {
     // scheduler.cpp's pushDummySeq), so hasSumSeq() is always false here and no
     // prefill time is ever actually accumulated. If decode_mode were ever disabled
     // (without disagg_system=on), this leaks prefill compute time into the reported
-    // decode-only TPOT (BUGS.md #2) -- warn once so the contamination isn't silent.
+    // decode-only TPOT (BUGS.md item 2) -- warn once so the contamination isn't silent.
     if (!config.disagg_system && scheduler->hasSumSeq()) {
       static bool warned_prefill_contamination = false;
       if (!warned_prefill_contamination) {
         std::cerr << "WARNING: runIterationMixed is accumulating a \"sum\" "
                      "(prefill) iteration into the decode-only total_time -- "
                      "decode_mode should be on unless disagg_system is also on "
-                     "(see BUGS.md #2)."
+                     "(see BUGS.md item 2)."
                   << std::endl;
         warned_prefill_contamination = true;
       }

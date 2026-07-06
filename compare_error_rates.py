@@ -89,7 +89,8 @@ def extract_value(cell, mode):
     m = CELL_RE.search(cell)
     if m:
         return float(m.group(1)) if mode == "abs" else float(m.group(2))
-    cell = cell.lstrip("~")
+    cell = cell.lstrip("~").rstrip("†").strip()
+    cell = re.sub(r"\s*\(FF\)\s*$", "", cell)
     try:
         return float(cell)
     except ValueError:
@@ -216,16 +217,36 @@ def compare_fig6(paper_df, sim_df):
 
 
 def compare_fig7(paper_df, sim_df):
+    # New (2026-07-06 vector-extraction) format: Model | Workload | GPUs |
+    # HBF (online) | HBF+ (online) | HBF (offline) | HBF+ (offline). Melt to
+    # (Model, Workload, Memory, paper_value) at GPUs==8 online, matching the
+    # sim's own @8-GPU/online-only Fig-7 table, for backward compatibility
+    # with the old @8GPU-only comparison this script has always done. Falls
+    # back to the pre-2026-07-06 flat "3-Year PEC (@8 GPU, online)" column if
+    # present (old-format file).
     paper_df = paper_df.copy()
     paper_df["Model"] = paper_df["Model"].map(MODEL_MAP)
-    paper_df["paper_value"] = paper_df["3-Year PEC (@8 GPU, online)"].apply(
-        lambda c: extract_value(c, "abs")
-    )
+
+    if "3-Year PEC (@8 GPU, online)" in paper_df.columns:
+        paper_df["paper_value"] = paper_df["3-Year PEC (@8 GPU, online)"].apply(
+            lambda c: extract_value(c, "abs")
+        )
+        paper_long = paper_df
+    else:
+        paper_df = paper_df[paper_df["GPUs"].astype(str) == "8"]
+        rows = []
+        for _, r in paper_df.iterrows():
+            for col, mem in [("HBF (online)", "HBF"), ("HBF+ (online)", "HBF+")]:
+                rows.append({
+                    "Model": r["Model"], "Workload": r["Workload"], "Memory": mem,
+                    "paper_value": extract_value(r[col], "abs"),
+                })
+        paper_long = pd.DataFrame(rows)
 
     sim_df = sim_df.copy()
     sim_df["sim_value"] = sim_df["3-Year PEC"].apply(lambda c: extract_value(c, "abs"))
 
-    merged = paper_df.merge(sim_df, on=["Model", "Workload", "Memory"])
+    merged = paper_long.merge(sim_df, on=["Model", "Workload", "Memory"])
     merged["figure"] = "Figure 7"
     merged["group"] = merged["Memory"]
     merged["key"] = merged["Model"] + " | " + merged["Workload"] + " | " + merged["Memory"]

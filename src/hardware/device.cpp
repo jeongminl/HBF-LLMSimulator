@@ -41,8 +41,9 @@ Device::Device(SystemConfig config, int device_total_rank, Cluster_ptr cluster)
     // A100 has no dedicated Ramulator2 DRAM config file (its real HBM2e generation
     // isn't one of the presets below); reuse H100's HBM3 80GB file as a placeholder,
     // matching the real A100-80GB SKU's capacity. Inert for every sweep in this repo
-    // (see the Rubin comment below for why) -- was previously a dormant crash
-    // (BUGS.md item 1: empty dram_cfg_path -> YAML::LoadFile("") -> YAML::BadFile).
+    // (see the Rubin comment below for why) -- was previously a dormant crash, fixed
+    // 2026-07-02 (CHANGES.md item 70: empty dram_cfg_path -> YAML::LoadFile("") ->
+    // YAML::BadFile).
     dram_cfg_path = "./dram_config_HBM3_80GB.yaml";
   }
   else if(config.gpu_gen == "H100"){

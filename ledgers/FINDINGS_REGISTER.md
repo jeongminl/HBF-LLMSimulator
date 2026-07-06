@@ -426,7 +426,7 @@ document the paper's inconsistency. C9's fix stands on correctness grounds but d
 8-GPU SHORT bar (corrected ceiling ~2824 > slo-bound ~2170); it lowers 16-GPU SRAM-bound cells.
 NOTE: F5/R6's "855→546" ceiling framing used a stale 855 baseline; actual current ceiling 4428
 (Track B analytic dump, exact). Corrected-formula ceiling ≈ 2824/GPU at tp1.
-Drivers left at worktree root: trackb_dump.py, trackb_pick.py.
+Drivers (trackb_dump.py, trackb_pick.py) were scratch, since removed 2026-07-06.
 
 ## Track A verdict — REFUTATION PASSED (R8: SAFE)
 Full 9-component decomposition sums to reported latency to the ns in both layouts; KV/GPU
