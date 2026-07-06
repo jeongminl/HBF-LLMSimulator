@@ -248,9 +248,14 @@ SLO-edge group (§6). This is the most direct throughput comparison available �
 intermediate assumptions — and it independently confirms the sim reproduces the
 paper's plotted bars to ~1%.
 
----
-
-## 8. Documented modeling choices & discrepancies (not deviations from data)
+**Absolute throughput (tokens/s).** Multiplying each vector bar height by the
+paper's *printed* baseline (9,843 / 2,467 / 20,483 / 5,566 tok/s) gives the
+paper's absolute throughput per bar, compared to the sim's measured
+`throughput_tok_s`: across all 32 bars **median |error| 1.1%, mean 1.4%, max
+5.6%**. Maverick lands within ±2.5% everywhere; DeepSeek-R1 runs 3–6% low on its
+NVLink and 32K-HBF bars (its baseline throughput is ~4% under the paper and its
+bar TPOTs sit at the −10% end of §4a). So the sim reproduces not just the
+*shape* of Fig5 (normalized bars, ~1%) but the *absolute* tokens/s to ~1% median.
 
 - **Fig5 workload = deterministic mean length (no dispersion).** Paper §VI-B:
   "…for each Lin and Lout configuration, we use the average sequence length within
