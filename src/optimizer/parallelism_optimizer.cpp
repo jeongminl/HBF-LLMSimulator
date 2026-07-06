@@ -338,6 +338,15 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
                                         layers_per_stage);
       }
 
+      // FULL faithful paper-1 intermediate-data gate: add the complete resident
+      // intermediate set (footprint.h::intermediateExtrasBytes) on top of
+      // peakIntermediateBytes. Off by default. Independent of kv_write_sram_gate;
+      // mirrors the live-sim gate (cluster.cpp) so the two never drift.
+      if (system_config.faithful_intermediate_gate) {
+        act_size += intermediateExtrasBytes(model_config, batch_size_per_gpu, tp,
+                                            layers_per_stage);
+      }
+
       // ---- Memory limit verification (via shared checkCapacity) ---------------
       // Uses hbm_per_stack_bytes and the same partitioning rule as cluster.cpp (via footprint.h).
       {

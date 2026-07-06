@@ -313,4 +313,51 @@ inline double kvWriteStagingBytes(const ModelConfig& model,
   return batch_per_gpu * per_layer_token * layers_per_stage;
 }
 
+// ---------------------------------------------------------------------------
+// FULL faithful paper-1 intermediate-data SRAM gate (2026-07-06).
+// ---------------------------------------------------------------------------
+// peakIntermediateBytes UNDER-counts the resident intermediate set: it excludes
+// the short-lived compute tiles and communication scratch buffers that paper 1
+// sizes the 320-MB logic SRAM by (peak occupancy). This helper returns the SUM
+// of the additional per-GPU resident terms the faithful gate must add on TOP of
+// peakIntermediateBytes. All SINGLE-buffered (paper 1 sizes by peak occupancy,
+// no double buffering); all per-seq terms scaled by batch_per_gpu:
+//   - KV-write staging  : kvWriteStagingBytes(...)  (context-independent burst)
+//   - Score tile        : (num_heads/tp) x 256 x precision   (flash-attn O(chunk) tile)
+//   - TP all-reduce scratch : (hidden_dim/tp) x precision    (in-place ring chunk)
+//   - MoE dispatch input (MoE only): top_k x hidden_dim x precision
+//   - MoE GateOut (MoE only): top_k x (expert_intermediate_dim/e_tp) x precision
+//   - Tiled LM-head logits: 2048 x precision  (argmax-consistent greedy-decode row)
+// Gated behind SystemConfig.faithful_intermediate_gate (default false). Added in
+// BOTH cluster.cpp (live sim) and parallelism_optimizer.cpp (optimizer) so the
+// two scarce-tier gates never drift. Independent of kv_write_sram_gate.
+inline double intermediateExtrasBytes(const ModelConfig& model,
+                                      double batch_per_gpu,
+                                      int tp,
+                                      double layers_per_stage) {
+  double precision = model.precision_byte;
+  double per_seq = 0.0;
+
+  // Score tile: flash-attention compute tile, O(chunk)=256 columns per head.
+  per_seq += (model.num_heads / (double)tp) * 256.0 * precision;
+
+  // TP all-reduce scratch: in-place ring reduces one hidden_dim/tp chunk at a time.
+  per_seq += (model.hidden_dim / (double)tp) * precision;
+
+  if (model.num_routed_expert > 0) {
+    int e_tp = (model.e_tp_dg > 0) ? model.e_tp_dg : 1;
+    // MoE dispatch input: top_k copies of the token routed to its experts.
+    per_seq += (double)model.top_k * model.hidden_dim * precision;
+    // MoE GateOut: top_k gate-projection outputs, e_tp-sharded.
+    per_seq += (double)model.top_k * (model.expert_intermediate_dim / (double)e_tp) * precision;
+  }
+
+  // Tiled LM-head logits (argmax-consistent -- the sim assumes greedy argmax, so
+  // only a 2048-wide logit tile is resident, not the full vocab).
+  per_seq += 2048.0 * precision;
+
+  return kvWriteStagingBytes(model, batch_per_gpu, tp, layers_per_stage) +
+         batch_per_gpu * per_seq;
+}
+
 }  // namespace llm_system
