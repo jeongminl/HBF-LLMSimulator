@@ -68,6 +68,7 @@ import copy
 import time
 import shutil
 import hashlib
+import random
 import argparse
 import subprocess
 import resource
@@ -378,17 +379,81 @@ def compute_batch(v_weight_node, budget_mult, context_mean, kv_bytes_per_token):
 # ---------------------------------------------------------------------------
 # Fig4 metrics
 # ---------------------------------------------------------------------------
-def fig4_metrics(result, v_weight_node):
+_RATIO_CACHE = {}
+
+
+def analytic_admission_decode_ratio(context_mean, cv, kappa, lout_ratio,
+                                    trunc_sigmas=2.0, n=200000, seed=12345):
+    """Steady-state admission:decode KV-byte RATE ratio E[Lin]/E[Lout], computed
+    by a one-time Monte-Carlo of the paper2 workload sampler (an exact replica of
+    scheduler.cpp:sampleWorkloadLengths -- truncated-normal context x Beta Lout
+    ratio x the output_len clamp). This replaces the windowed admission BYTE
+    counter in the Fig4 lifetime calc, which is sample-starved at ctx>=16K (few
+    sequence completions per 1000-step window -> a seed-dependent transient).
+
+    Why the ratio is E[Lin]/E[Lout]: by flow balance (Little's law) in steady-
+    state continuous batching, admissions/sec = completions/sec, so
+    admission_byte_rate/decode_byte_rate = E[admission_bytes]/E[decode_bytes].
+    Admission bytes per seq = num_layers*kvBytesPerLayerToken*effectiveKvLen(Lin);
+    decode bytes per seq    = num_layers*kvBytesPerLayerToken*Lout. The common
+    num_layers*kvBytesPerLayerToken factor cancels, leaving E[effectiveKvLen(Lin)]
+    / E[Lout].
+
+    LANDMINE: this assumes admission is UNCAPPED (effectiveKvLen(Lin)==Lin), i.e.
+    iRoPE OFF. That holds for EVERY paper2 Fig4 cell because build_config sets
+    simulation.disable_irope for Maverick (attn_chunk_size->0) and DeepSeek-R1 has
+    no iRoPE. If this ratio is ever reused for an iRoPE-ON config, admission would
+    be window-capped per local layer while decode is not, the factors would NOT
+    cancel, and E[Lin]/E[Lout] would be wrong -- assert-guarded at the call site."""
+    key = (round(context_mean), cv, kappa, lout_ratio, trunc_sigmas, n, seed)
+    if key in _RATIO_CACHE:
+        return _RATIO_CACHE[key]
+    rng = random.Random(seed)
+    mu = float(context_mean)
+    sigma = cv * mu
+    lo, hi = mu - trunc_sigmas * sigma, mu + trunc_sigmas * sigma
+    a = lout_ratio * kappa
+    b = (1.0 - lout_ratio) * kappa
+    sum_lin = 0.0
+    sum_lout = 0.0
+    for _ in range(n):
+        if sigma > 0:
+            C = rng.gauss(mu, sigma)
+            while C < lo or C > hi:
+                C = rng.gauss(mu, sigma)
+        else:
+            C = mu
+        r = rng.betavariate(a, b)
+        C_round = round(C)
+        out_len = min(max(round(C * r), 2), C_round - 1)
+        sum_lin += C_round - out_len
+        sum_lout += out_len
+    ratio = sum_lin / sum_lout
+    _RATIO_CACHE[key] = ratio
+    return ratio
+
+
+def fig4_metrics(result, v_weight_node, admission_decode_ratio=None):
     total_ns = result["total_ns"]
     timed_iters = result["P2_TIMED_ITERS"]
-    kv_written_total = result["P2_KV_BYTES_WRITTEN_TOTAL"]
     total_s = total_ns / 1e9
-    write_rate_bps = (kv_written_total / total_s) * WAF
     tbw_bytes = (5 * 512e9 * 8 - v_weight_node) * PE_CYCLES
+    decode_bytes = result.get("P2_KV_DECODE_BYTES")
+    if admission_decode_ratio is not None and decode_bytes:
+        # FIXED write-rate: the decode byte-rate is exact every step; the admission
+        # rate is the analytic Little's-law rate decode_rate * E[Lin]/E[Lout]
+        # (see analytic_admission_decode_ratio) instead of the sample-starved
+        # windowed counter. Seed-independent at ctx>=16K.
+        decode_rate = decode_bytes / total_s
+        write_rate_bps = decode_rate * (1.0 + admission_decode_ratio) * WAF
+    else:
+        # legacy path (no ratio supplied / no decode marker): windowed total.
+        write_rate_bps = (result["P2_KV_BYTES_WRITTEN_TOTAL"] / total_s) * WAF
     lifetime_years = tbw_bytes / write_rate_bps / SECONDS_PER_YEAR
     tpot_ms = total_ns / timed_iters / 1e6
     return {"lifetime_years": lifetime_years, "tpot_ms": tpot_ms,
-            "write_rate_bps": write_rate_bps, "tbw_bytes": tbw_bytes}
+            "write_rate_bps": write_rate_bps, "tbw_bytes": tbw_bytes,
+            "admission_decode_ratio": admission_decode_ratio}
 
 
 def fig5_throughput(result, served_batch):
@@ -487,7 +552,14 @@ def _fig4_worker(spec):
     if not res["success"]:
         out["reason"] = res.get("reason")
         return out
-    out.update(fig4_metrics(res, spec["v_weight_node"]))
+    # Fig4 always runs iRoPE-OFF (build_config sets disable_irope for Maverick;
+    # R1 has no iRoPE), so admission KV is uncapped and the analytic Little's-law
+    # ratio E[Lin]/E[Lout] is valid -- see analytic_admission_decode_ratio's
+    # LANDMINE note. Assert-guard against a future iRoPE-on reuse.
+    assert spec["model"] in ("llama4_maverick", "deepseekR1"), \
+        "analytic admission ratio assumes iRoPE-off (uncapped admission KV)"
+    adm_ratio = analytic_admission_decode_ratio(spec["ctx"], spec["cv"], spec["kappa"], spec["ratio"])
+    out.update(fig4_metrics(res, spec["v_weight_node"], admission_decode_ratio=adm_ratio))
     out["markers"] = {k: res.get(k) for k in MARKER_KEYS}
     return out
 

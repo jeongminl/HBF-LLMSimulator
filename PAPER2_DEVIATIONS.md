@@ -18,10 +18,11 @@ decision trail in `PAPER2_NOTES.md`.
 
 - **Fig4 (60 cells: lifetime + TPOT):** the sim reproduces the paper's
   qualitative structure and normalized-lifetime trend well. Absolute lifetimes
-  run systematically low (median −10%). The deviation is a ~8% central
-  bandwidth-efficiency effect (§4a) *plus* a workload-dependent spread (§4b): the
-  per-cell TPOT error is NOT flat — it ranges +3% to −26% and grows with input
-  share and context. Both components are honest, neither is a bug.
+  run systematically low (median −11%, worst corner −29%). The deviation is a
+  ~8% central efficiency-gap effect (§4a, irreducible) *plus* a context-dependent
+  residual (§4b) — one part of which was a real **finite-window measurement bug
+  now fixed** (Little's-law admission rate, §4b), the rest genuine roofline
+  physics. The per-cell TPOT error is NOT flat (+3% to −26%). No number is tuned.
 - **Fig5 (throughput bars + TPOT + SRAM):** after correcting the harness's
   baseline denominator (§3), the sim's baseline throughput matches the paper to
   **−1.0…−3.2%** (all four model/context baselines), and the 19 offload-
@@ -56,7 +57,7 @@ qualitative mismatch (§6).
 | Fig4 normalized lifetime trend | tracks within a few % | e.g. Mav CV0.1 (1.0, 1.99, 3.79) vs (1.0, 2.04, 4.14) |
 | Fig4 DeepSeek-R1 @ 8K | +6% … −6% | near-exact at short context |
 | Fig5 bar TPOTs (19, offload-independent) | median −8.5% (−4…−11%) | all at fixed 1:3 workload |
-| Fig4 lifetime, 60 cells | median −10%, 87% within ±20% | worst −36% at one extreme corner |
+| Fig4 lifetime, 60 cells | median −11%, worst −29% | seed-independent after the §4b Little's-law fix |
 | Fig4 TPOT, 60 cells | median −11%, range +3…−26% | workload-dependent, not flat (§4b) |
 | First-activated-expert tR exposure | exact to the ns | 24×3µs Maverick / 58×3µs R1 per step |
 
@@ -114,41 +115,61 @@ bandwidth-efficiency cause.
 
 **Diagnosis.** A full decode-step composition trace (KV-read-from-flash 67.6%,
 MoE weight-read 27.1%, all-to-all comm 0.4%; total matches the sim's own
-`latency` to 0.03 ms) ruled out every candidate missing term (comm is modeled
-but negligible; all weight tensors charged; roofline max/sum correct). The
-mechanism: the sim applies the paper's *stated peak* bandwidths (flash 8 TB/s,
-½-HBF 4 TB/s, HBM 8 TB/s, C2C 1.8 TB/s) at 100% efficiency, whereas the paper's
-roofline appears to fold in ~92% achievable-vs-peak efficiency it never
-separately reports.
+`latency` to 0.03 ms) ruled out every candidate missing term. Two follow-up
+adversarial bug-hunts closed the remaining hypotheses: **(a) compute MFU** —
+decode is 20–50× under the compute frontier (MoE-GEMM compute/memory = 0.004), so
+no MFU derate moves TPOT, and the paper states *peak* 2,250 TFLOPS regardless;
+**(b) MoE activated-expert count under Zipfian** — saturated (all 16 local
+experts active every step regardless of skew 0.8), so skewness-insensitive
+(<0.001% TPOT change at skew 0 vs 0.8). The paper explicitly uses **peak**
+8 TB/s / 2,250 TFLOPS with no stated efficiency derate, and its 16.8 TB/s
+on-chip bandwidth is a *sufficiency* assumption, not a throttle (½-HBF, with half
+the on-chip demand, shows the same deviation).
 
-**Why not patched.** Because the bandwidths already match the paper exactly, a
-0.92 derate would be pure tuning-to-target — the forbidden move. Documented as an
-honest ~8% central effect.
+**Why not patched — and it is NOT an "efficiency" the paper folds in.** An
+earlier draft of this report rationalized the gap as the paper assuming ~92%
+achievable-vs-peak bandwidth. **That is wrong** — the paper states *peak*
+bandwidths, so there is no derate to match, and inventing a 0.92 factor would be
+tuning-to-target. The paper's tool is a *modified* version of the same base
+simulator this codebase derives from (its ref [1] = `scale-snu/LLMSimulator`), so
+the ~8% is the residual between **two HBF reimplementations of the same
+simulator**, both at peak — an irreducible implementation-detail gap we cannot
+close without their code. Documented as such.
 
-### 4b. Fig4 context-dependent residual (on top of 4a)
+### 4b. Fig4 context-dependent residual — one FIXED measurement bug + one honest residual
 
 **Observation.** The sim's normalized lifetime grows *less* with context than the
-paper's (e.g. R1 CV0.1: 3.07× vs 3.37× at 32K); worst single corner Mav CV0.3
-15:1 32K = −16.9% on the normalized value. Any context-uniform part of §4a
-*cancels* in the normalized column (it is a ratio to the 8K case), so what
-remains here is a genuinely separate, context-dependent effect.
+paper's (e.g. R1 CV0.1: 3.07× vs 3.37× at 32K). This decomposed into a real,
+fixable measurement bug **plus** a genuine residual.
 
-**Diagnosis (two honest mechanisms, no bug).**
-1. The decode-write byte term is **exact**: `batch · 196,608`, halving 4.00× per
-   context doubling in all 20 cells.
-2. **DeepSeek** sub-linearity is roofline physics: MLA decode is compute/batch-
-   bound, so as batch shrinks 4× with context, per-iter time drops ~24% (the
-   same peak-vs-achievable family as §4a). Even the paper's own R1 column is
-   sub-linear (3.37 < 4).
-3. **Maverick** is realized-stochastic-workload noise: the admission-byte
-   scaling *sign-flips* across cells (overshoots the paper at CV0.3 1:3 = 4.53 >
-   4.22; undershoots at 15:1) — the fingerprint of the truncNormal×Beta sampler
-   + size-biased fill, not a monotone formula error.
+**FIXED — non-converged admission write-rate (finite-window bug).** Lifetime ∝
+1/write_rate; write_rate = (admission + decode KV bytes)/elapsed. The decode term
+is exact every step, but the *admission* term was accumulated only when a
+sequence completes — and at ctx≥16K a sequence's output (2K–24K steps) exceeds
+the 1000-step timed window, so few complete and the admission byte-rate was a
+sample-starved, **seed-dependent transient** (~6–11% swings at ctx≥16K; the
+"sign-flip across cells" an earlier draft mistook for benign sampler noise was
+*this* measurement artifact). **Fix (grounded, no tuning):** replace the windowed
+admission counter with the steady-state **Little's-law** rate. In continuous
+batching admissions/sec = completions/sec, so
+`admission_byte_rate = decode_byte_rate × E[Lin]/E[Lout]`, with E[Lin]/E[Lout]
+from a one-time Monte-Carlo of the sampler (the unbiased *arrival* distribution,
+not the size-biased in-flight one). It is exact and seed-independent, and reduces
+to E[Lin]/E[Lout] because paper2 disables iRoPE (uncapped admission) — assert-
+guarded against any iRoPE-on reuse (`run_paper2.py` `analytic_admission_decode_ratio`
+/ `fig4_metrics`; `_fig4_worker`). Effect: worst corner **−36% → −29%**, and the
+sign-flipped cross-CV inconsistencies collapse (e.g. Mav 1:1/32K windowed 14.3
+(CV0.1) vs 19.6 (CV0.3) → analytic 16.8 vs 17.0). Applied as a post-processing
+recompute of the exact stored decode bytes — no re-sweep needed.
 
-**Why not patched.** Matching the paper's normalized column would require an
-unstated paper assumption (constant decode throughput regardless of batch, or a
-deterministic mean-based endurance population instead of a sampled one) that is
-not better grounded than the current model.
+**Honest residual (survives the fix).** After convergence,
+`normalized_lifetime(32K) = 4 × (t_step_32K / t_step_8K)`: the write RATE is
+coupled to TPOT (steps/sec), so the DeepSeek MLA sub-linearity (per-iter time
+drops ~24% as batch shrinks 4× with context) and the flat §4a effect propagate
+into the lifetime scaling. That is genuine roofline physics; if the paper's
+endurance model used a fixed reference throughput rather than live TPOT it would
+be an unstated model difference — not patched (it's not better-grounded than the
+live-TPOT model).
 
 ---
 
@@ -185,19 +206,28 @@ plus the 48 MB read buffer:
 | DeepSeek-R1 | 512 GB | 32K | 113 | 104 | +9% |
 | DeepSeek-R1 | 768 GB | 32K | 167 | 145 | +15% |
 
-**This is the weakest-matching metric, and it is honest scatter in BOTH
-directions — not a uniform bias.** Maverick undershoots (−23…−41%) while R1
-*overshoots* (+9…+21%). The fixed 48 MB read buffer ≈ the paper's ~51 MB
-batch-independent SRAM offset, so the remaining gap is in the batch-scaled
-ACT+KVWRITE per-sequence staging: it runs low for Maverick (GQA, small hidden
-activation) and high for R1 (MLA, large hidden-dim activation working set at its
-much larger per-device batch). Matching both models' absolute SRAM would require
-the paper's exact (unpublished) staging-buffer accounting; we report the
-simulator's own component sum. This is an **output-only** metric — it has zero
-effect on TPOT, throughput, or lifetime — so it does not affect any headline
-result. The DBUF fix itself is unambiguously correct (removes SRAM the timing
-model provably does not need to hide tR); the residual per-model scatter is a
-documented modeling difference, not fitted.
+**This is the weakest-matching metric, and it is a systematic, architecture-
+correlated DEFECT — not "honest scatter" (an earlier draft's mischaracterization).**
+Maverick undershoots (−23…−41%) while R1 *overshoots* (+9…+21%) because the ACT
+term (`P2_SRAM_ACT_BYTES` = `peakIntermediateBytes`, `footprint.h:175`) reuses a
+conservative **capacity-gate** footprint — which *sums* all attention sub-tensors
+as concurrently-live — as the paper's I/O-activation *staging* metric. Real
+chunked/pipelined execution releases those transients as they're consumed, so the
+sum over-counts: for R1's MLA attention the true peak-of-chain liveness is **45.8%
+below** the coded sum (a genuine concurrent-liveness error). **But an adversarial
+refutation showed no grounded fix unifies both models:** applying the rigorous
+peak-liveness *flips* R1 from +17% to −20% — the paper's figure sits *between* the
+naive sum and the true peak, so it embeds an unstated staging assumption — and it
+cannot touch Maverick, whose ACT is FFN-bound (gate+up genuinely coexist). A
+separate weight-staging buffer was refuted (`layer_impl.h:39-51` already stages
+weight reads through the *same* double-buffer as KV — a second one double-counts),
+as was an I/O-double-buffer redefinition (~15.6 MB for R1, catastrophic
+undershoot). So it is a real definitional defect with **no non-tuning fix**; the
+DBUF term itself (above) is correct, and the `Q·Kᵀ` score tile's home is likewise
+unspecified by the paper (§8). **Output-only** — zero effect on TPOT/throughput/
+lifetime — so it touches no headline result; documented, not patched. (A graph-
+based peak-liveness pass would make the number *physically defensible* but still
+not match the paper, and is output-only, so it is deferred rather than built.)
 
 **Caveat — Fig4's SRAM markers are stale (pre-fix).** The SRAM table above is
 from the fixed-binary Fig5 rerun. The `P2_SRAM_*` marker fields inside
@@ -219,11 +249,12 @@ TPOT 178.5 ms — 21 ms *under* the 200 ms SLO, not bound.
 
 This is an honest, disclosed consequence of §4a: the sim runs this R1 bar ~8–10%
 faster than the paper (in line with R1's bar-TPOT deviations elsewhere,
-−9.7…−10.7%). Applying the paper's implicit ~8–10% bandwidth derate would push
-178.5 ms to ~196–200 ms — right at the SLO boundary, where the paper places it
-just above and the sim places it just below. So the single binary SLO-bound flag
-flips. We do not patch it (that would be the §4a tuning-to-target); we flag it as
-the one qualitative disagreement with the paper. No other SLO-bound flag differs.
+−9.7…−10.7%). Closing that ~8–10% implementation gap would push 178.5 ms to
+~196–200 ms — right at the SLO boundary, where the paper places it just above and
+the sim places it just below. So the single binary SLO-bound flag flips. We do
+not patch it (§4a has no locatable term to fix, so any change would be
+tuning-to-target); we flag it as the one qualitative disagreement with the paper.
+No other SLO-bound flag differs.
 
 ---
 
@@ -315,10 +346,20 @@ bar TPOTs sit at the −10% end of §4a). So the sim reproduces not just the
 
 ## 9. Discipline
 
-Every proposed change was adversarially pre-screened; the two systematic biases
-(§4a, §4b) were each traced to a mechanism and left unpatched precisely because
-the only way to close them was tuning-to-target or importing an unstated
-assumption. The two applied fixes (§3 harness denominator, §5 SRAM DBUF) are
-grounded in, respectively, the paper's own figure construction and the
-simulator's own timing-model break-even — and both were validated independently
-of the paper's target numbers.
+Every claim here was put through an adversarial investigate-then-refute pass
+(Opus bug-hunts, then Sonnet refuters attacking each verdict). That process
+overturned two of my own earlier calls: it retracted the "~92% efficiency"
+rationalization for §4a (the paper uses *peak*), and it reclassified the SRAM
+gap from "honest scatter" to a real concurrent-liveness defect — while also
+downgrading the Fig4 finding from a "~45% bug" to a ~6–11% finite-window variance.
+
+Net, after vetting: **three grounded fixes applied** — §3 harness baseline
+denominator (the paper's own figure construction), §5 SRAM DBUF (the timing
+model's own bandwidth-delay break-even), and §4b the Fig4 Little's-law admission
+rate (steady-state flow balance) — each validated independently of the paper's
+target numbers. **Two residuals left honestly unpatched** because no locatable
+term or non-tuning redefinition closes them: the §4a ~8% (an irreducible gap
+between two reimplementations of the same base simulator, both at peak) and the
+§5/§8 SRAM defect (output-only; the paper's staging assumption is unpublished and
+sits between the sim's over-count and the rigorous peak-liveness). No number was
+tuned to fit the paper.
