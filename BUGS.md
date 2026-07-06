@@ -171,13 +171,33 @@ inert for U7's current scope). Replacing the sum with the rigorous peak-liveness
 itself converge on paper2's reported SRAM figure — it flips R1 from +21% to −20% — because the
 under-count inventory above (items this section already tracks) is simultaneously in effect; the two
 errors partially cancel, which is very likely why paper figures land between a naive sum and a
-rigorous peak. **The two fixes are not independent and must land together**: a graph-based per-
-tensor liveness pass (max-concurrency sweep over def/last-use intervals, using the module graph's
-existing producer→consumer edges — `set_dependency_tensor`/`dependency_tensor_list` in
-`module_graph.cpp`) that both (a) stops over-counting attention's dataflow chain as a sum and (b)
-adds the currently-missing tensors (LM-head logits, score tile, KV-write staging) as their own
-liveness intervals. FFN is NOT over-counted (gate/up genuinely coexist for the SiLU multiply) — this
-finding is attention-specific and orthogonal to the FFN-side accounting.
+rigorous peak. The two fixes are not independent — the full architecturally-correct answer is a
+graph-based per-tensor liveness pass (max-concurrency sweep over def/last-use intervals, using the
+module graph's existing producer→consumer edges — see the separate `liveness-sweep` branch,
+`TopModuleGraph::livenessPeakActBytes()`, NOT yet merged) that both (a) stops over-counting
+attention's dataflow chain as a sum and (b) adds the currently-missing tensors (LM-head logits, score
+tile, KV-write staging) as their own liveness intervals. FFN is NOT over-counted (gate/up genuinely
+coexist for the SiLU multiply) — this finding is attention-specific and orthogonal to the FFN-side
+accounting.
+
+**RESOLVED (2026-07-06): the over-count itself is fixed on `main`, independent of the liveness-sweep
+migration.** The paper2 team's own derivation gives an exact, hand-derivable peak-of-chain formula
+for the `use_absorb` (MLA) branch of `peakIntermediateBytes` — no graph tracing required. Fixed
+directly in `footprint.h`: replaced the 5-term sum (`common_prefix` + `tr_k_up` + `attn_context` +
+`v_up` + `out_proj`) with `max(pre_score_peak, post_score_peak)`, where `pre_score_peak` = H (residual
+carry) + c_kv + rope + query_proj(+rope) + tr_k_up (the set alive up to score computation, correctly
+EXCLUDING `q_lora`/c_q, which dies once query_proj is produced — the previous formula's biggest
+single over-count source) and `post_score_peak` = H + attn_context + v_up + out_proj (the set alive
+after scores, which never coexists with the pre-score set). **Verified:** hand-computed against the
+paper2 finding's own DeepSeek-R1 numbers — reproduces 204,864 (old sum) → 114,240 (new peak) exactly,
+ratio 1.7933 ≈ their cited 1.79×. Clean rebuild; a smoke run on the default `deepseekV3`/`use_absorb`
+config shows `ACT:` drop from 0.0105839 GB (old) to 0.00847626 GB (new) — confirms the binary picks
+it up. llama3 (GQA, untouched `else` branch) is **byte-identical** before/after (`ACT: 0.105263GB`
+both times) — this fix is a no-op for every current paper1 preset, exactly as scoped. **Not done:**
+the `compressed_kv`-without-absorb branch has the same class of issue in principle but no verified
+derivation exists for it and no current preset reaches it (only `deepseekV3` sets `use_absorb`),
+so it was left alone rather than guessing; the missing-tensor UNDER-count above is still open and
+requires the separate liveness-sweep merge (or hand-adding the missing terms) to close.
 
 ## 10. `LmHead::forward` bypasses `device->execution()` — its FLOPs/DRAM-energy are uncounted
 

@@ -1622,6 +1622,54 @@ question remaining, per the "that doc holds only still-open or explained-not-a-b
     (a full sweep was previously deferred by the user as too expensive; a targeted re-check of the
     specific cells above is cheaper and likely sufficient).
 
+    **Targeted re-check (2026-07-06, same day):** re-ran the specific cells behind 3 of the 6 new
+    findings against this build. Fig-4 plain-HBF/llama3/SHORT (2-16 GPU) and the Fig-6 llama3/0.05s-
+    SLO ordering flip are **both unchanged** — every affected cell is SLO-bound, not SRAM-bound, so
+    the intermediate-data gate has no effect and both findings stand exactly as documented. The Fig-7
+    online≈offline duplicate finding **flips**: see item 78.
+
+## Attention-phase over-count fixed (2026-07-06) — item 77
+
+77. **`peakIntermediateBytes`'s `use_absorb` (MLA) branch summed attention-phase intermediates as if
+    concurrently resident instead of taking the true peak-of-chain** (paper2-extension team's finding,
+    `.claude/worktrees/paper2-extension/FINDING_peakIntermediateBytes_attention_overcount.md`; see
+    BUGS.md item 9's companion note). The dataflow is a strict sequential chain — `H(residual) → c_q
+    (q_lora) → query_proj(+rope) → [SCORES] → tr_k_up → attn_context → v_up → out_proj` — where `c_q`
+    dies once `query_proj` is produced and the whole pre-score set `{H, c_kv, rope, query_proj,
+    tr_k_up}` dies once scores are computed, never coexisting with `{attn_context, v_up, out_proj}`.
+    The old formula summed all of it as one phase-wide total, over-counting MLA models (many
+    attention intermediates) by 1.79×/45.8% while barely affecting GQA (few intermediates — this
+    repo's own llama3/llama4 paper1 presets, both FFN-bound anyway). **Fix:** replaced the 5-term sum
+    with `max(pre_score_peak, post_score_peak)` in `footprint.h`'s `use_absorb` branch — `c_q` is
+    correctly dropped entirely (never part of either peak). **Verified:** hand-derivation reproduces
+    the finding's own DeepSeek-R1 numbers exactly (204,864 summed → 114,240 peak, ratio 1.7933 ≈
+    their cited 1.79×); a smoke run on the default `deepseekV3`/`use_absorb` config shows `ACT:` drop
+    from 0.0105839 GB to 0.00847626 GB across a clean rebuild; llama3 (GQA, the untouched `else`
+    branch) is byte-identical before/after (`ACT: 0.105263GB`), confirming zero effect on any current
+    paper1 preset — exactly as scoped. **Not fixed:** the `compressed_kv`-without-`use_absorb` branch
+    has the same class of issue in principle, but no preset in this repo reaches it and no verified
+    derivation exists for it, so it was left alone; the separate missing-tensor UNDER-count (LM-head
+    logits, score tile, all-reduce scratch, MoE dispatch/GateOut — BUGS.md item 9 / item 76) is
+    unaffected by this fix and still needs the liveness-sweep merge (or hand-added terms) to close.
+
+## Fig-7 online≈offline duplicate: flips from "split verdict" to fully explained (2026-07-06) — item 78
+
+78. **Re-running the exact cells behind the "Fig-7 online≈offline duplicate" finding against the
+    merged faithful-intermediate-gate build reverses the 1-GPU verdict.** Previously (documented
+    under `PAPER_INCONSISTENCIES.md`'s "Still open" section, pre-merge): llama4_maverick/HBF+/SHORT
+    at 1-GPU showed online (batch 1071, `bound=slo`) vs. offline (batch 2824, `bound=sram`) — a real
+    57% gap, contradicting the paper's printed exact duplicate (185377=185377) at that cell; 8-GPU
+    already matched near-exactly (1.2% apart, both `bound=sram`). **Post-merge:** 1-GPU online now
+    gives batch=844, tps_per_gpu=9385.84, `bound=sram`; offline gives the identical batch=844,
+    tps_per_gpu=9385.84, `bound=sram` — an **exact** duplicate, matching the paper's pattern. 8-GPU
+    likewise exact post-merge (batch=6752, tps_per_gpu=21010.75, `bound=sram`, both directions). The
+    under-counting SRAM gate was masking a genuine SRAM-saturation effect at 1-GPU: with the correct
+    intermediate-data accounting, the cell is SRAM-bound even at the tight 0.1s SLO, so loosening the
+    SLO to 86400s changes nothing — exactly the paper's own behavior. **Disposition: fully resolved,
+    both GPU counts now explained by the same mechanism (SRAM saturation), no split verdict, no
+    remaining question about a paper misprint.** This item should move from "Still open" to a fully
+    closed record — see `PAPER_INCONSISTENCIES.md` for the corresponding removal.
+
 ## Paper-inconsistencies doc cleanup (2026-07-06) — consolidated detail moved out of PAPER_INCONSISTENCIES.md
 
 `PAPER_INCONSISTENCIES.md` was reorganized to hold ONLY still-open and explained-not-bug items, each

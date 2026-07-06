@@ -187,18 +187,18 @@ is a *llama3* CONV cell, outside scope).
 used **stale pixel data** — with vector-exact data "8.2× over SLO" becomes 1.63× and "CONV+ is clean"
 is false (12 cells >25%, split 6 CONV / 6 CONV+). Only "the sim is not the problem" survives.
 
-### Fig-7 — online≈offline "duplicate" (1-GPU): closed by the write-buffer gate
+### Fig-7 — online≈offline "duplicate" (1-GPU): closed by the intermediate-data gate
 **Divergence.** The paper prints identical online/offline PEC for llama4/SHORT/HBF+ at 1-GPU
-(185377=185377) and 8-GPU (424283=424283). Baseline sim: 8-GPU near-duplicate (1.2% apart), but 1-GPU
-a real **57%** gap (online SLO-bound batch 1071 vs offline SRAM-bound batch 2824).
+(185377=185377) and 8-GPU (424283=424283). Pre-merge baseline sim: 8-GPU near-duplicate (1.2% apart),
+but 1-GPU a real **57%** gap (online SLO-bound batch 1071 vs offline SRAM-bound batch 2824).
 
-**Explanation (out-of-sample, 2026-07-06).** With the write-buffer / intermediate-data gate enabled
-(branch `faithful-intermediate-gate`, default off), the 1-GPU online cell becomes **SRAM-bound at
-844**, so online == offline at both 1-GPU (844=844) and 8-GPU (6752=6752) — the 57% gap collapses to
-0%, reproducing the paper's exact duplicates. Out-of-sample: the gate was built for the Fig-3
-SRAM-bound bars, not tuned to Fig-7; a pure capacity change (KV-write *timing* share byte-identical).
-So "1-GPU is a paper misprint" is **rejected** — it's a real SRAM-saturation effect the sim reproduces
-once the gate lands.
+**Explanation, CONFIRMED on the merged default build (2026-07-06 — was out-of-sample on a branch,
+now reproduced on `main` itself after the faithful-intermediate-gate merge, CHANGES.md item 76/78).**
+With the full intermediate-data accounting now the default (unconditional) behavior, the 1-GPU online
+cell is **SRAM-bound at 844**, so online == offline exactly at both 1-GPU (844=844) and 8-GPU
+(6752=6752) — the 57% gap collapses to 0%, reproducing the paper's exact duplicates at both GPU
+counts. A pure capacity change (KV-write *timing* share byte-identical). So "1-GPU is a paper
+misprint" is **rejected** — it's a real SRAM-saturation effect the sim now reproduces by default.
 
 ---
 

@@ -161,17 +161,36 @@ inline double peakIntermediateBytes(const ModelConfig& model,
     // Query's non-rope output width is qk_nope_head_dim, not head_dim (which is V's
     // up-projected width, used correctly below in "v_up out"). Equal on deepseekV3's
     // preset (qk_nope_head_dim == head_dim == 128); distinct where a config diverges.
-    double common_prefix =
-        (batch_per_dp * hidden_dim) +
-        (batch_per_dp * model.q_lora_rank) +
-        (batch_per_dp * model.kv_lora_rank) +
-        (batch_per_dp * model.qk_rope_head_dim) +
-        (batch_per_dp * (3.0 * model.qk_rope_head_dim + model.qk_nope_head_dim) * model.num_heads / tp);
-    attn_total = (common_prefix +
-                  (batch_per_dp * model.num_heads * model.kv_lora_rank / tp) +  // tr_k up out
-                  (batch_per_dp * model.num_heads * model.kv_lora_rank / tp) +  // attn context out
-                  (batch_per_dp * model.num_heads * model.head_dim / tp) +      // v_up out
-                  (batch_per_dp * hidden_dim)) * precision;                     // out proj out
+    //
+    // Peak-of-CHAIN, not sum-of-phase (fixed 2026-07-06, paper2-extension finding
+    // FINDING_peakIntermediateBytes_attention_overcount.md): the dataflow is
+    // strictly sequential -- input/residual(H) -> c_q(q_lora) -> query_proj(+rope)
+    // -> [SCORES] -> tr_k_up -> attn_context -> v_up -> out_proj. c_q dies once
+    // query_proj is produced (never live at the same time as anything below); the
+    // score-time set {H, c_kv, rope, query_proj, tr_k_up} dies entirely once scores
+    // are computed and never coexists with {attn_context, v_up, out_proj}. Summing
+    // every term (as if all 7 co-resident) over-counted MLA by 1.79x/45.8%
+    // (verified on DeepSeek-R1: summed 204,864 vs. true peak 114,240 element-units,
+    // batch/context-independent) while barely affecting GQA (few attention
+    // intermediates -- this repo's own llama3/llama4 paper1 presets are GQA and
+    // FFN-bound anyway, so this fix is a no-op for them). H (the residual carry)
+    // is the only term live at BOTH candidate peaks.
+    double h_term = batch_per_dp * hidden_dim;
+    double query_proj_term =
+        batch_per_dp * (3.0 * model.qk_rope_head_dim + model.qk_nope_head_dim) * model.num_heads / tp;
+    double tr_k_up_term = batch_per_dp * model.num_heads * model.kv_lora_rank / tp;  // == attn_context's width
+    double pre_score_peak =
+        h_term +                                    // H, persists (residual carry)
+        (batch_per_dp * model.kv_lora_rank) +        // c_kv, needed through score compute
+        (batch_per_dp * model.qk_rope_head_dim) +    // rope component, needed through score compute
+        query_proj_term +                            // query_proj(+rope) out, dies after scores
+        tr_k_up_term;                                 // tr_k_up out, dies after scores
+    double post_score_peak =
+        h_term +                                    // H, persists (residual carry)
+        tr_k_up_term +                                // attn context out (same width as tr_k_up)
+        (batch_per_dp * model.num_heads * model.head_dim / tp) +  // v_up out
+        h_term;                                      // out proj out (hidden_dim-wide, same as H)
+    attn_total = std::max(pre_score_peak, post_score_peak) * precision;
   } else if (model.compressed_kv) {
     // Same qk_nope_head_dim width as the absorb branch above.
     double common_prefix =
