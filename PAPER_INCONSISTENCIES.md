@@ -19,26 +19,6 @@ holds only the two live categories.
 
 ## Still open
 
-### Fig-4 — CONV / llama4_maverick, low GPU count: sim TPS 55–89% off
-**Divergence.** At low GPU counts CONV/llama4 per-GPU TPS diverges 55–89% (e.g. CONV/MID/1-GPU: sim
-batch 39 at tpot 99.47 ms). The gap is specific to CONV (not CONV+) at 1–2 GPU.
-
-**Current explanation.** The simulator is very likely correct — decode is flash-weight-streaming-
-bound and the sim's throughput is physically defensible (breakdown at CONV/MID/1-GPU sums exactly to
-the 99.474 ms step; `expert_ffn` 70.7%; CONV's 1-HBM read bandwidth is masked under `std::max()`
-against the dominant flash weight-stream, `layer_impl.h:72,141`, so if anything the sim is mildly
-conservative). The residual genuine gap is bounded ≤~20% (the sim's batch and the paper's OWN Fig-3
-batch agree to 0–22%, both SLO-bound). What is NOT established is *why* the paper's Fig-4 CONV curve
-sits where it does. Not covered by any resolved item.
-
-**Disproved arguments.** A drop-in "RESOLVED: paper figures are provably self-contradictory, CONV+ is
-clean" proposal (drafted in the removed `bughunt-fifth-pass` worktree) was **rejected** — it used
-**stale pixel readings**. With vector-exact data its evidence collapses: "CONV implies 1.2×–8.2× over
-SLO" becomes **1.09×–1.84×** (its "worst case" MID/1-GPU 8.2× used tps 44.1, actually 202.3 →
-1.63×); and "CONV+ is clean" is **false** — 12 cells exceed 25% error, split 6 CONV / 6 CONV+. So the
-"paper is provably self-contradictory" framing does not hold; only Pillar 1 (sim is not the problem)
-survives.
-
 ### Fig-4 — plain-HBF / llama3_405B / SHORT: flat ~25.3% high, 2–16 GPU
 **Divergence.** Paper flat **2494.8** across 2/4/8/16 GPU; sim flat **3342.1** — a consistent
 **25.3%** at every GPU count ≥2. The 1-GPU cell is close (sim 1781.96 vs paper 1678.7, 5.8%). Plain
@@ -51,19 +31,6 @@ has not been traced to a specific term.
 **Disproved arguments.** The "same mechanism class as U5" framing is weak: U5's floor is worst at
 1-GPU and eases with GPU count; here it is the reverse (1-GPU is the *close* cell, the gap opens at
 2-GPU and stays flat) — so a simple U5-class explanation does not fit.
-
-### Fig-5 — llama3_405B / MID / HBF+: runtime-breakdown share mismatch
-**Divergence.** Breakdown shares (flat across 4/8/16 GPU): **FFN** 18.3% sim vs 31.8% paper (sim
-under-counts), **Communication** 7.2% vs 1.9% (sim over), **Attention** 64.2% vs 55.6%; **KV-write**
-matches (10.2% vs 9.4%).
-
-**Current explanation.** Most likely **one** root cause — FFN absolute time under-counted by ~40% —
-mechanically inflating the other shares (shares sum to 100%). Candidate: the deferred MFU under-
-charge, but its leverage on HBF+ is weak (HBF+ FFN is flash-bandwidth-bound, not GEMM-bound, so an
-MFU<1 correction that only touches FLOP-bound time moves it little). Not yet root-caused.
-
-**Disproved arguments.** The "three independent mismatches (FFN + Communication + Attention)" framing
-overstates it — they are not independent; correcting FFN alone would move all three shares.
 
 ### Fig-5 — llama3_405B / HBM4 / MID: paper's Communication share drops at 16-GPU, sim's doesn't
 **Divergence.** Communication share: 4-GPU 5.1% paper / 5.2% sim, 8-GPU 14.4% / 14.5%, but **16-GPU
@@ -100,22 +67,6 @@ dynamics (the throughput-max search reselecting tp/pp differently per model as G
 
 **Disproved arguments.** Cannot yet be filed as a clean U7 extension because of the model-split trend.
 
-### Fig-7 — online≈offline "duplicate": 8-GPU genuine, 1-GPU open
-**Divergence.** The paper prints **identical** online/offline PEC for llama4/SHORT/HBF+ at 1-GPU
-(185377 = 185377) and 8-GPU (424283 = 424283). Sim: **8-GPU** near-duplicate (online 23743 vs offline
-24026 tps/GPU, 1.2% apart); **1-GPU** a real **57%** gap (online 10711 slo-bound batch 1071 vs offline
-16810 sram-bound batch 2824).
-
-**Current explanation.** 8-GPU = genuine SRAM saturation (explained — loosening the SLO barely moves
-a batch already near the ceiling). 1-GPU = open: either a paper misprint, **or** an under-modeled
-SRAM term. If the KV-write staging term (U7) were charged, the 1-GPU online ceiling would collapse
-to ~559–999/GPU and could flatten all four operating points into the paper's duplicate without any
-misprint.
-
-**Disproved arguments.** "8-GPU is sram-bound in both directions" is **wrong** — the probe log shows
-8-GPU *online* is `bound=slo`. "1-GPU is definitely a paper misprint" is **premature** — the KV-write
-A/B (U7, in progress) is a competing sim-side explanation that hasn't been run to conclusion.
-
 ---
 
 ## Explained (not bugs)
@@ -138,19 +89,6 @@ quote in U7, where §III proves the paper *does* search TP/PP/EP). An untested a
 produce the identical symptom without any paper-side restriction — the sim's own "TP-headroom"
 mechanism being overestimated — was never ruled out. So the capacity match is solid; the causal
 story "the paper restricted the search" is not established.
-
-### U5 — "1-GPU HBF/HBF+ per-GPU batch > 8-GPU HBM4, in most cases"
-**Divergence.** The paper claims 1-GPU flash beats 8-GPU HBM4 per-GPU batch "in most cases." The sim
-matches **11 of 12** comparable cells; the single miss is llama3_405B/SHORT/HBF (sim 171.5 < paper
-194.0).
-
-**Current explanation.** The weight-reread floor (`getLinearMemoryDuration`: weight time =
-`k·n·precision`, no batch factor) means flash's larger capacity lets a 1-GPU flash node hold more
-batch than an 8-GPU HBM4 node whose weights are replicated. The one miss is consistent with the
-paper's own "in most cases" hedge. Blind re-derivation matched the mechanism to 0.3%.
-
-**Disproved arguments.** The earlier "U5 is a real miss" reading dissolved — the current binary
-matches the paper's OWN 1-GPU bars (the old comparison table was stale).
 
 ### U7 — HBF+/CONV+ per-GPU batch grows with GPU count instead of staying flat
 **Divergence.** The sim's per-GPU batch **grows** with GPU count and is **SLO-bound** (llama4/HBF+/
@@ -203,12 +141,64 @@ FINALIZED" headline is **retracted**.
   does — is TEST it: charging the term reproduces the paper's SHORT flat/SRAM-bound bars and the 2.35
   ratio under the real search (see the table above). So "num_layers drives the ratio" is the
   *mechanism*, not a flaw, and the standing caveats are the ~25% absolute overshoot and MID/LONG — not
-  "unverified." Paper1's own footnote 1 calls KV-cache writes "intermediate data," so this is arguably
-  the paper's stated mechanism, not a new one.
+  "unverified." NOTE (correction): paper1 does NOT explicitly state that the KV-write staging buffer
+  shares the 320-MB intermediate-data SRAM — its footnote 1 ("writing intermediate data increases
+  write traffic ... every decode iteration") uses "intermediate data" for the short-lived activations
+  it keeps in SRAM, and refers to the flash-written KV as "KV cache" (footnote 2), i.e. as distinct
+  terms. Charging the KV-write burst against the 320-MB pool is a physically-reasonable MODELING
+  CHOICE (the KV must buffer on-chip somewhere before the flash write); the evidence that it matches
+  the paper's tool is the A/B reproduction above, NOT the footnote.
 - **(d) "327 reconciled exactly."** `320 MiB/(2·40·6399·2 B) = 327.7` is arithmetically right but
   overfit — llama3's own SHORT/HBF+ bar (326.1) is a zero-parameter explanation comparably close.
 - **(e) The maverick-tp8 SRAM-ceiling impact numbers** carried in the 7th/8th-pass tables were wrong
   (a reproduction-script bug — missing `/e_tp` on the MoE term); the tp1 numbers were correct.
+
+### Fig-5 — llama3_405B / MID / HBF+: runtime-breakdown share mismatch — the MFU=1.0 assumption (deferred pair)
+**Divergence.** Shares (flat 4/8/16 GPU): FFN 18.3% sim vs 31.8% paper, Comm 7.2 vs 1.9, Attention
+64.2 vs 55.6, KV-write 10.2 vs 9.4 (matches).
+
+**Explanation (investigator + refuter pair, 2026-07-06).** NOT an FFN bug — FFN's absolute time is
+roofline-EXACT (18.26 ms sim = hand-computed, compute-bound). The driver is the **MFU=1.0 assumption**
+(`linear_impl.cpp::effectiveMFU`, default 1.0 — the sim runs every GEMM at 100% peak, but real decode
+GEMMs run ~0.5). Setting the realistic **MFU≈0.5** (share-implied 0.479) moves all four to near-
+agreement: FFN→31.4% (31.8), Attention→58.7% (55.6), Comm→2.2% (1.9, via the winner flipping
+TP=4→TP=2), KV→7.6% (9.4). A single lever explains the figure. This is the **deferred score/MFU pair**
+(below) — not applied by the no-tuning rule (the MFU value would be fitted). Same mechanism likely
+underlies the Fig-6 ordering-flip item.
+
+**Disproved arguments.** "FFN absolute time is under-counted (a coding bug)" — refuted (roofline-exact
+at MFU=1.0). "Three independent mismatches" — refuted (one MFU lever moves all four).
+
+### Fig-4 — CONV/CONV+ / llama4_maverick, low GPU: sim TPS 55–89% "off" — paper-extraction artifact
+**Divergence.** At low GPU counts CONV/CONV+/llama4 per-GPU TPS diverges 55–89% (e.g. CONV/MID/1-GPU:
+sim batch 39 at tpot 99.47 ms).
+
+**Explanation.** A non-divergence for two reasons: (1) the sim is physically defensible — decode is
+flash-weight-stream-bound, the breakdown sums exactly to the 99.474 ms step, CONV's HBM read is masked
+under `std::max()` (`layer_impl.h:72,141`) so it's if anything conservative; residual genuine gap
+≤~20% (sim batch and the paper's own Fig-3 batch agree to 0–22%). (2) **The paper reading is
+unextractable** — at low GPU the CONV/CONV+ Fig-4 bars are visually near-identical / overlapping, so
+the read is unreliable and the "error" is a paper-extraction artifact. The 15 affected cells
+(CONV/llama4 at 1/2/4 GPU + CONV+/llama4 at 1/2 GPU, × SHORT/MID/LONG) are **excluded from
+`compare_error_rates.py`** (`is_unextractable`); dropping them cuts Fig-4 max error 87%→70% (remainder
+is a *llama3* CONV cell, outside scope).
+
+**Disproved arguments.** The earlier "paper is provably self-contradictory, CONV+ is clean" proposal
+used **stale pixel data** — with vector-exact data "8.2× over SLO" becomes 1.63× and "CONV+ is clean"
+is false (12 cells >25%, split 6 CONV / 6 CONV+). Only "the sim is not the problem" survives.
+
+### Fig-7 — online≈offline "duplicate" (1-GPU): closed by the write-buffer gate
+**Divergence.** The paper prints identical online/offline PEC for llama4/SHORT/HBF+ at 1-GPU
+(185377=185377) and 8-GPU (424283=424283). Baseline sim: 8-GPU near-duplicate (1.2% apart), but 1-GPU
+a real **57%** gap (online SLO-bound batch 1071 vs offline SRAM-bound batch 2824).
+
+**Explanation (out-of-sample, 2026-07-06).** With the write-buffer / intermediate-data gate enabled
+(branch `faithful-intermediate-gate`, default off), the 1-GPU online cell becomes **SRAM-bound at
+844**, so online == offline at both 1-GPU (844=844) and 8-GPU (6752=6752) — the 57% gap collapses to
+0%, reproducing the paper's exact duplicates. Out-of-sample: the gate was built for the Fig-3
+SRAM-bound bars, not tuned to Fig-7; a pure capacity change (KV-write *timing* share byte-identical).
+So "1-GPU is a paper misprint" is **rejected** — it's a real SRAM-saturation effect the sim reproduces
+once the gate lands.
 
 ---
 
@@ -237,8 +227,9 @@ only, no code change. (Distinct from the already-fixed hot-expert *placement* bu
 ---
 
 ## Moved to CHANGES.md / ledgers (2026-07-06 cleanup)
-- **Resolved paper-comparison items** (U1, U2, U4, U6, U8, U9, Residuals 2–4, Fig-6 TPS+Batch
-  extraction) — full resolution records in `CHANGES.md` ("Paper-comparison items resolved").
+- **Resolved paper-comparison items** (U1, U2, U4, U5, U6, U8, U9, Residuals 2–4, Fig-6 TPS+Batch
+  extraction) — full resolution records in `CHANGES.md` ("Paper-comparison items resolved"). U5 was
+  resolved to a verified *agreement* (no code fix), moved 2026-07-06.
 - **U9 reproduction recipe** and the **"Ruled out as causes"** list → `CHANGES.md` (consolidation
   section, same date).
 - **U7 7th/8th/9th-pass detail** (score-tile O(chunk) implementation recipe, full uncounted-

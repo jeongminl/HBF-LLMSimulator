@@ -840,12 +840,28 @@ established practice of retaining superseded analysis with a pointer to the corr
 ## Paper-comparison items resolved (2026-07-03)
 
 Resolution records for the paper-comparison findings formerly tracked as open in
-`PAPER_INCONSISTENCIES.md` (U1, U2, U4, U8, U6). Each began as a discrepancy against Son et al.'s
-reported numbers and is now resolved by the correctness/objective fixes recorded as items 30-35
-above (plus items 21/24 for the older components). The technical mechanism of each fix lives in
-those items; this section records, per finding, the original inconsistency, the root cause(s), the
-fix references, and the final verified numbers. Multi-pass historical narratives were condensed
-away — only the final before/after evidence a future reader needs to trust the resolution is kept.
+`PAPER_INCONSISTENCIES.md` (U1, U2, U4, U6, U8 by code fixes; U5 by verified agreement, no fix
+needed). U1/U2/U4/U6/U8 each began as a discrepancy against Son et al.'s reported numbers and are now
+resolved by the correctness/objective fixes recorded as items 30-35 above (plus items 21/24 for the
+older components). The technical mechanism of each fix lives in those items; this section records,
+per finding, the original inconsistency, the root cause(s), the fix references, and the final
+verified numbers. Multi-pass historical narratives were condensed away — only the final before/after
+evidence a future reader needs to trust the resolution is kept.
+
+### U5 — "1-GPU HBF/HBF+ per-GPU batch > 8-GPU HBM4, in most cases" — resolved to AGREEMENT (no code change)
+
+**Original inconsistency:** a stale comparison table showed the sim missing the paper's claim that a
+1-GPU flash node beats an 8-GPU HBM4 node on per-GPU batch "in most cases."
+
+**Resolution (2026-07-06, moved here from PAPER_INCONSISTENCIES.md):** the current binary reproduces
+the paper's claim — **10 of 11** comparable cells show 1-GPU flash > 8-GPU HBM4, matching the paper's
+"in most cases" hedge. The single exception (llama3_405B/SHORT/HBF) is the **paper's own**: its 1-GPU
+HBF bar (171.5) sits below its 8-GPU HBM4 bar (194.0), and the sim reproduces that too. Mechanism =
+the weight-reread floor (`getLinearMemoryDuration` charges weight time `k·n·precision` with no batch
+factor, so flash's larger capacity lets a 1-GPU node hold more batch than an 8-GPU HBM4 node with
+replicated weights); a blind re-derivation matched it to **0.3%**. **No code fix was needed** — the
+item was a stale-table artifact; sim and paper agree, including on the one exception. Independently
+re-verified by the 2026-07-06 refuter panel (arithmetic reproduced exactly; paper quote verbatim).
 
 ### U1 — llama4_maverick's HBM4/8-GPU SHORT & MID batch anchors resolved
 
@@ -1605,7 +1621,7 @@ MB (maverick) / ~266 MB (llama3). Uncounted:
 | tensor | maverick | llama3 | status |
 |---|---|---|---|
 | LM-head logits (`batch × n_vocab/tp`) | 385 MB | 245 MB | gated against NO tier; sim materializes full tensor but a correct tiled LM head keeps only `batch × vocab_tile` (~4 KB/seq) resident — the FULL term must not be gated (vocab-scaling corrupts cross-model ratios) |
-| KV-write on-chip staging (`batch × 2·n_kv·head_dim × layers/stage`) | 187 MB | 492 MB | timed but zero byte reservation in main; = paper2 `P2_SRAM_KVWRITE_BYTES`; both papers describe it as an on-chip buffer (footnote-2 "overlap" is a LATENCY claim, orthogonal to capacity) so omitting the capacity is a genuine gap, NOT paper-conformant |
+| KV-write on-chip staging (`batch × 2·n_kv·head_dim × layers/stage`) | 187 MB | 492 MB | timed but zero byte reservation in main; = paper2 `P2_SRAM_KVWRITE_BYTES` (paper2 explicitly buffers KV on-chip and counts it). Paper1 says the write is "overlapped with computation" (footnote 2, a LATENCY claim) but does NOT state where the staging buffer sits or whether it shares the 320-MB intermediate SRAM — so charging it against that pool is a physically-reasonable MODELING CHOICE, evidenced by the A/B reproduction, not stated by paper1. |
 | TP all-reduce scratch (`batch × hidden`) | ~10 MB | ~31 MB | uncounted, all presets |
 | MoE per-expert dispatch input + extra GateOut | ~10 + ~16 MB | n/a | concurrent w/ expert FFN, uncounted |
 | Embedding output | ~10 MB | ~31 MB | uncounted, no charge |

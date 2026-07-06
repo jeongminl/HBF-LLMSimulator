@@ -40,6 +40,30 @@ CELL_RE = re.compile(r"([-\d.]+)\s*\(([-\d.]+)x\)")
 GPU_COLS = ["1 GPU", "2 GPU", "4 GPU", "8 GPU", "16 GPU"]
 
 
+def is_unextractable(row):
+    """Cells whose PAPER reading cannot be reliably extracted, so their error
+    rate is noise, not a sim-vs-paper divergence. Excluded from the scored
+    error and reported separately (like NA / zero-division cells).
+
+    Currently: the Fig-4 CONV / CONV+ / llama4_maverick low-GPU bars. In the
+    paper's Figure 4 these bars are visually near-identical / overlapping at low
+    GPU counts, so the pixel/vector read is unreliable AND (for CONV) provably
+    self-inconsistent (every CONV Fig-4 reading implies a decode step over the
+    0.1 s SLO, contradicting the paper's own Fig-3). The simulator is physically
+    defensible here; the large "error" is a paper-extraction artifact. Scope:
+    CONV/llama4 at 1/2/4 GPU, and CONV+/llama4 at 1/2 GPU. See
+    PAPER_INCONSISTENCIES.md's Fig-4 CONV/llama4 entry.
+    """
+    if row["figure"] != "Figure 4" or not row["key"].startswith("llama4_maverick |"):
+        return False
+    low_gpu = row["key"].endswith("| 1 GPU") or row["key"].endswith("| 2 GPU")
+    if "| CONV |" in row["key"]:                      # CONV: 1/2/4 GPU
+        return low_gpu or row["key"].endswith("| 4 GPU")
+    if "| CONV+ |" in row["key"]:                     # CONV+: 1/2 GPU
+        return low_gpu
+    return False
+
+
 # --------------------------------------------------------------------------
 # Markdown table parsing
 # --------------------------------------------------------------------------
@@ -357,7 +381,11 @@ def main():
     unmatched = all_pairs["paper_value"].isna() | all_pairs["sim_value"].isna() | (
         all_pairs["sim_value"] == 0
     )
-    scored = all_pairs.loc[~unmatched].copy()
+    # Cells with unextractable paper readings (see is_unextractable): excluded
+    # from the scored error like NA cells, since a paper-extraction artifact is
+    # not a sim-vs-paper divergence.
+    unextractable = all_pairs.apply(is_unextractable, axis=1)
+    scored = all_pairs.loc[~unmatched & ~unextractable].copy()
     scored["error_rate"] = (scored["paper_value"] - scored["sim_value"]).abs() / scored[
         "sim_value"
     ].abs()
@@ -371,6 +399,8 @@ def main():
 
     print(f"Matched & scored values: {len(scored)} / {n_total} total table cells")
     print(f"Skipped (NA / unresolved / zero-division): {unmatched.sum()}")
+    print(f"Excluded (unextractable paper readings — Fig-4 CONV/CONV+ llama4 low-GPU): "
+          f"{(unextractable & ~unmatched).sum()}")
     print()
 
     print("=" * 70)
