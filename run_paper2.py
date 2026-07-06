@@ -114,7 +114,16 @@ FIG5_BUDGETS = [2, 3]  # budget_node multiplier x -> "512GB"/device (x=2), "768G
 FIG5_DEVICES = ["NVLink5.0", "NVLink6.0", "HBF", "1/2-HBF"]
 FIG5_RATIO_LABEL = "1:3"
 FIG5_LOUT_RATIO = 0.75
-FIG5_CV, FIG5_KAPPA = 0.1, 90.0  # Fig5 doesn't state dispersion; low-dispersion assumed (documented)
+# Fig5 uses NO dispersion: paper2 Sec. VI-B says "...for each Lin and Lout
+# configuration, we use the average sequence length within a batch..." -- a
+# single deterministic (homogeneous) mean-length batch, unlike Fig4's stochastic
+# heterogeneous-request sweep (the only place the paper specifies CV/kappa).
+# cv=0 / kappa=0 trigger the sampler's exact deterministic path (scheduler.cpp:
+# deterministic_context / deterministic_ratio): every request is exactly the
+# mean context split at exactly mu_r. (Verified: vs the earlier low-dispersion
+# 0.1/90 assumption this shifts TPOT <1%, since CV=0.1 was already near-
+# deterministic -- but this matches the paper's stated method exactly.)
+FIG5_CV, FIG5_KAPPA = 0.0, 0.0
 
 SEARCH_ITER = 150
 DEFAULT_ITER = 1000  # fallback FINAL_ITER before smoke's decision is persisted

@@ -162,7 +162,16 @@ void Scheduler::sampleWorkloadLengths(int& input_len, int& output_len, bool size
   // even though neither realized CV is exactly the configured value.
   double lo = mu - trunc_sigmas * sigma;
   double hi = mu + trunc_sigmas * sigma;
-  std::normal_distribution<double> context_dist(mu, sigma);
+  // DETERMINISTIC (homogeneous) context when context_cv <= 0: every request in
+  // the batch is exactly the mean context mu. This is paper2 Fig.5's construction
+  // ("...we use the average sequence length within a batch..." -- Sec. VI-B),
+  // which, unlike Fig.4's stochastic heterogeneous-request lifetime sweep,
+  // specifies NO dispersion (no CV/kappa) and evaluates a single representative
+  // (mean) length. Skip the normal draw entirely (avoids a stddev==0
+  // distribution); construct context_dist with a placeholder stddev so it is
+  // never sampled in this mode.
+  bool deterministic_context = (sigma <= 0.0);
+  std::normal_distribution<double> context_dist(mu, deterministic_context ? 1.0 : sigma);
 
   // r = Lout / (Lin + Lout) = Lout / C, modeled as Beta(alpha, beta) via the
   // mean/concentration parametrization: alpha = mu_r*kappa, beta =
@@ -179,8 +188,14 @@ void Scheduler::sampleWorkloadLengths(int& input_len, int& output_len, bool size
   // Beta(alpha, beta) == g1/(g1+g2) for independent g1 ~ Gamma(alpha, 1),
   // g2 ~ Gamma(beta, 1) -- standard Gamma-ratio construction of the Beta
   // distribution.
-  std::gamma_distribution<double> gamma_a(alpha, 1.0);
-  std::gamma_distribution<double> gamma_b(beta, 1.0);
+  // DETERMINISTIC Lout ratio when lout_beta_kappa <= 0: every request splits at
+  // exactly r = mu_r (the mean Lout ratio). Same paper2 Fig.5 "average sequence
+  // length" construction as deterministic_context above -- together they yield a
+  // fully homogeneous batch. Placeholder gamma params when unused (alpha/beta
+  // would be 0 at kappa==0, which is not a valid gamma shape).
+  bool deterministic_ratio = (kappa <= 0.0);
+  std::gamma_distribution<double> gamma_a(deterministic_ratio ? 1.0 : alpha, 1.0);
+  std::gamma_distribution<double> gamma_b(deterministic_ratio ? 1.0 : beta, 1.0);
 
   // SIZE-BIASED mode (initial fill only, size_biased=true): under continuous
   // batching at steady state, the population of sequences in flight at a
@@ -209,16 +224,28 @@ void Scheduler::sampleWorkloadLengths(int& input_len, int& output_len, bool size
   double C = mu;
   double r = mu_r;
   while (true) {
-    do {
-      C = context_dist(workload_rng);
-    } while (C < lo || C > hi);
+    if (deterministic_context) {
+      C = mu;
+    } else {
+      do {
+        C = context_dist(workload_rng);
+      } while (C < lo || C > hi);
+    }
 
-    double g1 = gamma_a(workload_rng);
-    double g2 = gamma_b(workload_rng);
-    double denom = g1 + g2;
-    r = (denom > 0.0) ? (g1 / denom) : mu_r;
+    if (deterministic_ratio) {
+      r = mu_r;
+    } else {
+      double g1 = gamma_a(workload_rng);
+      double g2 = gamma_b(workload_rng);
+      double denom = g1 + g2;
+      r = (denom > 0.0) ? (g1 / denom) : mu_r;
+    }
 
     if (!size_biased) break;
+    // A fully deterministic (homogeneous) population has no length bias to
+    // correct -- every candidate is identical -- so accept immediately rather
+    // than spinning the size-biased rejection loop.
+    if (deterministic_context && deterministic_ratio) break;
     double lout_candidate = C * r;
     double accept_prob = (lout_max > 0.0) ? (lout_candidate / lout_max) : 1.0;
     if (accept_dist(workload_rng) <= accept_prob) break;
