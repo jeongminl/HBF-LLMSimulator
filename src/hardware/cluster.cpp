@@ -140,6 +140,18 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
       activation_size += (long long)kvWriteStagingBytes(
           device->model_config, batch_size_per_dp, ne_tp_dg, layers_per_stage);
     }
+
+    // FULL faithful paper-1 intermediate-data gate: add the complete resident
+    // intermediate set (footprint.h::intermediateExtrasBytes) on top of
+    // peakIntermediateBytes. Off by default. Independent of kv_write_sram_gate;
+    // mirrors the optimizer gate so the two never drift.
+    if (config.faithful_intermediate_gate) {
+      int pp = device->model_config.pp_dg > 0 ? device->model_config.pp_dg : 1;
+      int layers_per_stage = device->model_config.num_layers / pp;
+      if (layers_per_stage < 1) layers_per_stage = 1;
+      activation_size += (long long)intermediateExtrasBytes(
+          device->model_config, batch_size_per_dp, ne_tp_dg, layers_per_stage);
+    }
   }
   else{ // prefill mode & colocated system (mixed)
     if(device->model_config.use_absorb){
