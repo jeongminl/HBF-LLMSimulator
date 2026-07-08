@@ -9,6 +9,8 @@ __pycache__/
 config_temp.yaml
 run
 error_rates_detail.csv
+*.png
+*.json
 
 # Vendored C++ deps (fetched, not tracked)
 ext/
