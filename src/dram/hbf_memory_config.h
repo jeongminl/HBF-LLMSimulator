@@ -17,7 +17,8 @@ struct HBFMemoryConfig {
                   unsigned long long sram_per_stack_bytes = 0,
                   unsigned long long logic_sram_bytes = 0,
                   unsigned long long page_size_bytes = 4096,
-                  unsigned long long hbm_per_stack_bytes = 0)
+                  unsigned long long hbm_per_stack_bytes = 0,
+                  double logic_sram_bandwidth = 12.8e12)
       : num_hbm_stacks(num_hbm_stacks),
         num_flash_stacks(num_flash_stacks),
         total_capacity_bytes(total_capacity_bytes),
@@ -30,7 +31,8 @@ struct HBFMemoryConfig {
         sram_per_stack_bytes(sram_per_stack_bytes),
         logic_sram_bytes(logic_sram_bytes),
         page_size_bytes(page_size_bytes),
-        hbm_per_stack_bytes(hbm_per_stack_bytes) {}
+        hbm_per_stack_bytes(hbm_per_stack_bytes),
+        logic_sram_bandwidth(logic_sram_bandwidth) {}
 
   int num_hbm_stacks;
   int num_flash_stacks;
@@ -49,6 +51,12 @@ struct HBFMemoryConfig {
   // Used by checkCapacity() and the parallelism optimizer; absent from
   // total_capacity_bytes which tracks flash-pool capacity on HBF presets.
   unsigned long long hbm_per_stack_bytes;
+  // Logic-die SRAM / interconnect bandwidth; models the ~12.8 TB/s link that
+  // even SRAM-resident activation traffic traverses (= HBM4 bandwidth, so
+  // SRAM-tier traffic is charged the same per-byte cost as HBM regardless of
+  // tier). Read only on the num_hbm_stacks==0 (HBF+/CONV+) branch of the
+  // per-token activation memory-duration calculations.
+  double logic_sram_bandwidth;
 };
 
 // Preset 1: HBM4 (8 HBM stacks, 288 GB, 12.8 TB/s symmetric)

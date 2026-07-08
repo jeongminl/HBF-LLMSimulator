@@ -60,7 +60,12 @@ Tensor::Ptr LmHead::forward(const Tensor::Ptr input,
                                                  precision, total_memory_size, memory_bandwidth);
 
   // Compute time: 2 * m * k * n multiply-accumulates.
-  time_ns compute_time = (time_ns)(2.0 * m * (double)k * n / compute_peak_flops * 1e9);
+  // I5: derate by effectiveMFU, mirroring every other GEMM's compute_duration
+  // (linear_impl.cpp, activation_impl.cpp, attention_*_impl.cpp) -- LmHead was
+  // the sole GEMM using raw peak flops. mfu_max defaults to 1.0, so this is a
+  // no-op unless simulation.mfu_max is swept below 1.0.
+  time_ns compute_time = (time_ns)(2.0 * m * (double)k * n /
+                                    (compute_peak_flops * effectiveMFU(device->config, (double)m)) * 1e9);
 
   time_ns total_time = std::max(memory_time, compute_time);
 
@@ -72,6 +77,34 @@ Tensor::Ptr LmHead::forward(const Tensor::Ptr input,
     }
   }
   device->status.device_time += total_time;
+  // PP_FIX_SPEC.md §3.3: LmHead manipulates device_time directly (never goes
+  // through ExecStatus/set_pop_status), so it needs its own device_time_dep
+  // mirror. Same refined rule as Linear (linear_impl.cpp): compute_time is
+  // always fully batch-dependent (2*m*k*n, linear in m). memory_time is only
+  // uniformly one-or-the-other on the flash path (getLinearMemoryDuration's
+  // flash branch maxes two terms that are each already purely
+  // one-or-the-other); on the non-flash path memory_time is an ADDITIVE sum
+  // of a fixed weight-read term and an m-scaled activation term, so it must
+  // be split by byte fraction (exact, since duration is linear in bytes) --
+  // treating the whole thing as indep undercounts real linear scaling enough
+  // to blow the pp>1 reconstruction's +/-1% target (n_vocab/tp is often not
+  // overwhelmingly larger than the per-step activation at this op).
+  if (compute_time > memory_time) {
+    device->status.device_time_dep += total_time;
+  } else if (device->config.use_hbf && device->config.hbf_config.num_flash_stacks > 0) {
+    const auto& hbf = device->config.hbf_config;
+    hw_metric act_read_size = (hw_metric)m * k * precision;
+    hw_metric act_write_size = (hw_metric)m * n * precision;
+    double act_time = (hbf.num_hbm_stacks > 0)
+        ? (act_read_size + act_write_size) / hbf.hbm_read_bandwidth * 1e9
+        : (act_read_size + act_write_size) / hbf.logic_sram_bandwidth * 1e9;
+    if (act_time >= memory_time) device->status.device_time_dep += total_time;
+  } else {
+    hw_metric weight_bytes = (hw_metric)k * n * precision;
+    hw_metric act_bytes = total_memory_size - weight_bytes;
+    if (total_memory_size > 0)
+      device->status.device_time_dep += memory_time * (act_bytes / total_memory_size);
+  }
 
   return output;
 }

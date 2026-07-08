@@ -92,6 +92,7 @@ class BatchedSequence {
     for (int i = 0; i < num_expert; i++) {  // initialize
       local_num_token_in_expert.push_back(0);
       num_token_in_expert.push_back(0);
+      num_token_in_expert_micro.push_back(0);  // MOE_TAG_FIX_SPEC
     }
     cur_layer = 0;
   }
@@ -121,6 +122,7 @@ class BatchedSequence {
   int top_k;
   std::vector<int> local_num_token_in_expert;
   std::vector<int> num_token_in_expert;
+  std::vector<int> num_token_in_expert_micro;  // MOE_TAG_FIX_SPEC: first ceil(tokens/pp) tokens' activation
   std::vector<Sequence::Ptr> sequence;
   std::vector<int> seq_ids;
   Scheduler_ptr scheduler;

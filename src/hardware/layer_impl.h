@@ -61,13 +61,16 @@ inline time_ns getLinearMemoryDuration(const SystemConfig& config, double m, dou
 
     // Activations: input and output are on HBM or logic-die SRAM.
     // When num_hbm_stacks==0 (HBF+/CONV+), activations stage in logic-die SRAM
-    // (~320 MB total, fast) → modeled as free (act_time=0).
+    // (~320 MB total, fast) but still traverse the logic-die/interconnect link,
+    // so they're charged at logic_sram_bandwidth rather than for free.
     // act_read_size carries num_heads when input is not duplicated (to match act_write_size).
     hw_metric act_read_size = m * k * precision * (duplicated_input ? 1 : num_heads);
     hw_metric act_write_size = m * n * precision * num_heads;
-    double act_time = 0;
+    double act_time;
     if (hbf.num_hbm_stacks > 0) {
       act_time = (act_read_size + act_write_size) / hbf.hbm_read_bandwidth * 1e9;
+    } else {
+      act_time = (act_read_size + act_write_size) / hbf.logic_sram_bandwidth * 1e9;
     }
     return std::max(weight_read_time, act_time);
   } else {
@@ -134,9 +137,11 @@ inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric 
       kv_read_time = (kv_read_size / hbf.flash_read_bandwidth * 1e9) + exposed_latency_ns;
     }
 
-    double act_time = 0;
+    double act_time;
     if (hbf.num_hbm_stacks > 0) {
       act_time = act_size / hbf.hbm_read_bandwidth * 1e9;
+    } else {
+      act_time = act_size / hbf.logic_sram_bandwidth * 1e9;
     }
     return std::max(kv_read_time, act_time);
   }
@@ -173,7 +178,11 @@ inline time_ns getKVWriteDuration(const SystemConfig& config, int num_seq, int n
     if (compressed_kv) {
       kv_write_size = num_new_queries * (kv_lora_rank + qk_rope_head_dim) * effective_input_len * precision;
     } else {
-      kv_write_size = 2.0 * num_new_queries * num_kv_heads * head_dim * effective_input_len * precision;
+      // I12: add qk_rope to the K side, mirroring the KV-read path's
+      // n * (2*head_dim + qk_rope_head_dim) * num_heads term (attention_gen_impl.cpp) --
+      // the write side was omitting the RoPE component of the key. qk_rope_head_dim==0
+      // for every GQA model (paper-1), so this is a no-op there; live for MLA.
+      kv_write_size = num_new_queries * num_kv_heads * (2.0 * head_dim + qk_rope_head_dim) * effective_input_len * precision;
     }
     int amortize = (program_latency_amortize_calls > 0) ? program_latency_amortize_calls : 1;
     double write_time = (kv_write_size / hbf.flash_write_bandwidth * 1e9) +

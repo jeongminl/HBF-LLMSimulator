@@ -303,6 +303,17 @@ int main(int argc, char *argv[]) {
         config["simulation"]["latency_margin"].as<double>();
   }
 
+  // PP_FLAGS_SPEC §1.2: guarded so a yaml that omits a key keeps the true default.
+  if (config["simulation"]["pp_pipelined_timing"])
+    system_config.pp_pipelined_timing =
+        config["simulation"]["pp_pipelined_timing"].as<bool>();
+  if (config["simulation"]["pp_internode_only"])
+    system_config.pp_internode_only =
+        config["simulation"]["pp_internode_only"].as<bool>();
+  if (config["simulation"]["kv_write_softmax_hide"])
+    system_config.kv_write_softmax_hide =
+        config["simulation"]["kv_write_softmax_hide"].as<bool>();
+
   // Compute-utilization (MFU) derating -- see SystemConfig::mfu_max/mfu_m_half
   // (hardware_config.h) for the model. Both optional; defaults (1.0 / 0.0) are
   // an exact no-op matching pre-existing (100%-peak) behavior.

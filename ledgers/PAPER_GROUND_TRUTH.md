@@ -102,6 +102,20 @@ GPU-memory capacity, and on-die SRAM limits (in HBF+ and CONV+), by combining da
 pipeline, and expert parallelism." → search DP×TP×PP×EP, maximize throughput s.t. {SLO, capacity,
 SRAM}.
 
+### MoE parallelism semantics (confirmed vs CB1 reference, 2026-07-08)
+
+The authors' model uses **no orthogonal expert-parallel degree**. Expert parallelism =
+`(ne_tp·dp)/e_tp` **by construction**; `dp` is derived from the device count, never specified.
+Routed-expert weight per device = `num_routed·e_tp/(ne_tp·dp)` — **`dp` reduces per-device expert
+weight** (so e.g. `tp1/dp8` is an 8-way expert-parallel placement, 16 of 128 experts/device). The
+expert all-to-all **pools tokens across `dp` replicas** onto disjoint expert owners. Asymmetry:
+**routed** experts absorb `dp` (above), but **shared** experts and the `e_tp` tensor-shard stay
+**within a replica** (`non_moe_device_list`, `use_dp=true`). This fork matches the authors' reference
+tool **CB1 (`LLMSimulator_HBF`) exactly** — verified `expert.cpp:42,50-51`, `decoder.cpp:137-139`,
+`parallelism_optimizer.cpp:174` (all unmodified EP-across-DP). The alternative "dp = pure
+replication" model (`MOE_DP_FIX_SPEC.md`, Model A) was rejected as a *divergence* from the reference,
+not applied.
+
 ### Four assumptions
 1. "we focus on decode nodes in disaggregated prefill-decode execution, as the prefill phase is
    inherently compute-bound and thus benefits little from HBF's large capacity."

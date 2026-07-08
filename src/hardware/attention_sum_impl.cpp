@@ -903,6 +903,13 @@ ExecStatus MultiLatentAttentionSumExecutionGPU(Device_Ptr device,
   else{
     // Scoring //
     int num_seq = seq_list.size();
+    // I15: same aggregate-then-call-once flash-read pattern as GQA-Sum's
+    // Scoring/Context loops (AttentionSumExecutionGPU above) -- MLA-Sum was
+    // reading KV at plain HBM bandwidth unconditionally, even under HBF/HBF+
+    // presets. GQA cells are unaffected (MLA-only code path).
+    time_ns accumul_compute_duration = 0;
+    hw_metric total_kv_read_size = 0;
+    hw_metric total_act_size = 0;
     for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
       time_ns compute_duration = 0;
       time_ns memory_duration = 0;
@@ -922,7 +929,15 @@ ExecStatus MultiLatentAttentionSumExecutionGPU(Device_Ptr device,
       total_memory_size += memory_size;
 
       compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
-      memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+      // kv_read_size = k*n*heads (the key/value cache read for scoring);
+      // act_size = (query + output score) = (m*k*heads + m*n*heads).
+      if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+        total_kv_read_size += (hw_metric)k * n * num_heads * input->precision_byte;
+        total_act_size += (hw_metric)(m * k * num_heads + m * n * num_heads) * input->precision_byte;
+        accumul_compute_duration += compute_duration;
+      } else {
+        memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+      }
 
       if (use_ramulator) {
         time_ns accumul_memory_duration = 0;
@@ -991,7 +1006,14 @@ ExecStatus MultiLatentAttentionSumExecutionGPU(Device_Ptr device,
             getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kWrite, input);
         exec_status += temp;
       }
-      exec_status.total_duration += std::max(compute_duration, memory_duration);
+      bool defer_to_chunk_aggregate = config.use_hbf && config.hbf_config.num_flash_stacks > 0 && !use_ramulator;
+      if (!defer_to_chunk_aggregate) {
+        exec_status.total_duration += std::max(compute_duration, memory_duration);
+      }
+    }
+    if (config.use_hbf && config.hbf_config.num_flash_stacks > 0 && !use_ramulator) {
+      time_ns accumul_memory_duration = getAttentionMemoryDuration(config, total_kv_read_size, total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size);
+      exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
     }
 
     // Softmax + Scale + Mask //
@@ -1059,6 +1081,11 @@ ExecStatus MultiLatentAttentionSumExecutionGPU(Device_Ptr device,
     }
 
     // Context //
+    // I15: same aggregate-then-call-once flash-read pattern as GQA-Sum's
+    // Context loop (see above).
+    time_ns context_accumul_compute_duration = 0;
+    hw_metric context_total_kv_read_size = 0;
+    hw_metric context_total_act_size = 0;
     for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
       time_ns compute_duration = 0;
       time_ns memory_duration = 0;
@@ -1076,11 +1103,19 @@ ExecStatus MultiLatentAttentionSumExecutionGPU(Device_Ptr device,
                     (1.0 * m * k * num_heads + 1.0 * k * n * num_heads +
                     1.0 * m * n * num_heads) *
                     input->precision_byte;
-      
+
       total_memory_size += memory_size;
 
       compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
-      memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+      // kv_read_size = V-cache(k*n*heads); act_size = score read(m*k*heads) + output write(m*n*heads)
+      // (mirrors GQA-Sum's Context split: kv_read is the KV-cache term only).
+      if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+        context_total_kv_read_size += (hw_metric)(k * n * num_heads) * input->precision_byte;
+        context_total_act_size += (hw_metric)(m * k * num_heads + m * n * num_heads) * input->precision_byte;
+        context_accumul_compute_duration += compute_duration;
+      } else {
+        memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+      }
 
       if (use_ramulator) {
         time_ns accumul_memory_duration = 0;
@@ -1150,7 +1185,14 @@ ExecStatus MultiLatentAttentionSumExecutionGPU(Device_Ptr device,
             getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kWrite, input);
         exec_status += temp;
       }
-      exec_status.total_duration += std::max(compute_duration, memory_duration);
+      bool context_defer_to_chunk_aggregate = config.use_hbf && config.hbf_config.num_flash_stacks > 0 && !use_ramulator;
+      if (!context_defer_to_chunk_aggregate) {
+        exec_status.total_duration += std::max(compute_duration, memory_duration);
+      }
+    }
+    if (config.use_hbf && config.hbf_config.num_flash_stacks > 0 && !use_ramulator) {
+      time_ns context_accumul_memory_duration = getAttentionMemoryDuration(config, context_total_kv_read_size, context_total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size);
+      exec_status.total_duration += std::max(context_accumul_compute_duration, context_accumul_memory_duration);
     }
   }
 

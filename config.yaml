@@ -22,6 +22,10 @@ simulation:
   skewness: 0.8
   validate_optimizer: warn
   validate_optimizer_threshold: 0.1
+  # PP_FLAGS_SPEC — pipeline-parallel modeling switches (default true = shipping).
+  pp_pipelined_timing: true      # false: correctly-serialized 2S pp timing (A/B study)
+  pp_internode_only: true        # false: also search intra-node pp>1 candidates
+  kv_write_softmax_hide: true     # false: softmax compute excluded from KV-write overlap
 system:
   chunk_size: 0
   distribution:

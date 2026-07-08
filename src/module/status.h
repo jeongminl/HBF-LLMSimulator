@@ -17,6 +17,16 @@ struct ExecStatus {
   time_ns compute_duration = 0.0;
   time_ns memory_duration = 0.0;
   time_ns kv_write_duration = 0.0;  // track unhidden KV write duration separately
+  // PP_FIX_SPEC.md §3.1/3.3: portion of total_duration that scales with the
+  // op's num_process_token (batch). Tagged per-op in linear_impl.cpp,
+  // activation_impl.cpp, attention_gen_impl.cpp (see each file's comment for
+  // its rule); comm modules (AllReduce/MoEScatter-Gather/PipelineStage) leave
+  // this at its default 0 -- their volume-proportional time is handled
+  // separately by the pp>1 reconstruction's explicit hop term (cluster.cpp).
+  // Untagged ops default to 0 (treated as batch-independent), which is safe:
+  // pp==1 never reads this field (cluster.cpp gates the reconstruction on
+  // pp>1), so mis-tagging cannot regress the pp==1 path.
+  time_ns batch_dependent_duration = 0.0;
 
   hw_metric flops = 0.0;
   hw_metric memory_size = 0.0;
@@ -44,6 +54,7 @@ struct ExecStatus {
   ExecStatus& operator+=(const ExecStatus& rhs) {
     memory_duration += rhs.memory_duration;
     kv_write_duration += rhs.kv_write_duration;
+    batch_dependent_duration += rhs.batch_dependent_duration;
     generic_read_cmd += rhs.generic_read_cmd;
     generic_write_cmd += rhs.generic_write_cmd;
     compute_pim_cmd += rhs.compute_pim_cmd;
@@ -68,6 +79,22 @@ class StatusBoard {
 
   // accumulate
   time_ns device_time = 0;
+  // PP_FIX_SPEC.md §3.1/3.2: batch-dependent portion of device_time, mirrored
+  // in lock-step with device_time by TopModuleGraph::set_pop_status
+  // (module_graph.cpp). Read by the pp>1 reconstruction (cluster.cpp) to
+  // split each pipeline stage's clock into W (batch-independent, summed once
+  // per stage) and K*B (batch-dependent, summed then divided by pp) --
+  // pp==1 never reads this field.
+  time_ns device_time_dep = 0;
+  // PP_FIX_SPEC.md §3.4/§3.5: the actual per-iteration comm_time a
+  // PipelineStage module added to ITS OWN device (communication.cpp:558),
+  // separate from device_time so the pp>1 reconstruction can net it back out
+  // of that stage's clock before splitting into indep/dep (it is neither
+  // batch-independent stage work nor batch-dependent stage work -- it is the
+  // physical inter-stage hop, added back exactly once per non-last stage by
+  // the reconstruction). 0 for the last stage (no PipelineStage module) and
+  // always 0 when pp==1 (module is never constructed, see llm.cpp:68).
+  time_ns pipeline_hop_time = 0;
 
   time_ns high_time = 0;  // time of GPU
   time_ns low_time = 0;   // time of PIM

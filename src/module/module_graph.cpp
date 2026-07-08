@@ -76,15 +76,29 @@ void ModuleGraph::sync_devices() {
     if (!input->timeboard_synced) {
       Device::Ptr device;
       time_ns time = 0;
+      // PP_FIX_SPEC.md §3.2: device_time_dep must be broadcast in lockstep
+      // with device_time, or a TP-peer whose device_time gets bumped up to
+      // another peer's (because the round-robin device scheduler ran it
+      // behind) keeps its OWN stale device_time_dep -- corrupting the
+      // (device_time - device_time_dep) indep/dep split the pp>1
+      // reconstruction (cluster.cpp) reads back out. Track and broadcast the
+      // (time, time_dep) PAIR from whichever device carries the max time
+      // (not an independent max of each field), since dep is only meaningful
+      // as a component of ITS OWN device's time.
+      time_ns time_dep = 0;
       for (Tensor::Ptr tensor : dependency_tensor_list) {
         device = tensor->get_device();
         time_ns device_time = device->get_time();
-        time = std::max(time, device_time);
+        if (device_time >= time) {
+          time = device_time;
+          time_dep = device->get_time_dep();
+        }
       }
       for (Tensor::Ptr tensor : dependency_tensor_list) {
         tensor->timeboard_synced = true;
         device = tensor->get_device();
         device->set_time(time);
+        device->set_time_dep(time_dep);
       }
       input->timeboard_synced = false;
     } else {
@@ -219,6 +233,16 @@ void TopModuleGraph::set_pop_status() {
   status.kv_write_time += exec_status.kv_write_duration;
 
   if (status.parallel_execution) {
+    // PP_FIX_SPEC.md §3.2: no device_time_dep mirror on this branch --
+    // device->config.parallel_execution is hardcoded false in every
+    // SystemConfig hardware preset (hardware_config.h: A100/H100/B100/B200/
+    // Rubin), so status.parallel_execution can never become true (it only
+    // derives from tensor->parallel_execution, itself only ever set by
+    // Tensor::setPerformHigh/Low, all of which are gated behind
+    // device->config.parallel_execution or an already-true predecessor
+    // tensor). This branch is unreachable in the current build; if the
+    // feature is ever enabled, low_time/high_time would need matching
+    // low_time_dep/high_time_dep accumulators added here.
     if (exec_status.processor_type == ProcessorType::LOGIC ||
         exec_status.processor_type == ProcessorType::PIM) {
       status.low_time += exec_status.total_duration;
@@ -229,6 +253,8 @@ void TopModuleGraph::set_pop_status() {
     }
   } else {
     status.device_time += exec_status.total_duration;
+    // PP_FIX_SPEC.md §3.2: mirror the batch-dependent portion in lock-step.
+    status.device_time_dep += exec_status.batch_dependent_duration;
   }
 
   if (exec_status.processor_type == ProcessorType::PIM ||

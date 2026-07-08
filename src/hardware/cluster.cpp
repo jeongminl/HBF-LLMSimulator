@@ -34,6 +34,56 @@ time_ns Cluster::maxDeviceTime() {
   return max_time;
 }
 
+time_ns Cluster::reportedIterationTime() {
+  int pp = (scheduler->model_config.pp_dg > 0) ? scheduler->model_config.pp_dg : 1;
+  if (pp <= 1) {
+    // pp==1: UNCHANGED -- byte-identical to the pre-fix path (PP_FIX_SPEC.md
+    // §6 hazard: reconstruction must be gated pp>1, never alter pp==1).
+    return maxDeviceTime();
+  }
+
+  // pp>1: reconstruct reported = full_model(B/pp) + (pp-1)*hop
+  //     = Sigma_stages indep_s + (Sigma_stages dep_s)/pp + Sigma_stages hop_s
+  // (PP_FIX_SPEC.md §2.4/§3.5). Device layout (LLM::LLM, llm.cpp): rank =
+  // d*(tp*pp) + s*tp + tp_rank, so the first tp-peer of stage s in dp-replica
+  // d is at rank d*(tp*pp) + s*tp; tp-peers are AR-synced every layer so any
+  // one of them is representative of that stage's clock.
+  int tp = (scheduler->model_config.ne_tp_dg > 0) ? scheduler->model_config.ne_tp_dg : 1;
+  int dp = (tp * pp > 0) ? num_total_device / (tp * pp) : 1;
+
+  time_ns best = 0;
+  for (int d = 0; d < dp; d++) {
+    time_ns indep_sum = 0, dep_sum = 0, hop_sum = 0;
+    for (int s = 0; s < pp; s++) {
+      int rep = d * (tp * pp) + s * tp;
+      const StatusBoard& st = get_device(rep)->status;
+      // own_hop: the ACTUAL comm_time this stage's own PipelineStage module
+      // added to its own device_time (communication.cpp:558/pipeline_hop_time
+      // mirror) -- 0 on the last stage, which has no PipelineStage module
+      // (llm.cpp:68). Netting this back out of device_time before splitting
+      // into indep/dep and re-adding the exact same per-stage hop values once
+      // via hop_sum is what keeps the total hop contribution at exactly
+      // (pp-1) hops (not 0, not 2*(pp-1)) -- see PP_FIX_SPEC.md §3.5's note.
+      time_ns own_hop = st.pipeline_hop_time;
+      dep_sum   += st.device_time_dep;
+      indep_sum += (st.device_time - own_hop) - st.device_time_dep;
+      hop_sum   += own_hop;
+    }
+    // PP_FLAGS_SPEC §2.1: gate ONLY the /pp. Part A (own_hop netting above, the
+    // double-count removal) stays unconditional -- no flag may resurrect the 3S
+    // over-count bug. When pp_pipelined_timing=false this reduces to
+    // indep_sum + dep_sum + hop_sum = Sigma_s device_time_s (each stage's own
+    // full-B clock) plus the (pp-1) real hops -- the "correctly-serialized 2S"
+    // model requested by the user ruling (GATE-2), still double-count-free.
+    time_ns dep_term = config.pp_pipelined_timing
+                          ? dep_sum / pp   // microbatch (Part B): full_model(B/pp)
+                          : dep_sum;       // correctly-serialized 2S: full_model(B) per stage
+    time_ns candidate = indep_sum + dep_term + hop_sum;
+    best = std::max(best, candidate);
+  }
+  return best;
+}
+
 void Cluster::add_module(int device_rank, std::string name,
                          Module::Ptr module) {
   auto &module_map_ = module_map.at(device_rank);
@@ -608,11 +658,13 @@ std::vector<Stat> Cluster::runIterationMixed(int iter, std::ofstream &csv) {
 
     auto metadata = scheduler->setMetadata();
     run(metadata);
-    // maxDeviceTime(), not get_device(0): with pipeline parallelism, only the
-    // slowest-finishing device's status.device_time reflects the true, fully
-    // propagated per-token latency across all pp stages -- see maxDeviceTime()'s
-    // doc comment (cluster.h) and PipelineStage::forward (communication.cpp).
-    time_ns time = maxDeviceTime();
+    // reportedIterationTime(), not maxDeviceTime()/get_device(0): with
+    // pipeline parallelism (pp>1) the per-token latency is reconstructed from
+    // each stage's own clock rather than read off any single device's
+    // maxDeviceTime() -- see reportedIterationTime()'s doc comment
+    // (cluster.h), PP_FIX_SPEC.md, and PipelineStage::forward
+    // (communication.cpp). Reduces to maxDeviceTime() exactly when pp==1.
+    time_ns time = reportedIterationTime();
 
     // if no reqeusts, add time
     // INVARIANT: unreachable in the decode/steady-state harness path this cell
@@ -717,9 +769,10 @@ std::vector<Stat> Cluster::runIterationSumGenSplit(int iter,
 
     auto metadata = scheduler->setMetadata();
     run(metadata);
-    // maxDeviceTime(), not get_device(0) -- see the identical comment in
-    // runIterationMixed above / maxDeviceTime()'s doc comment in cluster.h.
-    time_ns time = maxDeviceTime();
+    // reportedIterationTime(), not maxDeviceTime()/get_device(0) -- see the
+    // identical comment in runIterationMixed above / reportedIterationTime()'s
+    // doc comment in cluster.h.
+    time_ns time = reportedIterationTime();
 
     // if no reqeusts, add time
     // INVARIANT: unreachable in the decode/steady-state harness path this cell
@@ -859,11 +912,12 @@ void Cluster::exportGantt(std::string gantt_file_path) {
   }
 }
 void Cluster::setStat(Stat &stat) {
-  // maxDeviceTime(), not get_device(0) -- see cluster.h's doc comment. Kept as
-  // an independent read (mirroring the caller's own maxDeviceTime() call) since
-  // this function only ever reads device_time right after the same run(), so
-  // the two calls agree exactly.
-  time_ns time = maxDeviceTime();
+  // reportedIterationTime(), not maxDeviceTime()/get_device(0) -- see
+  // cluster.h's doc comment. Kept as an independent read (mirroring the
+  // caller's own reportedIterationTime() call) since this function only ever
+  // reads device_time right after the same run(), so the two calls agree
+  // exactly.
+  time_ns time = reportedIterationTime();
 
   stat.batchsize = scheduler->getBatchSize();
   stat.average_seq_len = scheduler->getAverageSeqlen();

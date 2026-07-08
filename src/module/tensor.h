@@ -37,7 +37,14 @@ class Tensor : public std::enable_shared_from_this<Tensor> {
 
   // for MoE layers
   bool perform_with_optimal;
-  
+
+  // MOE_TAG_FIX_SPEC: set true by Route::forward on a routed-expert input tensor
+  // iff the expert is activated at full batch B but receives zero tokens in the
+  // first B/pp (microbatch); propagated input->output by linearCore/activationCore
+  // so every op in that expert's FFN chain is zeroed by the pp>1 reconstruction.
+  // Default false => no effect on any non-expert op or when pp==1.
+  bool cold_at_micro = false;
+
   // for parallel execution
   bool parallel_execution;
   bool perform_at_high;

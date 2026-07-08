@@ -189,6 +189,12 @@ class SystemConfig {
   // Parsed from config.yaml: system.chunk_size.
   int chunk_size = 0;
 
+  // PP_FLAGS_SPEC. All default true (shipping behavior). Parsed from
+  // config.yaml simulation section by eval/test.cpp.
+  bool pp_pipelined_timing = true;   // false => correctly-serialized 2S (no /pp)
+  bool pp_internode_only   = true;   // false => enumerate all pp>1 (intra-node too)
+  bool kv_write_softmax_hide = true; // false => softmax compute not in KV-write hide budget
+
   // Length of the per-iteration consecutive weight-read stream on one device
   // (count of linear weight tensors read back-to-back from flash each decode
   // step). getLinearMemoryDuration divides the flash page-read PIPELINE-FILL

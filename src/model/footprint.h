@@ -262,7 +262,21 @@ inline double peakIntermediateBytes(const ModelConfig& model,
     ffn_total += batch_per_dp * hidden_dim * precision;
   }
 
-  return std::max(attn_total, ffn_total);
+  // Out-of-place residual instant: residual_1 (x0+attn) and residual_2 (x1+ffn)
+  // each hold 3 hidden-wide tensors live at once (incoming residual + block
+  // output + new result buffer) when the residual add is NOT done in place.
+  // Distinct instant from the FFN up-proj peak; for dense (inter >> hidden) it
+  // is dominated by ffn_total, but for small-per-device-intermediate MoE it can
+  // become the peak. Confirmed 3H even for shared-expert MoE, not 4H: per
+  // MoEDecoder::forward (decoder.cpp) and ExpertFFN::forward (expert.cpp), the
+  // shared expert consumes post_attn_ln_out (c) internally -- c's last use is
+  // inside expert_ffn's forward, which fully returns (producing `result`)
+  // BEFORE residual_2 runs on `result`. So c is already dead by the residual_2
+  // instant; only res_1_out (x1), the FFN output, and the new result buffer are
+  // concurrently live then, same as the dense case.
+  double residual_oop = 3.0 * batch_per_dp * hidden_dim * precision;
+
+  return std::max({attn_total, ffn_total, residual_oop});
 }
 
 // DIAGNOSTIC ONLY -- never gates capacity or batch. Paper-style "score-inclusive"
@@ -323,9 +337,14 @@ inline double kvWriteStagingBytes(const ModelConfig& model,
                                   double batch_per_gpu,
                                   int tp,
                                   double layers_per_stage) {
+  // I12: add qk_rope to the K side, keeping this in lockstep with
+  // getKVWriteDuration's non-compressed branch (layer_impl.h) so the timing
+  // and staging-capacity formulas price the same bytes. qk_rope_head_dim==0
+  // for every GQA model (paper-1) -- no-op there; live for MLA.
   double per_layer_token = model.compressed_kv
       ? (double)(model.kv_lora_rank + model.qk_rope_head_dim) * model.precision_byte
-      : 2.0 * ((double)model.num_kv_heads / (double)tp) * model.head_dim * model.precision_byte;
+      : ((double)model.num_kv_heads / (double)tp) *
+            (2.0 * model.head_dim + model.qk_rope_head_dim) * model.precision_byte;
   return batch_per_gpu * per_layer_token * layers_per_stage;
 }
 

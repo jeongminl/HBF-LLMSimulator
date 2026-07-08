@@ -1,3 +1,106 @@
+# Findings register — Paper-1 bug-hunt campaign (2026-07-07)
+
+Protocol: 5 parallel Opus hunt tracks (A fig4-short-hbf/MFU, B 16-GPU PP serialization, C fig6-slo +
+CONV-llama3 + U7 refresh, D fig7-pec chain, E fresh-bugs sweep) + Sonnet refuters (Refuter A on the
+MFU grid, Refuter B on PP) + orchestrator adjudication, all confined to worktree
+`bughunt-paper1-campaign` @ c2afcf8 (post intermediate-data-gate merge). Full findings + every
+reproduction script: `FINDINGS_REPORT.md`; hunt-by-hunt narrative: `CAMPAIGN_NOTES.md`. **No source
+files were modified by this pass** — the two proposed code fixes below are tracked as `BUGS.md` items
+19-20 pending review/fix; doc updates landed in `PAPER_INCONSISTENCIES.md` and `BUGS.md`.
+
+## Executive summary (verdicts)
+- **PP runtime 3× stage over-count** — NEW BUG, CONFIRMED byte/ratio-exact (measured/stage
+  2.999/3.005/3.009/3.014/3.017 at batch 16/64/128/256/400, `huntB_disc.py`). Root cause: item-35's
+  `max()`→`+=` flip compounds through `sync_devices()`'s max-broadcast on every tp≥2 stage. FIX IN
+  PROGRESS (`BUGS.md` #19).
+- **PP decode model (serialized vs pipelined)** — Methodology deviation, CONFIRMED: the faithful
+  pipelined model (period `W+K·B/pp`) reproduces the paper's entire 16-GPU Fig-3/Fig-4 growth (MID
+  80.3/GPU, 2011 TPS vs paper 74.9/1906.8; LONG 4.75/GPU vs paper 4.6; SHORT near-tie, flat like the
+  paper). Correct-serialized (2S) alone reproduces none of the growth. Pairs with the item above
+  (`huntB_wk.py`, `huntB_verdict.py`).
+- **Optimizer stale `e_tp_dg`** — NEW BUG, CONFIRMED byte-exact (43.51 MB over-charge at ep2, analytic
+  cap 3027 vs true 3476, `huntE_analytic.py`/`huntE_pin.py`). Also the dominant PEC offline-sweep cost
+  driver (~82% of maverick multi-GPU ep>1 probe-walk cost). FIX IN PROGRESS (`BUGS.md` #20).
+- **Fig-4 plain-HBF/llama3/SHORT +25.3%** — Explained: MFU=1.0 crossover mechanism (crossover-MFU
+  0.23 @1-GPU vs 0.86 @multi-GPU; mfu 0.45 → 253.5/GPU vs paper 253.0). Deferred/report-only — the
+  refuter pass surfaced a genuine dp1→dp2 winner flip plus an MFU/Rubin-FLOPs degeneracy
+  (`huntA_mfu_probe.py`, `refA_probe.py`).
+- **Fig-6 0.05s SLO ordering flip** — Explained: paper-internal. HBF SLO-bound (KV-read 71% of
+  tpot), HBM4 capacity-bound with 46% SLO headroom (immune to latency levers); MFU refuted as a lever
+  (widens HBF's lead, 1.0485→1.0712); sole lever = the paper's own 11.2 TB/s flash-BW spec, ~6-9%
+  below which flips the ordering (`huntC_boundary.py`, `huntC_mfu.py`).
+- **Fig-7 PEC errors** — Explained: chain clean, errors fully inherited. Zero-free-parameter identity
+  closes to 0.0% on 11/12 cells; the paper's own PEC = K_sim × the paper's own TPS to within
+  −2.3%…+1.0%. Opposite GPU trends (llama3 grows 19.5%→60.5%, llama4 shrinks 16.7%→10.5%) solved by
+  the paper's own Fig-4 TPS-saturation-vs-scaling shape (`huntD2_decomp2.py`).
+- **Fig-5 16-GPU comm-share drop** — Still OPEN (narrowed). The PP fix alone keeps ~14.5% share
+  (TP-AllReduce sits on each stage's own critical path); tp4/pp2/dp2 has the right comm share
+  (~6-7%) but is capacity-flat/never selected; MFU 0.5 is too weak (needs tpot ×1.93, delivers
+  ×1.08). Candidate: microbatch comm/compute overlap (~50% AR hiding ⇒ ~7.2% ≈ paper's 7.5%) —
+  untestable until the pipelined-PP fix lands (`huntB_mfumatrix.py`, `huntB_rank.py`).
+- **U7 HBF+ absolute offset** — Explained: config-dependent scatter, now sign-inconsistent (llama3
+  +14.7/+6.4/+6.4%, llama4 +10.1/+10.1/−4.6%; ratios 2.26/2.43/2.11 bracketing the paper's 2.35); no
+  additive per-seq term closes all six cells. Variant sweep: KV double-buffer over-corrects ~30%
+  below; LM full-row is physically wrong and breaks the ratio; a fit-chosen ~32k vocab-chunk lands
+  both but still fails llama4-16g (`huntC_u7_task1.py`, `huntC_u7_gate.py`).
+- **llama3 SHORT CONV/CONV+** — Explained: paper-side. The paper's own Fig3÷Fig4 arithmetic implies
+  tpot over its own 0.1s SLO in every cell (up to 0.1278s); CONV batch matches ±2% so the TPS gap is
+  exactly the paper's own overshoot; not a U7-class issue (SRAM ceilings 673/434 ≫ operating batch).
+  Folded into the existing Fig-4 CONV item (`huntC_conv_task1.py`).
+- **PEC offline-sweep cost** — 4 accepted measures: dedup 8 LONG-offline cells + 6 more
+  `sens_baseline` duplicates; the `e_tp_dg` fix (same bug as above); on-disk memoization of
+  `run_simulation`; 2 risk-flagged C++ opts (deferred, byte-identical-only). `iter=10` reduction was
+  rejected (not provably result-preserving).
+- **Misc small findings** — `classify_failure` "flash"-label conflation (cosmetic); CHANGES#61 doc
+  gap (sum/MLA paths still effectively `fill_amortize=1`, dormant for paper1); `attention_sum_impl.cpp`
+  memory_util divisor drift (print-only). Tracked as `BUGS.md` items 21-23.
+- **Repo hazard** — the `ramulator2` submodule's HBF/PIM integration exists only as uncommitted local
+  modifications in the main checkout (~40 modified + 4 untracked files); a fresh clone cannot build.
+  Commit/vendor decision needed from the user (process note, not a paper-comparison finding).
+
+## Refuter outcomes
+- **Refuter A (MFU grid attack on Fig-4/Residual-1) — PARTIALLY SURVIVED.** The orchestrator first
+  corrected an input-contamination bug in its own feed to the refuter: wrong paper TPS/batch values
+  had been supplied for cells c2/c4/c5/c6 (true vector readings: llama4/HBM4/SHORT TPS=19000, sim
+  error 1.4% not the originally-claimed 77%; llama3/HBF/MID batch 146.2/TPS 1494.1, sim 11.0%/9.0%
+  not 58%/35%; llama3/HBF/LONG 15.9/159.1; llama4/HBF+/SHORT TPS=18592.8, sim error 11.5% not 65%) —
+  the refuter's aggregate "62-77% pre-existing TPS bugs" claim was entirely an artifact of these bad
+  inputs, not a real finding. On the corrected grid, global `mfu_max=0.5` improves 6/9 probe metrics
+  (including landing llama4/HBM4/SHORT batch exactly on the paper's 460 anchor) but genuinely
+  WORSENS c1 (llama3/HBM4/SHORT batch error 1.9%→92.1%, winner flips dp1→dp2: forced dp1's true
+  ceiling TPS 2735 < dp2's 3149 at mfu 0.5) — confirmed a real, verified property of the lever (not a
+  search artifact) via a full-compute-seed_tps-as-upper-bound pruning audit. Surviving refutation
+  points: the c1 winner-flip (genuine global-application hazard), the mfu_max/Rubin-peak-FLOPs
+  degeneracy (same free parameter, two names), and the 253/267 exact-match being one sub-problem
+  dp-replicated rather than an independent confirmation. Disposition: the MFU=1.0 mechanism is
+  CONFIRMED; the fix stays DEFERRED/report-only (`refA_probe.py`, `refA_mfu045.py`).
+- **Refuter B (PP serialization attack) — REFUTED, and its own key measurement traced to the same
+  artifact it was attacking.** Refuter B first verified Hunt B's anchors exactly, then attacked with a
+  half-batch-trick emulation of faithful pp2, measuring tpot 59.05ms @B'=625.5 (vs Hunt B's algebraic
+  prediction of 39.1ms) — claiming the fix changes nothing, since fixed-pp2 still loses to dp2
+  everywhere and MID's 62.88-vs-74.9 gap stays unexplained. The orchestrator then showed that ALL
+  serialized pp2 measurements — including the refuter's own 59.05ms — decompose exactly as
+  `3×stage(b) + ~2·hop` (31.814/42.426/59.05 ≈ 3×10.55/14.06/19.55 + ε): the refuter's "18.1ms real
+  hop" reading was itself the 3× propagation artifact (`BUGS.md` #19), not genuine communication cost.
+  Refuter B's separate point that the paper is silent on PP scheduling (verified by PDF grep) was
+  ACCEPTED and reframed the fix's justification from paper-conformance to physical realism; its point
+  that an optimizer-only fix would be incoherent was also ACCEPTED (both the optimizer and the runtime
+  must change together) (`refB_verify1.py`; discriminator re-run in `huntB_disc.py`).
+
+## Convergence vs prior docs
+| Item | This pass's verdict | vs. prior-pass disposition |
+|---|---|---|
+| Fig-4 plain-HBF/llama3/SHORT | MFU=1.0 crossover mechanism explains the whole pattern (+6% @1-GPU vs +34% @multi-GPU) | Was "Still open, None confirmed" — now EXPLAINED (deferred) |
+| Fig-5 comm-share drop | PP fix alone, a tp4-class winner, and MFU all tested and refuted as sole closers; microbatch-overlap candidate documented | Was "Still open, not investigated" — now NARROWED, stays OPEN |
+| Fig-6 ordering flip | Single lever = the paper's own 11.2 TB/s flash-BW spec; report-only | CONVERGES with the sibling hunt that first traced this; tightened here |
+| Fig-7 PEC errors | Chain clean, 0.0% identity closure on 11/12 cells; opposite GPU trends solved by the paper's own Fig-4 TPS shape | Was "Still open, escape-dynamics guess" — now EXPLAINED, guess REFUTED |
+| U7 HBF+ offset | Sign-inconsistent ±15% scatter; no additive fix exists; numbers refreshed to the current build | CONVERGES with the prior "report-only" disposition; the A/B-era table is SUPERSEDED |
+| llama3 SHORT CONV/CONV+ | The paper's own SLO arithmetic explains the gap | Folded into the existing Fig-4 CONV item, no new mechanism needed |
+| PP runtime + decode model | NEW bug (3× over-count) + a paired methodology deviation (serialized vs pipelined) | NEW this pass; retroactively invalidates CHANGES-26's PP measurements |
+| Optimizer `e_tp_dg` | NEW bug, byte-exact, also the dominant PEC-sweep cost driver | NEW this pass |
+
+---
+
 # Findings register — FIFTH-pass bug hunt (2026-07-04)
 
 Protocol: 9 blind Opus finder tracks (F1 scheduler lifecycle, F2 decode attention accounting, F3

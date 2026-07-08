@@ -54,7 +54,8 @@ Tensor::Ptr RoPE::forward(const Tensor::Ptr input,
     // weight tensor, so it belongs on the scarce activation tier (HBM stacks or
     // logic-die SRAM), never flash -- same tier convention as layernorm.cpp's act_time.
     memory_duration = (hbf.num_hbm_stacks > 0)
-        ? (time_ns)(memory_size / hbf.hbm_read_bandwidth * 1e9) : 0;
+        ? (time_ns)(memory_size / hbf.hbm_read_bandwidth * 1e9)
+        : (time_ns)(memory_size / hbf.logic_sram_bandwidth * 1e9);
   } else {
     memory_duration = (time_ns)(memory_size / memory_bandwidth * 1000 * 1000 * 1000);
   }
@@ -69,6 +70,11 @@ Tensor::Ptr RoPE::forward(const Tensor::Ptr input,
     }
   }
   device->status.device_time += total_time;
+  // PP_FIX_SPEC.md §3.3: RoPE manipulates device_time directly (never goes
+  // through ExecStatus/set_pop_status, unlike Linear/Activation/AttentionGen),
+  // so it needs its own device_time_dep mirror. Elementwise op: both flops and
+  // bytes are proportional to m (num_process_token) -- entirely batch-dependent.
+  device->status.device_time_dep += total_time;
   return output;
 }
 
@@ -124,7 +130,8 @@ TensorVec BatchedRoPE::forward(const TensorVec input,
     // weight tensor, so it belongs on the scarce activation tier (HBM stacks or
     // logic-die SRAM), never flash -- same tier convention as layernorm.cpp's act_time.
     memory_duration = (hbf.num_hbm_stacks > 0)
-        ? (time_ns)(memory_size / hbf.hbm_read_bandwidth * 1e9) : 0;
+        ? (time_ns)(memory_size / hbf.hbm_read_bandwidth * 1e9)
+        : (time_ns)(memory_size / hbf.logic_sram_bandwidth * 1e9);
   } else {
     memory_duration = (time_ns)(memory_size / memory_bandwidth * 1000 * 1000 * 1000);
   }
@@ -139,6 +146,8 @@ TensorVec BatchedRoPE::forward(const TensorVec input,
     }
     }
     device->status.device_time += total_time;
+    // PP_FIX_SPEC.md §3.3: see RoPE::forward's identical comment above.
+    device->status.device_time_dep += total_time;
   return input;
 }
 

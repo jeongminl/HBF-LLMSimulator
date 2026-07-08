@@ -58,6 +58,18 @@ class Cluster : public std::enable_shared_from_this<Cluster> {
   // it's a no-op equal to get_device(0)'s own value).
   time_ns maxDeviceTime();
 
+  // PP_FIX_SPEC.md §3.5: the per-iteration time actually REPORTED as the
+  // decode step latency. For pp==1 this is exactly maxDeviceTime() (no
+  // change). For pp>1, maxDeviceTime() alone over-counts (see
+  // PP_FIX_SPEC.md §1's root-cause trace: a stage-1 group AllReduce's
+  // max-broadcast lands between the per-tp-peer PipelineStage adds and
+  // re-stamps an already-added clock onto not-yet-added devices, which then
+  // get added to a second time -- "the 3rd stage" -- on top of running each
+  // stage at the FULL per-replica batch instead of the true microbatch
+  // period); this reconstructs full_model(B/pp) + (pp-1)*hop directly from
+  // each stage's own (device_time, device_time_dep, pipeline_hop_time).
+  time_ns reportedIterationTime();
+
   void set_dependency();
   void add_module(int device_rank, std::string name, Module::Ptr module);
 

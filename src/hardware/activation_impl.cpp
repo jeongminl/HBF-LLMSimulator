@@ -48,7 +48,7 @@ static ExecStatus activationCore(
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
     memory_duration = (config.hbf_config.num_hbm_stacks > 0)
         ? total_memory_size / config.hbf_config.hbm_read_bandwidth * 1000 * 1000 * 1000
-        : 0;
+        : total_memory_size / config.hbf_config.logic_sram_bandwidth * 1000 * 1000 * 1000;
   } else {
     memory_duration = total_memory_size / desc.memory_bandwidth * 1000 * 1000 * 1000;
   }
@@ -73,9 +73,31 @@ static ExecStatus activationCore(
   }
 
   exec_status.total_duration = std::max(exec_status.compute_duration, exec_status.memory_duration);
+  // Batch-dependence tag (PP_FIX_SPEC.md §3.3): activation is elementwise --
+  // FLOPs/bytes are entirely proportional to the batch (total_flops ==
+  // total_memory_size, both scale with num_process_token), no m-independent
+  // weight term exists here. Whole total_duration is batch-dependent.
+  exec_status.batch_dependent_duration = exec_status.total_duration;
 
+  // MOE_TAG_FIX_SPEC §4.3: same cold-at-micro override + propagation as linearCore.
+  // Zeroes the activation op of a cold-at-micro expert and carries the flag from
+  // this op's input to its output so the following ffn_down linear also zeroes.
+  {
+    int pp = device->model_config.pp_dg;
+    if (pp > 1 && input->cold_at_micro && exec_status.total_duration > 0.0) {
+      exec_status.batch_dependent_duration =
+          exec_status.total_duration * (double)pp / (double)(pp - 1);
+    }
+  }
+  output->cold_at_micro = input->cold_at_micro;
+
+  // I13: use the actual logic-SRAM bandwidth field instead of a hardcoded
+  // placeholder (1e13 vs the real 12.8e12) -- diagnostic-only (memory_util is
+  // a reporting metric, never fed back into latency), so this only changes
+  // what gets printed/logged, not any timing.
   double eff_bw = (config.use_hbf && config.hbf_config.num_flash_stacks > 0)
-      ? (config.hbf_config.num_hbm_stacks > 0 ? config.hbf_config.hbm_read_bandwidth : 1e13)
+      ? (config.hbf_config.num_hbm_stacks > 0 ? config.hbf_config.hbm_read_bandwidth
+                                               : config.hbf_config.logic_sram_bandwidth)
       : desc.memory_bandwidth;
   exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /
                              desc.compute_peak_flops / exec_status.total_duration;

@@ -4,13 +4,13 @@ experiment_results.md (this repo's simulator output) and report error rates.
 
 Error rate for a matched pair is defined as:
 
-    error_rate = |paper_value - sim_value| / |sim_value|
+    error_rate = |paper_value - sim_value| / |paper_value|
 
-i.e. the simulator's own output is treated as the reference ("actual"), and
-the pixel-read paper value is the "prediction" being scored against it. Pairs
-where either side is missing (NA / not present in one of the two tables) or
-where the simulator value is exactly 0 (relative error undefined) are skipped
-and reported separately as "unmatched".
+i.e. the paper's (ground-truth) reading is treated as the reference
+("actual"), and the simulator's output is the "prediction" being scored
+against it. Pairs where either side is missing (NA / not present in one of
+the two tables) or where the paper value is exactly 0 (relative error
+undefined) are skipped and reported separately as "unmatched".
 
 Usage:
     python compare_error_rates.py
@@ -240,41 +240,115 @@ def compare_fig6(paper_df, sim_df):
     return merged[["figure", "group", "key", "paper_value", "sim_value"]]
 
 
-def compare_fig7(paper_df, sim_df):
-    # New (2026-07-06 vector-extraction) format: Model | Workload | GPUs |
-    # HBF (online) | HBF+ (online) | HBF (offline) | HBF+ (offline). Melt to
-    # (Model, Workload, Memory, paper_value) at GPUs==8 online, matching the
-    # sim's own @8-GPU/online-only Fig-7 table, for backward compatibility
-    # with the old @8GPU-only comparison this script has always done. Falls
-    # back to the pre-2026-07-06 flat "3-Year PEC (@8 GPU, online)" column if
-    # present (old-format file).
+def _import_run_experiments():
+    """Import run_experiments.py as a module (guarded by its own __main__
+    check, so importing is side-effect-free) so Fig-7 can reuse its
+    compute_pec() -- the single source of truth for the PEC formula, shared
+    with experiment_results.md Section 5 and fig7_pec.png. Mirrors the
+    pattern already used by fig7_online.py / check_fig7_key.py /
+    check_fig7_gpu1.py in this same directory."""
+    import sys
+
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    import run_experiments as R
+
+    return R
+
+
+def _fig7_series_long(paper_df, checkpoint_path, online):
+    """Build the long (figure/group/key/paper_value/sim_value) frame for one
+    Fig-7 series (online or offline) across the FULL grid: every (model,
+    workload, mem in {HBF, HBF+}, gpu in {1, 8, 16}) cell -- 36 cells per
+    series when the checkpoint is present.
+
+    Sim value: run_experiments.compute_pec() applied directly to the
+    matching row of `checkpoint_path` (checkpoint_results.json for online --
+    the same 0.1s-SLO sweep Figures 3-6 draw from; checkpoint_pec_results.json
+    for offline -- the dedicated unconstrained-batch PEC sweep). Going
+    straight to the checkpoint (rather than experiment_results.md's own Fig-7
+    table) recovers GPU=1/16, which that report table doesn't tabulate
+    (Section 5 there is @8-GPU only).
+
+    Paper value: the matching Section-5 column in paper_figure_readings.md's
+    full grid (HBF (online) / HBF+ (online) / HBF (offline) / HBF+
+    (offline)).
+
+    Returns an empty frame (0 rows) if `checkpoint_path` doesn't exist yet --
+    this is how the offline series gracefully no-ops until the recovery
+    sweep writes checkpoint_pec_results.json, instead of erroring."""
+    empty = pd.DataFrame(columns=["figure", "group", "key", "paper_value", "sim_value"])
+
+    checkpoint_path = Path(checkpoint_path)
+    if not checkpoint_path.exists():
+        return empty
+
+    import json
+
+    R = _import_run_experiments()
+    with open(checkpoint_path) as f:
+        chk_rows = json.load(f)
+
     paper_df = paper_df.copy()
     paper_df["Model"] = paper_df["Model"].map(MODEL_MAP)
+    paper_df["GPUs"] = paper_df["GPUs"].astype(str)
 
-    if "3-Year PEC (@8 GPU, online)" in paper_df.columns:
-        paper_df["paper_value"] = paper_df["3-Year PEC (@8 GPU, online)"].apply(
-            lambda c: extract_value(c, "abs")
-        )
-        paper_long = paper_df
-    else:
-        paper_df = paper_df[paper_df["GPUs"].astype(str) == "8"]
-        rows = []
-        for _, r in paper_df.iterrows():
-            for col, mem in [("HBF (online)", "HBF"), ("HBF+ (online)", "HBF+")]:
-                rows.append({
-                    "Model": r["Model"], "Workload": r["Workload"], "Memory": mem,
-                    "paper_value": extract_value(r[col], "abs"),
-                })
-        paper_long = pd.DataFrame(rows)
+    mem_col = {"HBF": "HBF (online)" if online else "HBF (offline)",
+               "HBF+": "HBF+ (online)" if online else "HBF+ (offline)"}
 
-    sim_df = sim_df.copy()
-    sim_df["sim_value"] = sim_df["3-Year PEC"].apply(lambda c: extract_value(c, "abs"))
+    rows = []
+    for model in MODEL_MAP.values():
+        for workload in R.PEC_WORKLOADS:
+            for mem in R.PEC_MEM_TYPES:
+                for gpu in R.PEC_GPUS:
+                    sim_row = next(
+                        (r for r in chk_rows if r["model"] == model and r["workload"] == workload
+                         and r["memory"] == mem and r["gpus"] == gpu),
+                        None,
+                    )
+                    pec_info = R.compute_pec(sim_row)
+                    if pec_info is None:
+                        # Infeasible cell (max_batch 0, or PEC geometry never
+                        # emitted) -- skip, don't count as a zero/NA pair.
+                        continue
 
-    merged = paper_long.merge(sim_df, on=["Model", "Workload", "Memory"])
-    merged["figure"] = "Figure 7"
-    merged["group"] = merged["Memory"]
-    merged["key"] = merged["Model"] + " | " + merged["Workload"] + " | " + merged["Memory"]
-    return merged[["figure", "group", "key", "paper_value", "sim_value"]]
+                    paper_match = paper_df[
+                        (paper_df["Model"] == model) & (paper_df["Workload"] == workload)
+                        & (paper_df["GPUs"] == str(gpu))
+                    ]
+                    paper_value = (
+                        extract_value(paper_match.iloc[0][mem_col[mem]], "abs")
+                        if not paper_match.empty else None
+                    )
+
+                    rows.append({
+                        "figure": "Figure 7",
+                        "group": f"{mem} ({'online' if online else 'offline'})",
+                        "key": f"{model} | {workload} | {mem} | {gpu} GPU | "
+                               f"{'online' if online else 'offline'}",
+                        "paper_value": paper_value,
+                        "sim_value": pec_info["pec"],
+                    })
+
+    return pd.DataFrame(rows, columns=["figure", "group", "key", "paper_value", "sim_value"]) \
+        if rows else empty
+
+
+def compare_fig7(paper_df):
+    """Full-grid Fig-7 comparison: every (model, workload, mem, gpu) cell,
+    ONLINE (from checkpoint_results.json, always present) and OFFLINE (from
+    checkpoint_pec_results.json, produced by the offline-PEC recovery sweep
+    -- absent until that sweep finishes, in which case this contributes 0
+    offline cells and the online-only result still flows through normally).
+    36 online cells + up to 36 offline cells = up to 72 total, vs. the
+    previous 12 (GPU=8, online-only) cells."""
+    online_long = _fig7_series_long(
+        paper_df, REPO_ROOT / "checkpoint_results.json", online=True
+    )
+    offline_long = _fig7_series_long(
+        paper_df, REPO_ROOT / "checkpoint_pec_results.json", online=False
+    )
+    return pd.concat([online_long, offline_long], ignore_index=True)
 
 
 # --------------------------------------------------------------------------
@@ -372,14 +446,13 @@ def main():
         ),
         compare_fig7(
             paper_tables["Write Traffic and Endurance (Figure 7)"],
-            sim_tables["Write Traffic and Endurance Assessment (Figure 7 Replication)"],
         ),
     ]
     all_pairs = pd.concat(frames, ignore_index=True)
 
     n_total = len(all_pairs)
     unmatched = all_pairs["paper_value"].isna() | all_pairs["sim_value"].isna() | (
-        all_pairs["sim_value"] == 0
+        all_pairs["paper_value"] == 0
     )
     # Cells with unextractable paper readings (see is_unextractable): excluded
     # from the scored error like NA cells, since a paper-extraction artifact is
@@ -387,7 +460,7 @@ def main():
     unextractable = all_pairs.apply(is_unextractable, axis=1)
     scored = all_pairs.loc[~unmatched & ~unextractable].copy()
     scored["error_rate"] = (scored["paper_value"] - scored["sim_value"]).abs() / scored[
-        "sim_value"
+        "paper_value"
     ].abs()
 
     scored.to_csv(REPO_ROOT / args.out, index=False)

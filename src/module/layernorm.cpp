@@ -58,9 +58,11 @@ Tensor::Ptr LayerNorm::forward(const Tensor::Ptr input,
                                                    0, memory_bandwidth);
     // Activations (input read + output write) are on the scarce tier.
     // When num_hbm_stacks==0 (HBF+/CONV+), activations stage in logic-die SRAM
-    // (~320 MB, fast) → modeled as free to match all other ops (e.g. activation_impl.cpp).
+    // (~320 MB, fast) but still traverse the logic-die/interconnect link, so
+    // they're charged at logic_sram_bandwidth rather than for free.
     double act_bytes = 2.0 * (double)m * k * input->precision_byte;
-    double act_time = (hbf.num_hbm_stacks > 0) ? act_bytes / hbf.hbm_read_bandwidth * 1e9 : 0.0;
+    double act_time = (hbf.num_hbm_stacks > 0) ? act_bytes / hbf.hbm_read_bandwidth * 1e9
+                                                : act_bytes / hbf.logic_sram_bandwidth * 1e9;
     memory_duration = (time_ns)std::max(weight_read, act_time);
   } else {
     memory_duration = (time_ns)(memory_size / memory_bandwidth * 1000 * 1000 * 1000);
@@ -76,6 +78,15 @@ Tensor::Ptr LayerNorm::forward(const Tensor::Ptr input,
     }
   }
   device->status.device_time += total_time;
+  // PP_FIX_SPEC.md §3.3: LayerNorm manipulates device_time directly (never
+  // goes through ExecStatus/set_pop_status), so it needs its own
+  // device_time_dep mirror. Elementwise op: flops/bytes (input read + output
+  // write) are proportional to m -- entirely batch-dependent. (The HBF branch
+  // also maxes in a tiny fixed weight_read term for the norm's gamma/beta,
+  // negligible next to the m-scaled activation term for any non-degenerate
+  // batch -- size==0 already returns early above -- so this is tagged the
+  // same as the non-flash, purely-m-scaled path.)
+  device->status.device_time_dep += total_time;
 
   return output;
 }

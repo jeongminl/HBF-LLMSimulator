@@ -59,6 +59,16 @@ class Device : public std::enable_shared_from_this<Device> {
 
   time_ns get_time() { return status.device_time; }
   void set_time(time_ns time) { status.device_time = time; }
+  // PP_FIX_SPEC.md §3.2: sync_devices (module_graph.cpp) max-broadcasts
+  // device_time across a TP-sync group (e.g. after AllReduce) to equalize
+  // clocks. device_time_dep must be broadcast the SAME way in lockstep --
+  // otherwise a TP-peer whose device_time gets bumped up to another peer's
+  // value (because it happened to run behind in the round-robin device
+  // scheduler) keeps its OWN stale device_time_dep, corrupting the
+  // (device_time - device_time_dep) indep/dep split the pp>1 reconstruction
+  // (cluster.cpp) reads back out.
+  time_ns get_time_dep() { return status.device_time_dep; }
+  void set_time_dep(time_ns time) { status.device_time_dep = time; }
 
   // run with module_graph
   void run(std::vector<BatchedSequence::Ptr> sequences_metadata_list);

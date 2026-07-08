@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import copy
 import yaml
 import subprocess
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -142,7 +143,198 @@ def apply_mla_flags(cfg, model):
     cfg["system"]["optimization"]["use_absorb"] = is_mla
     cfg["system"]["optimization"]["use_flash_mla"] = is_mla
 
+# ---------------------------------------------------------------------------
+# On-disk memoization for run_simulation. Many cells across different sweep
+# phases (and different probes WITHIN one find_max_batch_size's binary/expo
+# search) request the exact same simulator invocation -- same model, memory
+# type, GPU count, batch size, parallelism config, sequence lengths, SLO, and
+# MFU knobs. run_simulation is a pure function of those inputs (see docstring
+# below), so identical invocations are cached to a JSON-lines file and never
+# re-run. Guarded by HBF_SIM_CACHE=0 to force a fully-live run (e.g. to
+# validate the cache against a fresh run, or to rebuild a corrupted cache).
+#
+# Storage: one JSON object per line, {"key": [...], "value": {...}}. Keys are
+# plain JSON-safe lists (not dicts) so lookup is a simple equality check after
+# freezing to a hashable tuple -- no dict-ordering ambiguity. Concurrent
+# ProcessPoolExecutor workers append via a single os.write() on an fd opened
+# O_APPEND -- POSIX guarantees that a single write() to a file opened O_APPEND
+# is atomic against other appenders on a local filesystem, so concurrent
+# workers can never interleave/tear each other's lines. Duplicate lines for
+# the same key (two workers racing on an uncached cell) are tolerated: values
+# are deterministic, so last-wins/first-wins are equivalent; the loader below
+# simply lets a later line for the same key overwrite the earlier one in the
+# in-memory dict.
+# ---------------------------------------------------------------------------
+SIM_CACHE_PATH = os.path.join(DATA_DIR, "simcache.jsonl")
+
+def _sim_cache_enabled():
+    # Read dynamically (not a module-level constant) so tests can toggle
+    # HBF_SIM_CACHE within one process/import without needing a re-import.
+    return os.environ.get("HBF_SIM_CACHE", "1") != "0"
+
+# Per-process in-memory mirror of the on-disk cache, populated incrementally
+# (only newly-appended bytes are re-parsed on each refresh, not the whole
+# file) so repeated lookups in a long-lived worker process are O(1) after the
+# first load rather than O(file size) every time.
+_SIM_CACHE = {}
+_SIM_CACHE_POS = 0
+
+# Fingerprint of the build artifacts whose CONTENTS (not just their path)
+# determine simulator behavior/timing -- ./run itself, and libllm_system.so
+# (where the timing-model code actually lives; ./run dynamically links it).
+# A rebuild (e.g. a landing C++ fix) changes these files' mtime/size, which
+# MUST invalidate any cache entries recorded against the old binary --
+# otherwise a stale-but-key-identical cache hit would silently serve
+# pre-fix numbers forever. (st_mtime_ns, st_size) is a cheap two-stat()
+# fingerprint, good enough to catch any real rebuild; computed once per
+# process (lazily memoized -- stable for a run's lifetime, and re-stat'ing
+# on every single cache lookup would add real overhead across a large sweep).
+_BINARY_FINGERPRINT = None
+
+def _binary_fingerprint():
+    global _BINARY_FINGERPRINT
+    if _BINARY_FINGERPRINT is None:
+        parts = []
+        for name in ("run", "libllm_system.so"):
+            path = os.path.join(BUILD_DIR, name)
+            try:
+                st = os.stat(path)
+                parts.append([name, st.st_mtime_ns, st.st_size])
+            except OSError:
+                # Missing artifact still becomes part of the key (as a
+                # distinct, stable value) rather than silently omitted.
+                parts.append([name, None, None])
+        _BINARY_FINGERPRINT = parts
+    return _BINARY_FINGERPRINT
+
+def _sim_cache_key(model, mem_type, num_device, batch_size, input_len, output_len,
+                    optimize_parallelism, tpot_slo, distribution, mfu_max, mfu_m_half):
+    # Every parameter that reaches the temp config / changes simulator behavior.
+    # num_device is the ORIGINAL requested GPU count (not the derived
+    # num_node/num_device split) -- that split is itself a pure function of
+    # num_device (see run_simulation below), so it adds no information.
+    # distribution, when given, forces optimize_parallelism False regardless
+    # of the caller's flag (see run_simulation) -- encode the EFFECTIVE
+    # parallelism-control mode, not the raw incoming flag, so two calls that
+    # behave identically (e.g. distribution=None,optimize_parallelism=True vs.
+    # a stale optimize_parallelism=False that gets overridden) hash the same
+    # iff they really are the same request, and calls with different explicit
+    # (tp,pp,ep) never collide with each other or with the "auto" mode.
+    if distribution is not None:
+        parallel = ["dist", distribution["tp"], distribution["pp"], distribution["ep"]]
+    else:
+        parallel = ["auto", bool(optimize_parallelism)]
+    # PP_FLAGS_SPEC §1.3 correction: the spec's driver-override hook assumed the
+    # cache key hashes the actual written yaml content, but this key is a fixed
+    # tuple of explicit args -- it does NOT see the PP_PIPELINED_TIMING/
+    # PP_INTERNODE_ONLY/KV_WRITE_SOFTMAX_HIDE env overrides applied to cfg in
+    # _run_simulation_uncached. Without this, an A/B call with an env override
+    # would silently hit a cache entry recorded under shipping defaults (or
+    # vice versa) at the same (model, mem, gpu, batch, ...) point -- a real
+    # wrong-result risk once these flags exist. Include their EFFECTIVE
+    # (env-resolved, default-true) values explicitly so default-flag calls and
+    # flag-overridden calls never collide. Old pre-flag cache entries have a
+    # shorter key tuple and simply miss (safe: forces a fresh, correct run).
+    flags = [
+        os.environ.get("PP_PIPELINED_TIMING", "1") != "0",
+        os.environ.get("PP_INTERNODE_ONLY", "1") != "0",
+        os.environ.get("KV_WRITE_SOFTMAX_HIDE", "1") != "0",
+    ]
+    return [model, mem_type, num_device, batch_size, input_len, output_len,
+            tpot_slo, mfu_max, mfu_m_half, parallel, flags, _binary_fingerprint()]
+
+def _sim_cache_freeze(key):
+    """JSON-safe key (lists) -> hashable tuple, for use as a dict key."""
+    if isinstance(key, list):
+        return tuple(_sim_cache_freeze(x) for x in key)
+    return key
+
+def _sim_cache_refresh():
+    """Pull any bytes appended to the cache file (by us or another process)
+    since our last read into the in-memory dict. Safe to call when the file
+    doesn't exist yet (pre-first-write) or is empty."""
+    global _SIM_CACHE_POS
+    if not os.path.exists(SIM_CACHE_PATH):
+        return
+    try:
+        with open(SIM_CACHE_PATH, "r") as f:
+            f.seek(_SIM_CACHE_POS)
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    # Torn line from a concurrent writer racing our read (rare;
+                    # see the O_APPEND atomicity note above -- possible only if
+                    # our read window straddled a write still in flight).
+                    # Leave _SIM_CACHE_POS at the start of this line so the
+                    # NEXT refresh re-reads and (hopefully complete-by-then)
+                    # re-parses it, instead of silently skipping the record.
+                    break
+                if "key" in rec and "value" in rec:
+                    _SIM_CACHE[_sim_cache_freeze(rec["key"])] = rec["value"]
+            _SIM_CACHE_POS = f.tell()
+    except Exception:
+        # Cache is a pure optimization; never let a read glitch break the sweep.
+        pass
+
+def _sim_cache_lookup(key):
+    if not _sim_cache_enabled():
+        return None
+    kt = _sim_cache_freeze(key)
+    if kt not in _SIM_CACHE:
+        _sim_cache_refresh()
+    val = _SIM_CACHE.get(kt)
+    return copy.deepcopy(val) if val is not None else None
+
+def _sim_cache_store(key, value):
+    if not _sim_cache_enabled():
+        return
+    kt = _sim_cache_freeze(key)
+    _SIM_CACHE[kt] = value
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        rec = json.dumps({"key": key, "value": value})
+        data = (rec + "\n").encode("utf-8")
+        fd = os.open(SIM_CACHE_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+    except Exception:
+        # Failing to persist the cache entry must never fail the sweep itself
+        # -- worst case this cell's result just isn't reusable later.
+        pass
+
 def run_simulation(model, mem_type, num_device, batch_size, input_len, output_len, optimize_parallelism=True, tpot_slo=0.1, distribution=None, mfu_max=None, mfu_m_half=None, temp_cfg_name="config_temp.yaml", worker_tag=None):
+    """Cached wrapper around _run_simulation_uncached (below): identical calls
+    (per _sim_cache_key) return the on-disk-memoized dict instead of spawning
+    another ./run. temp_cfg_name/worker_tag are pure I/O isolation (config
+    filename, CSV output directory) -- they never affect the returned values,
+    so they're deliberately excluded from the cache key. A worker-crash/
+    timeout result (generic exception in the uncached call, e.g. a subprocess
+    timeout under host load) is NOT cached -- that's a property of this one
+    attempt, not of the (model, mem, ...) request -- everything else
+    (success, SLO-violated, OOM/capacity-exceeded) IS cached: those are
+    deterministic outcomes of the simulator itself. Disable entirely with
+    HBF_SIM_CACHE=0.
+    """
+    key = _sim_cache_key(model, mem_type, num_device, batch_size, input_len, output_len,
+                          optimize_parallelism, tpot_slo, distribution, mfu_max, mfu_m_half)
+    cached = _sim_cache_lookup(key)
+    if cached is not None:
+        return cached
+    result = _run_simulation_uncached(model, mem_type, num_device, batch_size, input_len, output_len,
+                                       optimize_parallelism, tpot_slo, distribution, mfu_max, mfu_m_half,
+                                       temp_cfg_name, worker_tag)
+    crashed = result.pop("_crash", False)
+    if not crashed:
+        _sim_cache_store(key, result)
+    return result
+
+def _run_simulation_uncached(model, mem_type, num_device, batch_size, input_len, output_len, optimize_parallelism=True, tpot_slo=0.1, distribution=None, mfu_max=None, mfu_m_half=None, temp_cfg_name="config_temp.yaml", worker_tag=None):
     # mfu_max/mfu_m_half: optional compute-utilization (MFU) override, forwarded to
     # config.yaml's simulation.mfu_max/mfu_m_half (see SystemConfig::mfu_max/mfu_m_half,
     # hardware_config.h). None (default) omits the key entirely, so the C++ binary keeps
@@ -207,6 +399,18 @@ def run_simulation(model, mem_type, num_device, batch_size, input_len, output_le
         cfg["simulation"]["mfu_max"] = mfu_max
     if mfu_m_half is not None:
         cfg["simulation"]["mfu_m_half"] = mfu_m_half
+
+    # PP_FLAGS_SPEC §1.3: env-gated A/B override hook, mirroring HBF_RESTRICT_PP1.
+    # Lets a driver flip a flag without editing config.yaml; the written yaml
+    # (and therefore the flag value) flows into the sim-cache key hash below.
+    for env_name, cfg_key in (
+        ("PP_PIPELINED_TIMING", "pp_pipelined_timing"),
+        ("PP_INTERNODE_ONLY", "pp_internode_only"),
+        ("KV_WRITE_SOFTMAX_HIDE", "kv_write_softmax_hide"),
+    ):
+        env_val = os.environ.get(env_name)
+        if env_val is not None:
+            cfg["simulation"][cfg_key] = (env_val != "0")
 
     # Suppress the per-op timeboard dump (config.yaml's log.print_log default: on).
     # Verified cosmetic-only: gates exactly one std::cout-only call
@@ -327,7 +531,11 @@ def run_simulation(model, mem_type, num_device, batch_size, input_len, output_le
                 "pec_kv_bytes": pec_kv_bytes, "pec_capacity": pec_capacity, "dp": dp,
                 "sram_diag_ceiling": sram_diag_ceiling}
     except Exception as e:
-        return {"success": False, "reason": str(e), "stdout": ""}
+        # Worker-crash/timeout (e.g. subprocess.TimeoutExpired under host load,
+        # or any other infra-level hiccup) -- NOT a deterministic property of
+        # this (model, mem, ...) request, so the cache wrapper (run_simulation,
+        # above) strips "_crash" and skips storing this result.
+        return {"success": False, "reason": str(e), "stdout": "", "_crash": True}
 
 def run_analytic_sweep(model, mem_type, num_device, input_len, output_len, tpot_slo=0.1, temp_cfg_name="config_temp.yaml"):
     """Fast, in-process (no discrete-event simulation) batch-size search using ONLY
@@ -365,6 +573,17 @@ def run_analytic_sweep(model, mem_type, num_device, input_len, output_len, tpot_
     # (the analytic-sweep-only path returns before ever reaching the gated print call
     # anyway, so this is a no-op here in practice; kept for uniformity/future-proofing).
     cfg["log"]["print_log"] = False
+
+    # PP_FLAGS_SPEC §1.3: same env-gated A/B override hook as run_analytic_configs
+    # (this function also builds its own independent cfg).
+    for env_name, cfg_key in (
+        ("PP_PIPELINED_TIMING", "pp_pipelined_timing"),
+        ("PP_INTERNODE_ONLY", "pp_internode_only"),
+        ("KV_WRITE_SOFTMAX_HIDE", "kv_write_softmax_hide"),
+    ):
+        env_val = os.environ.get(env_name)
+        if env_val is not None:
+            cfg["simulation"][cfg_key] = (env_val != "0")
 
     temp_cfg_path = os.path.join(BUILD_DIR, temp_cfg_name)
     with open(temp_cfg_path, "w") as f:
@@ -432,6 +651,21 @@ def run_analytic_configs(model, mem_type, num_device, input_len, output_len, tpo
     cfg["system"]["tpot_slo"] = tpot_slo
     cfg["system"]["analytic_configs_only"] = True
     cfg["log"]["print_log"] = False
+
+    # PP_FLAGS_SPEC §1.3: this function builds its OWN cfg (independent of
+    # _run_simulation_uncached), and it is the one that generates the candidate
+    # LISTING find_max_batch_size's auto search verifies against -- so the
+    # env-gated A/B override hook must apply here too, or PP_INTERNODE_ONLY=0
+    # (etc.) would silently have no effect on the auto-search winner even
+    # though forced-distribution verify() calls elsewhere honor it.
+    for env_name, cfg_key in (
+        ("PP_PIPELINED_TIMING", "pp_pipelined_timing"),
+        ("PP_INTERNODE_ONLY", "pp_internode_only"),
+        ("KV_WRITE_SOFTMAX_HIDE", "kv_write_softmax_hide"),
+    ):
+        env_val = os.environ.get(env_name)
+        if env_val is not None:
+            cfg["simulation"][cfg_key] = (env_val != "0")
 
     temp_cfg_path = os.path.join(BUILD_DIR, temp_cfg_name)
     with open(temp_cfg_path, "w") as f:
@@ -622,6 +856,32 @@ def find_max_batch_size(model, mem_type, num_device, input_len, output_len, tpot
         return best_k * dp, best_res, cfg_fail
 
     configs = listing["configs"]
+    # PP-fix adjudication knob (investigation only): HBF_RESTRICT_PP1=1 drops every
+    # pp>1 candidate from the search. Because the pp==1 runtime path is byte-identical
+    # pre/post the pipelined-PP fix, and correctly-serialized (2S) pp>1 never wins a
+    # cell (Hunt B), this restricted search reproduces the "double-count fix only"
+    # variant's auto winners on the current build without a second binary.
+    # PP_FLAGS_SPEC §3.4: under shipping defaults, EnumerateCandidates already
+    # excludes intra-node pp>1 (pp_internode_only=true), so this knob now only
+    # additionally removes the *inter-node* pp>1 candidates -- i.e. it now
+    # expresses "no PP at all," relevant ONLY for the A/B study of
+    # "double-count-fix-only vs shipping." The internode gate is the shipping
+    # mechanism; this knob is an A/B-only tool now.
+    if os.environ.get("HBF_RESTRICT_PP1") == "1":
+        had_configs_before_restrict = bool(configs)
+        configs = [c for c in configs if c["pp"] == 1]
+        if had_configs_before_restrict and not configs:
+            # Every capacity-feasible config at this (model, mem, gpu) point requires
+            # pp>1 -- there is no pp==1 candidate at all. listing["cap_feasible_at_1"]
+            # (computed analytically in eval/test.cpp) is NOT restriction-aware: it is
+            # true as soon as ANY dp==1 tuple fits at batch 1, including pp>1 ones, so
+            # falling through to the generic "not configs" handling below would call
+            # verify(1) with distribution=None and let the simulator's own optimizer
+            # freely pick a config -- which could silently pick pp>1, defeating the
+            # entire point of this restriction for exactly the cells where it matters
+            # most (capacity-tight cells where only pp>1 fits). Report infeasible
+            # under the restriction instead of risking a silent pp>1 answer.
+            return 0, 0.0, None, None, None, 1, "unknown"
     if not configs:
         if not listing["cap_feasible_at_1"]:
             # Genuine capacity/SRAM infeasibility at every config's minimum batch --
@@ -1409,59 +1669,17 @@ def main():
     # so 1-2 GPU points would have an infeasible/undefined baseline.
     sensitivity_gpus = SENSITIVITY_GPUS
 
-    # Gather sensitivity baselines (HBM4, 8 GPU) per SLO. slo=0.1/LONG was already
-    # gathered as the main baseline; the remaining (model, slo!=0.1) cells are
-    # independent -- same parallelization pattern as the main sweep above.
-    sens_baseline_specs = [
-        {"model": model, "slo": slo, "mem": "HBM4", "gpu": 8,
-         "in_len": long_in, "out_len": long_out}
-        for model in models for slo in slos if slo != 0.1
-    ]
-    sens_baseline_results = {}
-    # Split offline (slo=86400, unconstrained-batch-search) specs into their own,
-    # smaller pool -- see OFFLINE_SWEEP_WORKERS above; these can need 10x+ the host
-    # RAM per process of a latency-bound (online) probe.
-    sens_baseline_offline = [s for s in sens_baseline_specs if s["slo"] >= 1000]
-    sens_baseline_normal = [s for s in sens_baseline_specs if s["slo"] < 1000]
-    for group, workers, label in ((sens_baseline_normal, SWEEP_WORKERS, "sens-baseline"),
-                                   (sens_baseline_offline, OFFLINE_SWEEP_WORKERS, "sens-baseline-offline")):
-        if not group:
-            continue
-        with ProcessPoolExecutor(max_workers=min(workers, max(1, len(group)))) as pool:
-            fut_to_spec = {pool.submit(_run_cell, spec): spec for spec in group}
-            for fut in as_completed(fut_to_spec):
-                spec = fut_to_spec[fut]
-                try:
-                    r = fut.result()
-                except Exception as e:
-                    print(f"[{label}] worker crashed for {spec}: {e!r} -- recording as failed cell")
-                    r = _crashed_cell(spec)
-                sens_baseline_results[(spec["model"], spec["slo"])] = r
-
-    sens_baselines = {}
-    for model in models:
-        sens_baselines[model] = {}
-        for slo in slos:
-            if slo == 0.1:
-                bl = baselines[model]["LONG"]
-                max_b_per_gpu = bl["max_batch_per_gpu"]
-                tpot  = bl["tpot"]
-                tps   = bl["tps"]
-            else:
-                r = sens_baseline_results[(model, slo)]
-                max_b, tpot = r["max_b"], r["tpot"]
-                max_b_per_gpu = max_b / 8
-                tps = max_b / (tpot * 8) if tpot > 0 else 0.0
-            sens_baselines[model][slo] = {
-                "max_batch_per_gpu": max_b_per_gpu,
-                "tps": tps,
-                "tpot": tpot
-            }
-            print(f"SLO Sensitivity Baseline {model} SLO {slo}: Max Batch/GPU = {max_b_per_gpu:.1f}, TPS/GPU = {tps:.2f}")
-
     # Main sensitivity sweep, same parallelization pattern as the main sweep: canonical
     # spec list built up front, HBM4/8-GPU/slo=0.1 cache-pulled (never resubmitted), the
     # rest submitted to the pool, then assembled in canonical order afterward.
+    #
+    # This sweep's own scope (mem_types x sensitivity_gpus x slos, all LONG) already
+    # includes every (model, HBM4, 8-GPU, slo) cell the per-SLO sensitivity baselines
+    # need (mem_types contains HBM4, sensitivity_gpus contains 8) -- so the baselines
+    # are pulled from sens_cell_results below instead of running a second, separately-
+    # pooled sweep over the same cells (that used to duplicate 2 models x 3 slos = 6
+    # simulations). Run this sweep FIRST so sens_cell_results is available when
+    # sens_baselines is assembled just below.
     sens_specs = [
         {"model": model, "mem": mem, "gpu": gpu, "slo": slo,
          "in_len": long_in, "out_len": long_out}
@@ -1473,7 +1691,9 @@ def main():
 
     sens_to_submit = [s for s in sens_specs if not (s["mem"] == "HBM4" and s["gpu"] == 8 and s["slo"] == 0.1)]
     sens_cell_results = {}
-    # Same offline/normal pool split as the sensitivity baselines above.
+    # Split offline (slo=86400, unconstrained-batch-search) specs into their own,
+    # smaller pool -- see OFFLINE_SWEEP_WORKERS above; these can need 10x+ the host
+    # RAM per process of a latency-bound (online) probe.
     sens_offline = [s for s in sens_to_submit if s["slo"] >= 1000]
     sens_normal = [s for s in sens_to_submit if s["slo"] < 1000]
     for group, workers, label in ((sens_normal, SWEEP_WORKERS, "sensitivity"),
@@ -1493,6 +1713,31 @@ def main():
                 sens_cell_results[key] = r
                 print(f"Completed Sensitivity Sweep: {r['model']} | {r['mem']} | {r['gpu']} GPUs | SLO {r['slo']}s "
                       f"-> Max Batch/GPU: {(r['max_b'] / r['gpu']):.1f}")
+
+    # Per-SLO sensitivity baselines (HBM4, 8 GPU): slo=0.1/LONG reuses the main
+    # baseline; every other slo is now pulled straight from sens_cell_results
+    # (computed by the sweep above, which already covers mem=HBM4/gpu=8 for
+    # every slo) instead of a second, separately-submitted simulation.
+    sens_baselines = {}
+    for model in models:
+        sens_baselines[model] = {}
+        for slo in slos:
+            if slo == 0.1:
+                bl = baselines[model]["LONG"]
+                max_b_per_gpu = bl["max_batch_per_gpu"]
+                tpot  = bl["tpot"]
+                tps   = bl["tps"]
+            else:
+                r = sens_cell_results[(model, "HBM4", 8, slo)]
+                max_b, tpot = r["max_b"], r["tpot"]
+                max_b_per_gpu = max_b / 8
+                tps = max_b / (tpot * 8) if tpot > 0 else 0.0
+            sens_baselines[model][slo] = {
+                "max_batch_per_gpu": max_b_per_gpu,
+                "tps": tps,
+                "tpot": tpot
+            }
+            print(f"SLO Sensitivity Baseline {model} SLO {slo}: Max Batch/GPU = {max_b_per_gpu:.1f}, TPS/GPU = {tps:.2f}")
 
     for spec in sens_specs:
         model, mem, gpu, slo = spec["model"], spec["mem"], spec["gpu"], spec["slo"]
@@ -1533,8 +1778,17 @@ def main():
     # same scope is already derivable from `results` (0.1s SLO), but offline
     # (SLO=86400, i.e. no rate limit) isn't probed anywhere else -- the SLO
     # sensitivity sweep above only covers the LONG workload, and Fig. 7 needs
-    # {SHORT,MID,LONG} x gpu{1,8,16} x {HBF,HBF+}. Fully independent cells, no
-    # cache-hit branch needed -- simplest of the three parallelized loops.
+    # {SHORT,MID,LONG} x gpu{1,8,16} x {HBF,HBF+}.
+    #
+    # The sensitivity sweep just above (sens_specs/sens_cell_results) already computed
+    # 8 of these cells: (model in models) x LONG x gpu in {8,16} x mem in {HBF,HBF+} x
+    # slo=86400.0 -- sensitivity_gpus contains {8,16} and mem_types contains {HBF,HBF+},
+    # and the PEC workload set/GPU set/mem set are each subsets of the sensitivity
+    # sweep's, restricted to the LONG workload (the only workload the sensitivity sweep
+    # covers). Pull those straight from sens_cell_results (same (model,mem,gpu,slo) key
+    # shape/values as _sens_key -- both come from _run_cell, so the dicts are
+    # interchangeable) instead of resubmitting them. Only the genuinely-new cells (gpu=1,
+    # and/or workload SHORT/MID) go to the pool.
     print("\n--- GATHERING OFFLINE PEC DATA (Fig. 7) ---")
     pec_specs = [
         {"model": model, "wl_name": wl_name, "in_len": workloads[wl_name][0],
@@ -1544,13 +1798,26 @@ def main():
         for gpu in PEC_GPUS
         for mem in PEC_MEM_TYPES
     ]
+
+    def _pec_dup_of_sensitivity(s):
+        # slo is always 86400.0 for every pec_spec, matching the sensitivity sweep's
+        # own offline SLO entry -- only workload/gpu/mem gate the overlap.
+        return s["wl_name"] == "LONG" and s["gpu"] in (8, 16) and s["mem"] in ("HBF", "HBF+")
+
+    pec_dup_specs = [s for s in pec_specs if _pec_dup_of_sensitivity(s)]
+    pec_to_submit = [s for s in pec_specs if not _pec_dup_of_sensitivity(s)]
+
     pec_cell_results = {}
+    for spec in pec_dup_specs:
+        key = (spec["model"], spec["wl_name"], spec["gpu"], spec["mem"])
+        pec_cell_results[key] = sens_cell_results[(spec["model"], spec["mem"], spec["gpu"], spec["slo"])]
+
     # All PEC specs are offline (slo=86400, unconstrained-batch-search) -- see
     # OFFLINE_SWEEP_WORKERS above. This phase is where the host OOM-killer storm
     # actually occurred (individual ./run RSS of 13-23GB, SWEEP_WORKERS-wide
     # concurrency oversubscribing this box's RAM for hours).
-    with ProcessPoolExecutor(max_workers=min(OFFLINE_SWEEP_WORKERS, max(1, len(pec_specs)))) as pool:
-        fut_to_spec = {pool.submit(_run_cell, spec): spec for spec in pec_specs}
+    with ProcessPoolExecutor(max_workers=min(OFFLINE_SWEEP_WORKERS, max(1, len(pec_to_submit)))) as pool:
+        fut_to_spec = {pool.submit(_run_cell, spec): spec for spec in pec_to_submit}
         for fut in as_completed(fut_to_spec):
             spec = fut_to_spec[fut]
             key = (spec["model"], spec["wl_name"], spec["gpu"], spec["mem"])

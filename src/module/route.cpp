@@ -189,6 +189,17 @@ void GateUpdate::aggregate_expert(BatchedSequence::Ptr sequences_metadata) {
                    std::to_string(scheduler->getNumProcessToken() *
                                   device->model_config.top_k) +
                    ", but" + std::to_string(test_token));
+
+    // MOE_TAG_FIX_SPEC §4.5: mirror the full-vector aggregation for the micro
+    // vector (num_token_in_expert_micro), so Route::forward can compare
+    // full-B vs microbatch activation per expert.
+    std::vector<int> temp_micro(num_expert, 0);
+    for (int i = 0; i < num_batch; i++)
+      for (int j = 0; j < num_expert; j++)
+        temp_micro[j] += scheduler->running_queue[i]->num_token_in_expert_micro[j];
+    for (int i = 0; i < num_batch; i++)
+      for (int j = 0; j < num_expert; j++)
+        scheduler->running_queue[i]->num_token_in_expert_micro[j] = temp_micro[j];
   }
 }
 
@@ -233,6 +244,16 @@ TensorVec Route::forward(const TensorVec input,
     Tensor::Ptr output =
         get_activation("expert_input_" + std::to_string(expert_idx), shape);
     output_vec.push_back(output);
+
+    // MOE_TAG_FIX_SPEC §4.5: mark cold-at-micro experts (hot at full B, zero
+    // tokens in the first B/pp). Gated pp>1 so pp==1 leaves the flag false
+    // (byte-identical). ALWAYS assign (true AND false) so a pooled/reused
+    // tensor can never carry a stale flag from a prior iteration.
+    int pp = device->model_config.pp_dg;
+    bool cold = (pp > 1) &&
+                (sequences_metadata->num_token_in_expert[expert_idx] > 0) &&
+                (sequences_metadata->num_token_in_expert_micro[expert_idx] == 0);
+    output->cold_at_micro = cold;
 
     if (device->config.hetero_subbatch) {
       output->setPerformLow();

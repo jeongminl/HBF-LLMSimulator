@@ -18,6 +18,7 @@ Tensor::Tensor(std::string name, std::vector<int> shape, std::string tag,
   perform_with_optimal = false;
   parallel_execution = false;
   perform_at_high = true;
+  cold_at_micro = false;  // MOE_TAG_FIX_SPEC: symmetry with the other tensor flags
 }
 
 long Tensor::getSize() {

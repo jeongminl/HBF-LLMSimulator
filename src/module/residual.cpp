@@ -45,7 +45,7 @@ Tensor::Ptr Residual::forward(const Tensor::Ptr input,
   if (hw_config.use_hbf && hw_config.hbf_config.num_flash_stacks > 0) {
     memory_duration = (hw_config.hbf_config.num_hbm_stacks > 0)
         ? memory_size / hw_config.hbf_config.hbm_read_bandwidth * 1000 * 1000 * 1000
-        : 0;
+        : memory_size / hw_config.hbf_config.logic_sram_bandwidth * 1000 * 1000 * 1000;
   } else {
     memory_duration = memory_size / hw_config.memory_bandwidth * 1000 * 1000 * 1000;
   }
@@ -60,6 +60,11 @@ Tensor::Ptr Residual::forward(const Tensor::Ptr input,
     }
   }
   device->status.device_time += total_time;
+  // PP_FIX_SPEC.md §3.3: Residual manipulates device_time directly (never
+  // goes through ExecStatus/set_pop_status), so it needs its own
+  // device_time_dep mirror. Elementwise op: flops/bytes are proportional to m
+  // -- entirely batch-dependent.
+  device->status.device_time_dep += total_time;
 
   return output;
 }

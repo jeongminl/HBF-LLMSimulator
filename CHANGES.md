@@ -1776,3 +1776,116 @@ llama3/HBM4/8-GPU/LONG was −13% TPS; resolved as the AllReduce ring-latency ov
 `run_experiments.find_max_batch_size("llama3_405B","HBM4",8,103500,1100,tpot_slo=0.1,...)` or force
 `run_simulation(...,batch_size=29,distribution={"tp":8,"pp":1,"ep":1})`; diff the winner CSV's
 `type=="t2t"` per-component shares against the SHORT/MID cells at the same TP=8 config.
+
+## 2026-07-08 — Paper-conformance abandoned; PAPER_INCONSISTENCIES.md dispositions absorbed
+
+The paper-1 campaign has pivoted to **correctness-first**: reproducing Son et al.'s published numbers
+is no longer a goal. Every paper-vs-sim divergence tracked in `PAPER_INCONSISTENCIES.md` is therefore
+now historical. This section absorbs all of that file's content (its four sections: Still open,
+Explained (not bugs), Deferred, Moved to CHANGES) before the file itself was reduced to a stub
+pointing here. **13 individual items + 1 pointer-section absorbed**, none dropped.
+
+### Still open (2 items) — both resolved to MOOT / historical
+
+- **Fig-5 — llama3_405B/HBM4/MID Communication-share drop at 16-GPU** (`compare_error_rates.py:7`;
+  PP-serialization fix tracked in `BUGS.md`/`PP_FIX_SPEC.md`/`PP_FLAGS_SPEC.md`). Former status: open —
+  three levers refuted as sole closers (faithful pipelined-PP alone keeps ~14.5% share, the
+  matching-comm-share tp4/pp2/dp2 config is never selected by the optimizer, MFU 0.5 is too weak
+  ×1.08 vs the needed ×1.93); an untestable microbatch-AR-hiding candidate remains pending the
+  pipelined runtime. **MOOT: paper-match no longer pursued.** (The underlying PP-serialization /
+  pipelined-timing work continues under `PP_FIX_SPEC.md` / `PP_PIPELINED_TIMING_FLIP_RESULTS.md` for
+  correctness reasons, independent of whether it ever closes this comm-share gap.)
+- **Fig-5 — HBM4 KV-Write band structurally 0.0% in sim vs paper's uniform 0.2% read**
+  (`getKVWriteDuration`, `layer_impl.h:159`; Fig-5 bucket `attention_gen_impl.cpp:218-233`; gate
+  `hbf_memory_config.h:57`). Former status: already marked RESOLVED as EXPLAINED inside the doc itself
+  (no code change) — the overlap trap (`unhidden_write = max(0, kv_write − attention_compute)`) fully
+  hides the write on HBM4's 12.8 TB/s, and the paper's uniform 0.2% is an extraction-floor artifact
+  (no self-normalizing anchor on Fig-5), not twelve distinct values. **Historical, kept for
+  provenance** — was already a closed non-bug, not substantively open.
+
+### Explained (not bugs) (9 items) — all historical, kept for provenance
+
+- **HBM4 bandwidth = Table I's 12.8 TB/s** (`eval/test.cpp:143-145` overwrite of the GPU preset;
+  `hardware_config.h:401` Rubin 22 TB/s comment is documentation-only, non-load-bearing). DECIDED-
+  CONFORMANT by user ruling (Hunt G, 2026-07-07). Historical, kept for provenance.
+- **Fig-4 — plain-HBF/llama3_405B/SHORT flat ~25.3% high, 2–16 GPU** — explained by the MFU=1.0
+  crossover mechanism (`linear_impl.cpp::effectiveMFU`); fix deferred (a global MFU derating flips the
+  llama3/HBM4/SHORT dp1→dp2 winner, and `mfu_max` is degenerate with the Rubin peak-FLOPs estimate).
+  Historical, kept for provenance.
+- **Fig-6 — llama3_405B, 0.05s SLO: HBF-vs-HBM4 TPS ordering flips at 8/16-GPU** — paper-internal:
+  HBF is SLO-bound (flash-KV-read dominated), HBM4 is capacity-bound with 46% unused SLO headroom it
+  cannot spend; the sole lever is HBF's flash-read bandwidth (`flash_read_bandwidth = 11.2 TB/s`, the
+  paper's own Table I value) — at that value HBF *should* lead, so the paper's own Fig-6 crossover is
+  internally inconsistent with its own Table I. Report-only, no sim change proposed. Historical, kept
+  for provenance.
+- **Fig-7 — 36-cell online PEC: HBF+ errors elevated, up to 60.5% at 16-GPU** — closed 2026-07-07
+  (Hunt D2, zero free parameters): `compute_pec` audited term-by-term as a clean chain; the identity
+  `PEC_err ≈ (1+batch_err)·(paper_tpot/sim_tpot)·(1+K)−1` closes to 0.0% on 11/12 cells. All error is
+  inherited from batch-error × the tpot ratio, both tracked by other items (the MFU-class deferred
+  lever). Historical, kept for provenance.
+- **Residual-1 — llama4/HBM4/8-GPU SHORT: batch high, TPS low** — sim's TP=2 capacity-bound winner
+  (488.5/GPU) beats the paper's DP-pure anchor (460/GPU) by TP-sharding non-expert weights into KV
+  headroom; not a bug, the sim explores the full TP/PP/DP/EP space the paper's own §III describes.
+  Historical, kept for provenance.
+- **U7 — HBF+/CONV+ per-GPU batch grows with GPU count instead of staying flat** (`peakIntermediateBytes`,
+  `footprint.h`) — the KV-write-staging A/B (`system.kv_write_sram_gate`) reproduces the paper's
+  SRAM-bound SHORT signatures (SLO→SRAM flip, flat-across-GPU, cross-model ratio), but the residual
+  overshoot is sign-inconsistent across models (+14.7%/+6.4%/+6.4% llama3 vs +10.1%/+10.1%/−4.6%
+  llama4, 16-GPU winner flips to TP2). Final disposition in the doc: config-dependent ±15% scatter,
+  report-only, no further code change proposed. Historical, kept for provenance.
+- **Fig-5 — llama3_405B/MID/HBF+ runtime-breakdown share mismatch** — the MFU=1.0 assumption
+  (`linear_impl.cpp::effectiveMFU`) moves all four shares (FFN/Comm/Attention/KV-write) to near
+  agreement at MFU≈0.5, but this is the deferred score/MFU pair (see Deferred below) and was not
+  applied under the no-tuning rule. Historical, kept for provenance.
+- **Fig-4 — CONV/CONV+/llama4_maverick, low GPU: sim TPS 55–89% "off"** — a paper-extraction artifact
+  (bars visually overlapping/unreadable at low GPU, excluded via `compare_error_rates.py`'s
+  `is_unextractable`) compounded by a real self-inconsistency in the paper's own Fig-3÷Fig-4
+  arithmetic (implies tpot up to 0.1278s against its own stated 0.1s SLO). Not a sim bug. Historical,
+  kept for provenance.
+- **Fig-7 — online≈offline "duplicate" (1-GPU)** — CONFIRMED closed by the faithful-intermediate-data
+  SRAM gate merge (this file, items 76/78): the 1-GPU online cell becomes SRAM-bound, collapsing the
+  57% pre-merge gap to 0% at both 1-GPU and 8-GPU, matching the paper's exact duplicate PEC values.
+  Historical, kept for provenance (already closed, not open).
+
+### Deferred (2 items)
+
+- **Score/query HBM-traffic removal + GEMM-efficiency (MFU<1), "both or neither"**
+  (`attention_gen_impl.cpp`, the `m·n·G` score / `m·k·G` query terms). Former status: deferred to
+  avoid fitting the MFU knob to Fig-5 (removing score traffic alone drives 3 cells to −8…−11%; pairing
+  with MFU≈0.45–0.5 was projected to close most cells but counts as tuning-to-target). **Now
+  superseded by the correctness-first work**: this is being handled structurally by the
+  `use_flash_attention` master flag — see `FA_FLAG_SPEC.md`. Its OFF branch keeps the score/context
+  materialization terms and ADDS the softmax-memory charge GQA currently omits (unifying GQA with
+  MLA's existing treatment); its ON branch drops both coherently. This replaces the old
+  paper-fitting framing with a physically-coherent toggle, independent of ever matching Fig-5.
+- **Expert-routing skewness (`config.yaml: skewness: 0.8`, unstated by the paper)**. Former status:
+  deferred — no paper ground truth exists to fit toward (uniform 0.0 vs 0.8 both unanchored), surfaced
+  but left as-is. **MOOT: paper-match no longer pursued** — skewness can now be chosen on
+  realistic-workload grounds rather than left pending a paper anchor that was never going to arrive.
+
+### Moved to CHANGES.md / ledgers (2026-07-06 cleanup) — pointer section, already archived
+
+This closing section of `PAPER_INCONSISTENCIES.md` was itself only a pointer to material already
+relocated as of 2026-07-06: resolved paper-comparison items (U1, U2, U4, U5, U6, U8, U9, Residuals
+2–4, Fig-6 TPS+Batch extraction) live in "Paper-comparison items resolved (2026-07-03)" above; the U9
+reproduction recipe and the "Ruled out as causes" list are both in this file (see immediately above);
+U7's 7th/8th/9th-pass detail is in this file, with the raw per-pass adjudication trail in
+`ledgers/FINDINGS_REGISTER.md`; the old verbose per-session narrative is superseded by items 30-75 in
+this file. Historical, kept for provenance — nothing further to do.
+
+## 2026-07-08 — MoE DP/EP semantics (`MOE_DP_FIX_SPEC`) RESOLVED: WON'T-FIX (matches reference)
+
+The EP-across-DP scheme (`dp` reduces per-device routed-expert weight; no orthogonal `ep` knob) was
+suspected of being a dp/ep conflation bug (Hunt H / `MOE_DP_FIX_SPEC.md`). The §7 topology decision
+was settled by checking the authors' reference tool **CB1 (`LLMSimulator_HBF`)** via an AI with
+CB1 access: CB1 implements the **same Model B exactly** — `num_expert_per_device =
+num_routed·e_tp/(ne_tp·dp)`, the a2a pools tokens across `dp` onto disjoint expert owners, `dp` is
+derived, and there is no separate `ep` degree (CB1 is single-config, no parallelism sweep). This
+fork's code is **unmodified EP-across-DP** — verified across all 7 sites the spec would touch
+(`expert.cpp:42,50-51`, `decoder.cpp:137-139`, `parallelism_optimizer.cpp:174/278/72-79`,
+`model_config.h:189`, `route.cpp` aggregate). **Decision: keep the current semantics and document
+them** (`PAPER_GROUND_TRUTH.md` §3 "MoE parallelism semantics"); the Model-A change ("dp = pure
+replication") would diverge from the reference, so it is NOT implemented. `MOE_DP_FIX_SPEC.md` is
+closed (RESOLVED banner added) and is now an archive candidate for `ledgers/`. The two asymmetries
+kept for the record: routed experts absorb `dp`; shared experts + `e_tp` tensor-shard stay within a
+replica.

@@ -116,6 +116,7 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
 
   exec_status.total_duration +=
       std::max(accumul_compute_duration, accumul_memory_duration);
+  exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
 
   // Softmax //
   for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
@@ -134,6 +135,9 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
     compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
 
     exec_status.total_duration += compute_duration;
+    exec_status.batch_dependent_duration += compute_duration;
+    // PP_FLAGS_SPEC §4.2: let softmax compute serve as KV-write hiding budget (:227).
+    if (config.kv_write_softmax_hide) exec_status.compute_duration += compute_duration;
   }
 
   // Context //
@@ -201,6 +205,7 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
 
   exec_status.total_duration +=
       std::max(accumul_compute_duration, accumul_memory_duration);
+  exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
 
   exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /
                              compute_peak_flops / exec_status.total_duration;
@@ -223,6 +228,7 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
     time_ns kv_write = getKVWriteDuration(config, num_seq, num_kv_heads, head_dim, input->precision_byte, false, 0, 0, device->model_config.input_len, device->model_config.output_len, layer_info.local_attention_window, layers_per_stage);
     time_ns unhidden_write = std::max((time_ns)0, kv_write - exec_status.compute_duration);
     exec_status.total_duration += unhidden_write;
+    exec_status.batch_dependent_duration += unhidden_write;
     exec_status.kv_write_duration = unhidden_write;
   }
 
@@ -321,6 +327,7 @@ ExecStatus AttentionGenExecutionLogic(Device_Ptr device,
 
   exec_status.total_duration +=
       std::max(accumul_compute_duration, accumul_memory_duration);
+  exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
 
   // Context //
   accumul_len = 0;
@@ -369,6 +376,7 @@ ExecStatus AttentionGenExecutionLogic(Device_Ptr device,
 
   exec_status.total_duration +=
       std::max(accumul_compute_duration, accumul_memory_duration);
+  exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
 
   exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /
                              compute_peak_flops / exec_status.total_duration;
@@ -472,6 +480,7 @@ ExecStatus AttentionGenExecutionPIM(Device_Ptr device,
   // GPU/LOGIC both take total_duration += max(compute, memory) (roofline overlap).
   exec_status.total_duration +=
       std::max(accumul_compute_duration, accumul_memory_duration);
+  exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
 
   // Softmax // -- mirrors the GPU/LOGIC softmax compute charge.
   for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
@@ -487,6 +496,9 @@ ExecStatus AttentionGenExecutionPIM(Device_Ptr device,
         (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
 
     exec_status.total_duration += softmax_compute_duration;
+    exec_status.batch_dependent_duration += softmax_compute_duration;
+    // PP_FLAGS_SPEC §4.2: let softmax compute serve as KV-write hiding budget.
+    if (config.kv_write_softmax_hide) exec_status.compute_duration += softmax_compute_duration;
   }
 
   // Context //
@@ -537,6 +549,7 @@ ExecStatus AttentionGenExecutionPIM(Device_Ptr device,
   // Same max(compute, memory) roofline overlap as the Scoring section above.
   exec_status.total_duration +=
       std::max(accumul_compute_duration, accumul_memory_duration);
+  exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
 
   exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /
                              compute_peak_flops / exec_status.total_duration;
@@ -685,6 +698,7 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
     }
 
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
+    exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
   }
   else{
 
@@ -757,6 +771,7 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
     }
 
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
+    exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
 
     // Softmax //
     for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
@@ -807,7 +822,10 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
         exec_status += temp;
       }
 
-      exec_status.total_duration += std::max(compute_duration, memory_duration);;
+      exec_status.total_duration += std::max(compute_duration, memory_duration);
+      exec_status.batch_dependent_duration += std::max(compute_duration, memory_duration);
+      // PP_FLAGS_SPEC §4.3: same softmax->hide-budget contribution as the GQA path.
+      if (config.kv_write_softmax_hide) exec_status.compute_duration += compute_duration;
     }
 
     // Context //
@@ -886,6 +904,7 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
       exec_status += temp;
     }
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
+    exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
   }
 
   exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /
@@ -907,6 +926,7 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
     // accumulates across both phases and is correct here.
     time_ns unhidden_write = std::max((time_ns)0, kv_write - exec_status.compute_duration);
     exec_status.total_duration += unhidden_write;
+    exec_status.batch_dependent_duration += unhidden_write;
     exec_status.kv_write_duration = unhidden_write;
   }
 
@@ -1048,6 +1068,7 @@ ExecStatus MultiLatentAttentionGenExecutionLogic(Device_Ptr device,
     }
 
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
+    exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
   }
   else{
 
@@ -1110,6 +1131,7 @@ ExecStatus MultiLatentAttentionGenExecutionLogic(Device_Ptr device,
     }
 
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
+    exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
 
     // Softmax //
     for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
@@ -1160,7 +1182,10 @@ ExecStatus MultiLatentAttentionGenExecutionLogic(Device_Ptr device,
         exec_status += temp;
       }
 
-      exec_status.total_duration += std::max(compute_duration, memory_duration);;
+      exec_status.total_duration += std::max(compute_duration, memory_duration);
+      exec_status.batch_dependent_duration += std::max(compute_duration, memory_duration);
+      // PP_FLAGS_SPEC §4.3: same softmax->hide-budget contribution as the GQA path.
+      if (config.kv_write_softmax_hide) exec_status.compute_duration += compute_duration;
     }
 
     // Context //
@@ -1229,6 +1254,7 @@ ExecStatus MultiLatentAttentionGenExecutionLogic(Device_Ptr device,
       exec_status += temp;
     }
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
+    exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
   }
 
   exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /
@@ -1376,6 +1402,7 @@ ExecStatus MultiLatentAttentionGenExecutionPIM(Device_Ptr device,
     }
 
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
+    exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
   }
   else{
     // Score //
@@ -1437,6 +1464,7 @@ ExecStatus MultiLatentAttentionGenExecutionPIM(Device_Ptr device,
     }
 
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
+    exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
 
     // Softmax //
     for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
@@ -1487,7 +1515,10 @@ ExecStatus MultiLatentAttentionGenExecutionPIM(Device_Ptr device,
         exec_status += temp;
       }
 
-      exec_status.total_duration += std::max(compute_duration, memory_duration);;
+      exec_status.total_duration += std::max(compute_duration, memory_duration);
+      exec_status.batch_dependent_duration += std::max(compute_duration, memory_duration);
+      // PP_FLAGS_SPEC §4.3: same softmax->hide-budget contribution as the GQA path.
+      if (config.kv_write_softmax_hide) exec_status.compute_duration += compute_duration;
     }
 
     // Context //
@@ -1556,6 +1587,7 @@ ExecStatus MultiLatentAttentionGenExecutionPIM(Device_Ptr device,
       exec_status += temp;
     }
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
+    exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
   }
 
   exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /
@@ -1687,6 +1719,7 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
     }
 
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
+    exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
   }
   else{
     // Scoring for NoPE//
@@ -1758,6 +1791,7 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
     }
 
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
+    exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
 
     // Scoring for RoPE//
     accumul_len = 0;
@@ -1832,6 +1866,7 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
     }
     
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
+    exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
 
 
     // Scale + mask + Softmax //
@@ -1883,7 +1918,10 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
         exec_status += temp;
       }
 
-      exec_status.total_duration += std::max(compute_duration, memory_duration);;
+      exec_status.total_duration += std::max(compute_duration, memory_duration);
+      exec_status.batch_dependent_duration += std::max(compute_duration, memory_duration);
+      // PP_FLAGS_SPEC §4.3: same softmax->hide-budget contribution as the GQA path.
+      if (config.kv_write_softmax_hide) exec_status.compute_duration += compute_duration;
     }
 
     // Context //
@@ -1969,6 +2007,7 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
     }
 
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
+    exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
   }
 
 
@@ -1992,6 +2031,7 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
     // accumulates across both phases and is correct here.
     time_ns unhidden_write = std::max((time_ns)0, kv_write - exec_status.compute_duration);
     exec_status.total_duration += unhidden_write;
+    exec_status.batch_dependent_duration += unhidden_write;
     exec_status.kv_write_duration = unhidden_write;
   }
 
@@ -2114,6 +2154,7 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
     }
 
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
+    exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
   }
   else{
     
@@ -2186,6 +2227,7 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
     }
 
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
+    exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
 
     // Scoring for RoPE//
     accumul_len = 0;
@@ -2260,6 +2302,7 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
     }
     
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
+    exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
 
 
     // Scale + mask + Softmax //
@@ -2311,7 +2354,10 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
         exec_status += temp;
       }
 
-      exec_status.total_duration += std::max(compute_duration, memory_duration);;
+      exec_status.total_duration += std::max(compute_duration, memory_duration);
+      exec_status.batch_dependent_duration += std::max(compute_duration, memory_duration);
+      // PP_FLAGS_SPEC §4.3: same softmax->hide-budget contribution as the GQA path.
+      if (config.kv_write_softmax_hide) exec_status.compute_duration += compute_duration;
     }
 
     // Context //
@@ -2388,6 +2434,7 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
     }
 
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
+    exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
   }
 
   exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /
@@ -2516,6 +2563,7 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
     }
 
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
+    exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
   }
   else{  
     // Scoring for NoPE//
@@ -2587,6 +2635,7 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
     }
 
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
+    exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
 
     // Scoring for RoPE//
     accumul_len = 0;
@@ -2661,6 +2710,7 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
     }
     
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
+    exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
 
 
     // Scale + mask + Softmax //
@@ -2712,7 +2762,10 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
         exec_status += temp;
       }
 
-      exec_status.total_duration += std::max(compute_duration, memory_duration);;
+      exec_status.total_duration += std::max(compute_duration, memory_duration);
+      exec_status.batch_dependent_duration += std::max(compute_duration, memory_duration);
+      // PP_FLAGS_SPEC §4.3: same softmax->hide-budget contribution as the GQA path.
+      if (config.kv_write_softmax_hide) exec_status.compute_duration += compute_duration;
     }
 
     // Context //
@@ -2788,6 +2841,7 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
     }
 
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
+    exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
   }
 
   exec_status.compute_util = 1000.0 * 1000.0 * 1000.0 * total_flops /

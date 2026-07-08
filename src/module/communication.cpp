@@ -4,11 +4,52 @@
 
 #include <cmath>
 #include <algorithm>
+#include <tuple>
+#include <utility>
 
 #include "common/assert.h"
+#include "model/util.h"
 // AllReduce //
 
 namespace llm_system {
+
+namespace {
+// PP_FIX_SPEC.md §3.3: MoEScatter/MoEGather (like AllReduce/PipelineStage)
+// manipulate device_time directly and never go through ExecStatus/
+// set_pop_status, so they need their own device_time_dep tracking. Shared by
+// both modules' send/receive legs: computes {total_time, batch_dependent_time}
+// for one directional a2a transfer given its intra-/inter-node byte volumes.
+// Each link's cost is latency (fixed, batch-independent) + bandwidth (volume-
+// proportional, batch-dependent since the token/expert counts scale with the
+// batch); the two links are combined via the SAME max() the live modules use,
+// and the winning link's own bandwidth term is what gets returned as the
+// batch-dependent contribution (mirroring AllReduce::forward's split).
+std::pair<time_ns, time_ns> moeLinkTime(hw_metric intra_size, hw_metric inter_size,
+                                        bool is_prefill, bool is_decode,
+                                        hw_metric device_bw, time_ns device_lat,
+                                        hw_metric node_bw, time_ns node_lat) {
+  time_ns intra_bw = 0, intra_lat = 0, inter_bw = 0, inter_lat = 0;
+  if (is_prefill) {
+    // I6: gate each link's latency on whether it actually carries any volume,
+    // mirroring the decode branch below -- a link with zero bytes to move
+    // shouldn't still incur its fixed hop latency. (Prefill is off the paper-1
+    // decode-steady-state path, so this is a latent-consistency fix only.)
+    intra_bw = intra_size > 0 ? intra_size / device_bw * 1000 * 1000 * 1000 : 0.0;
+    intra_lat = intra_size > 0 ? device_lat : 0.0;
+    inter_bw = inter_size > 0 ? inter_size / node_bw * 1000 * 1000 * 1000 : 0.0;
+    inter_lat = inter_size > 0 ? node_lat : 0.0;
+  } else if (is_decode) {
+    intra_bw = intra_size > 0 ? intra_size / device_bw * 1000 * 1000 * 1000 : 0.0;
+    intra_lat = intra_size > 0 ? device_lat : 0.0;
+    inter_bw = inter_size > 0 ? inter_size / node_bw * 1000 * 1000 * 1000 : 0.0;
+    inter_lat = inter_size > 0 ? node_lat : 0.0;
+  }
+  time_ns intra_total = intra_lat + intra_bw;
+  time_ns inter_total = inter_lat + inter_bw;
+  return (intra_total >= inter_total) ? std::make_pair(intra_total, intra_bw)
+                                      : std::make_pair(inter_total, inter_bw);
+}
+}  // namespace
 
 AllReduce::AllReduce(std::string& prefix, std::string& name,
                      std::vector<int> device_list, Device::Ptr device)
@@ -66,10 +107,19 @@ Tensor::Ptr AllReduce::forward(const Tensor::Ptr input,
   hw_metric link_bandwidth = cross_node ? device->config.node_ict_bandwidth
                                         : device->config.device_ict_bandwidth;
 
-  time_ns total_time =
-      (time_ns)(latency_hops * link_latency +
-                (double)bw_hops * ((double)size / n_ranks) /
-                    link_bandwidth * 1e9);
+  // PP_FIX_SPEC.md §3.3: like PipelineStage, AllReduce::forward manipulates
+  // device_time directly (never goes through ExecStatus/set_pop_status), so
+  // the mechanical batch_dependent_duration tagging applied to the Linear/
+  // Activation/AttentionGen impl files never reaches it. Split total_time
+  // into its batch-INDEPENDENT latency term (fixed hop count, independent of
+  // message size) and its batch-DEPENDENT bandwidth term (size/n_ranks scales
+  // with the batch-sized message) so the pp>1 reconstruction's device_time -
+  // device_time_dep split (cluster.cpp) correctly treats only the volume
+  // term as something to divide by pp, not the whole AR cost.
+  time_ns latency_term = (time_ns)(latency_hops * link_latency);
+  time_ns bandwidth_term = (time_ns)((double)bw_hops * ((double)size / n_ranks) /
+                                     link_bandwidth * 1e9);
+  time_ns total_time = latency_term + bandwidth_term;
 
   if (input->parallel_execution && !device->config.communication_hiding) {
     if (input->isPerformHigh()) {
@@ -79,6 +129,7 @@ Tensor::Ptr AllReduce::forward(const Tensor::Ptr input,
     }
   }
   device->status.device_time += total_time;
+  device->status.device_time_dep += bandwidth_term;
 
   return output;
 }
@@ -129,12 +180,23 @@ Tensor::Ptr MoEScatter::forward(const Tensor::Ptr input,
 
   std::unordered_set<int> set_tp_devices(tp_sharing_device_list.begin(), tp_sharing_device_list.end());
 
-  int total_num_device = device->config.num_device * device->config.num_node;
+  // PP_FIX (MoE a2a pp>1 scoping): iterate this STAGE's device_list (member,
+  // set at Create-time to the stage-scoped devices -- see expert.cpp:39/110),
+  // not the whole cluster. At pp==1 the stage device_list == the whole
+  // cluster in rank order, so stage_n == total_num_device and
+  // device_list[di] == di for every di -- byte-identical to the prior
+  // total_num_device-based loop.
+  int stage_n = (int)device_list.size();
 
-  for(int dst = 0; dst < total_num_device; dst ++){ // dst: destination device
+  for(int di = 0; di < stage_n; di ++){ // di: LOCAL index within this stage's device_list
+    int dst = device_list[di]; // dst: destination device (GLOBAL rank)
     if(set_tp_devices.count(dst) == 0){ // outer tp space
-      int expert_id_offset = device->model_config.num_routed_expert / total_num_device * (dst / e_tp_dg) * e_tp_dg;
-      int num_expert_per_device = device->model_config.num_routed_expert / total_num_device * e_tp_dg;
+      // I7: multiply-first (matches cluster.cpp:154's num_routed_expert*e_tp_dg/devices_per_stage
+      // capacity-model convention) instead of divide-first -- identical today since
+      // num_routed_expert is evenly divisible by stage_n for every swept config.
+      int expert_id_offset = device->model_config.num_routed_expert * e_tp_dg / stage_n * (di / e_tp_dg);
+      // I7: multiply-first, matching cluster.cpp's capacity-model convention (see comment above).
+      int num_expert_per_device = device->model_config.num_routed_expert * e_tp_dg / stage_n;
 
       if((int)(dst / device->config.num_device) == src_node){
         // intra node
@@ -152,7 +214,7 @@ Tensor::Ptr MoEScatter::forward(const Tensor::Ptr input,
   }
 
   // if ne_tp_dg > 1, tp sharing devices have same tokens. Therefore, need to be divided by ne_tp_dg (send only 1/ne_tp_dg tokens)
-  
+
   hw_metric intra_node_comm_size = 1.0 * intra_node_comm_token * k * input->precision_byte;
   hw_metric inter_node_comm_size = 1.0 * inter_node_comm_token * k * input->precision_byte;
 
@@ -163,31 +225,18 @@ Tensor::Ptr MoEScatter::forward(const Tensor::Ptr input,
     return output;
   }
 
-  if(sequences_metadata->get_sum_process_token() > 0){
-    // prefill & mixed stage - use both NVLink and InfiniBand
-
-    time_ns intra_node_latency = intra_node_comm_size / device->config.device_ict_bandwidth * 1000 * 1000 * 1000
-                                + device->config.device_ict_latency;
-                                
-    time_ns inter_node_latency = inter_node_comm_size / device->config.node_ict_bandwidth * 1000 * 1000 * 1000
-                                + device->config.node_ict_latency;
-
-    send_time = std::max(intra_node_latency, inter_node_latency);
-  }
-  else if (sequences_metadata->get_gen_process_token() > 0){
-    // decode - same physical links as prefill: intra-node bytes ride NVLink,
-    // inter-node bytes ride InfiniBand, and the two links run concurrently
-    // (max composition). A zero-byte direction charges nothing. At
-    // num_node == 1 inter_node_comm_size is structurally 0, so this reduces
-    // to the old NVLink-only path bit-for-bit.
-    time_ns intra_node_latency = intra_node_comm_size > 0 ?
-        intra_node_comm_size / device->config.device_ict_bandwidth * 1000 * 1000 * 1000
-        + device->config.device_ict_latency : 0;
-    time_ns inter_node_latency = inter_node_comm_size > 0 ?
-        inter_node_comm_size / device->config.node_ict_bandwidth * 1000 * 1000 * 1000
-        + device->config.node_ict_latency : 0;
-    send_time = std::max(intra_node_latency, inter_node_latency);
-  }
+  // PP_FIX_SPEC.md §3.3: moeLinkTime splits the fixed link latency
+  // (batch-independent) from the volume-proportional bandwidth term
+  // (batch-dependent) and propagates the winning (max) link's dep value --
+  // see its doc comment above. Numerically identical to the prior inline
+  // send_time computation (same formulas, same max composition).
+  time_ns send_dep = 0, receive_dep = 0;
+  bool is_prefill = sequences_metadata->get_sum_process_token() > 0;
+  bool is_decode = sequences_metadata->get_gen_process_token() > 0;
+  std::tie(send_time, send_dep) = moeLinkTime(
+      intra_node_comm_size, inter_node_comm_size, is_prefill, is_decode,
+      device->config.device_ict_bandwidth, device->config.device_ict_latency,
+      device->config.node_ict_bandwidth, device->config.node_ict_latency);
 
   // Receive time //
   intra_node_comm_token = 0;
@@ -198,14 +247,22 @@ Tensor::Ptr MoEScatter::forward(const Tensor::Ptr input,
 
   int pp_dg = device->model_config.pp_dg;
   int dst_dp_rank = (device->device_total_rank / ne_tp_dg) / pp_dg; // data parallel index
-  
-  int expert_id_offset = device->model_config.num_routed_expert / total_num_device * (dst_device_rank / e_tp_dg) * e_tp_dg; // experts in a dst_device
-  int num_expert_per_device = device->model_config.num_routed_expert / total_num_device * e_tp_dg;
 
-  for(int src_dp_idx = 0; src_dp_idx < (total_num_device / ne_tp_dg) / pp_dg; src_dp_idx ++){ 
+  // PP_FIX: LOCAL rank of this device within its stage's device_list, not a
+  // global-rank-derived offset -- see get_local_rank_in_list (model/util.h).
+  int dst_local_rank = get_local_rank_in_list(device_list, dst_device_rank);
+  // I7: multiply-first, matching cluster.cpp's capacity-model convention (see comment above).
+  int expert_id_offset = device->model_config.num_routed_expert * e_tp_dg / stage_n * (dst_local_rank / e_tp_dg); // experts in a dst_device
+  // I7: multiply-first, matching cluster.cpp's capacity-model convention.
+  int num_expert_per_device = device->model_config.num_routed_expert * e_tp_dg / stage_n;
+
+  // stage_n/ne_tp_dg == dp (the stage device_list already excludes other pp
+  // stages, so no separate /pp_dg is needed here -- equals the prior
+  // (total_num_device/ne_tp_dg)/pp_dg at every pp, byte-identical at pp==1).
+  for(int src_dp_idx = 0; src_dp_idx < stage_n / ne_tp_dg; src_dp_idx ++){
     if(src_dp_idx != dst_dp_rank){ // from other dp space
 
-      int src_device_rank = src_dp_idx * ne_tp_dg;
+      int src_device_rank = device_list[src_dp_idx * ne_tp_dg]; // GLOBAL rank, for the node check
       int src_node = src_device_rank / device->config.num_device;
 
       if(dst_node == src_node){ 
@@ -235,33 +292,13 @@ Tensor::Ptr MoEScatter::forward(const Tensor::Ptr input,
     return output;
   }
 
-  if(sequences_metadata->get_sum_process_token() > 0){
-    // prefill & mixed stage - use both NVLink and InfiniBand
-
-    time_ns intra_node_latency = intra_node_comm_size / device->config.device_ict_bandwidth * 1000 * 1000 * 1000
-                                + device->config.device_ict_latency;
-                                
-    time_ns inter_node_latency = inter_node_comm_size / device->config.node_ict_bandwidth * 1000 * 1000 * 1000
-                                + device->config.node_ict_latency;
-
-    receive_time = std::max(intra_node_latency, inter_node_latency);
-  }
-  else if (sequences_metadata->get_gen_process_token() > 0){
-    // decode - same physical links as prefill: intra-node bytes ride NVLink,
-    // inter-node bytes ride InfiniBand, and the two links run concurrently
-    // (max composition). A zero-byte direction charges nothing. At
-    // num_node == 1 inter_node_comm_size is structurally 0, so this reduces
-    // to the old NVLink-only path bit-for-bit.
-    time_ns intra_node_latency = intra_node_comm_size > 0 ?
-        intra_node_comm_size / device->config.device_ict_bandwidth * 1000 * 1000 * 1000
-        + device->config.device_ict_latency : 0;
-    time_ns inter_node_latency = inter_node_comm_size > 0 ?
-        inter_node_comm_size / device->config.node_ict_bandwidth * 1000 * 1000 * 1000
-        + device->config.node_ict_latency : 0;
-    receive_time = std::max(intra_node_latency, inter_node_latency);
-  }
+  std::tie(receive_time, receive_dep) = moeLinkTime(
+      intra_node_comm_size, inter_node_comm_size, is_prefill, is_decode,
+      device->config.device_ict_bandwidth, device->config.device_ict_latency,
+      device->config.node_ict_bandwidth, device->config.node_ict_latency);
 
   total_time = std::max(send_time, receive_time);
+  time_ns total_dep = (send_time >= receive_time) ? send_dep : receive_dep;
 
   if (input->parallel_execution && !device->config.communication_hiding) {
     if (input->isPerformHigh()) {
@@ -272,6 +309,7 @@ Tensor::Ptr MoEScatter::forward(const Tensor::Ptr input,
     }
   }
   device->status.device_time += total_time;
+  device->status.device_time_dep += total_dep;
 
   return output;
 }
@@ -321,12 +359,28 @@ TensorVec MoEGather::forward(const TensorVec input_vec,
 
   std::unordered_set<int> set_e_tp_devices(e_tp_sharing_device_list.begin(), e_tp_sharing_device_list.end());
 
-  int total_num_device = device->config.num_device * device->config.num_node;
-  
-  for(int src = 0; src < total_num_device; src ++){ // dst: destination device
+  // PP_FIX (MoE a2a pp>1 scoping): iterate this STAGE's device_list (member),
+  // not the whole cluster -- see the matching comment in MoEScatter::forward
+  // above. At pp==1 the stage device_list == the whole cluster in rank
+  // order, so stage_n == total_num_device and device_list[di] == di for
+  // every di -- byte-identical to the prior total_num_device-based loop.
+  //
+  // NOTE: this leg excludes via set_e_tp_devices (the e_tp peer set), not the
+  // tp set used in MoEScatter's send leg. e_tp peers are contiguous only when
+  // e_tp_dg <= ne_tp_dg; under pp>1 with e_tp_dg>ne_tp_dg the e_tp block can
+  // span non-contiguous groups of this stage's device_list -- pp=1-safe,
+  // latent for e_tp_dg>ne_tp_dg (not reached by paper-1 configs).
+  int stage_n = (int)device_list.size();
+
+  for(int di = 0; di < stage_n; di ++){ // di: LOCAL index within this stage's device_list
+    int src = device_list[di]; // src: source device (GLOBAL rank)
     if(set_e_tp_devices.count(src) == 0){ // outer tp space
-      int expert_id_offset = device->model_config.num_routed_expert / total_num_device * (src / e_tp_dg) * e_tp_dg;
-      int num_expert_per_device = device->model_config.num_routed_expert / total_num_device * e_tp_dg;
+      // I7: multiply-first (matches cluster.cpp:154's num_routed_expert*e_tp_dg/devices_per_stage
+      // capacity-model convention) instead of divide-first -- identical today since
+      // num_routed_expert is evenly divisible by stage_n for every swept config.
+      int expert_id_offset = device->model_config.num_routed_expert * e_tp_dg / stage_n * (di / e_tp_dg);
+      // I7: multiply-first, matching cluster.cpp's capacity-model convention (see comment above).
+      int num_expert_per_device = device->model_config.num_routed_expert * e_tp_dg / stage_n;
 
       if((int)(src / device->config.num_device) == dst_node){
         // intra node
@@ -362,31 +416,17 @@ TensorVec MoEGather::forward(const TensorVec input_vec,
     return input_vec;
   }
 
-  if(sequences_metadata->get_sum_process_token() > 0){
-    // prefill & mixed stage - use both NVLink and InfiniBand
-
-    time_ns intra_node_latency = intra_node_comm_size / device->config.device_ict_bandwidth * 1000 * 1000 * 1000
-                                + device->config.device_ict_latency;
-                                
-    time_ns inter_node_latency = inter_node_comm_size / device->config.node_ict_bandwidth * 1000 * 1000 * 1000
-                                + device->config.node_ict_latency;
-
-    receive_time = std::max(intra_node_latency, inter_node_latency);
-  }
-  else if (sequences_metadata->get_gen_process_token() > 0){
-    // decode - same physical links as prefill: intra-node bytes ride NVLink,
-    // inter-node bytes ride InfiniBand, and the two links run concurrently
-    // (max composition). A zero-byte direction charges nothing. At
-    // num_node == 1 inter_node_comm_size is structurally 0, so this reduces
-    // to the old NVLink-only path bit-for-bit.
-    time_ns intra_node_latency = intra_node_comm_size > 0 ?
-        intra_node_comm_size / device->config.device_ict_bandwidth * 1000 * 1000 * 1000
-        + device->config.device_ict_latency : 0;
-    time_ns inter_node_latency = inter_node_comm_size > 0 ?
-        inter_node_comm_size / device->config.node_ict_bandwidth * 1000 * 1000 * 1000
-        + device->config.node_ict_latency : 0;
-    receive_time = std::max(intra_node_latency, inter_node_latency);
-  }
+  // PP_FIX_SPEC.md §3.3: see moeLinkTime's doc comment above (shared with
+  // MoEScatter::forward) -- splits fixed link latency (indep) from the
+  // volume-proportional bandwidth term (dep), numerically identical to the
+  // prior inline receive_time computation.
+  time_ns send_dep = 0, receive_dep = 0;
+  bool is_prefill = sequences_metadata->get_sum_process_token() > 0;
+  bool is_decode = sequences_metadata->get_gen_process_token() > 0;
+  std::tie(receive_time, receive_dep) = moeLinkTime(
+      intra_node_comm_size, inter_node_comm_size, is_prefill, is_decode,
+      device->config.device_ict_bandwidth, device->config.device_ict_latency,
+      device->config.node_ict_bandwidth, device->config.node_ict_latency);
 
   // Send time //
   intra_node_comm_token = 0;
@@ -397,14 +437,22 @@ TensorVec MoEGather::forward(const TensorVec input_vec,
 
   int pp_dg = device->model_config.pp_dg;
   int src_dp_rank = (device->device_total_rank / ne_tp_dg) / pp_dg; // data parallel index
-  
-  int expert_id_offset = device->model_config.num_routed_expert / total_num_device * (src_device_rank / e_tp_dg) * e_tp_dg; // experts in a src_device
-  int num_expert_per_device = device->model_config.num_routed_expert / total_num_device * e_tp_dg;
 
-  for(int dst_dp_idx = 0; dst_dp_idx < (total_num_device / ne_tp_dg) / pp_dg; dst_dp_idx ++){ 
+  // PP_FIX: LOCAL rank of this device within its stage's device_list, not a
+  // global-rank-derived offset -- see get_local_rank_in_list (model/util.h).
+  int src_local_rank = get_local_rank_in_list(device_list, src_device_rank);
+  // I7: multiply-first, matching cluster.cpp's capacity-model convention (see comment above).
+  int expert_id_offset = device->model_config.num_routed_expert * e_tp_dg / stage_n * (src_local_rank / e_tp_dg); // experts in a src_device
+  // I7: multiply-first, matching cluster.cpp's capacity-model convention.
+  int num_expert_per_device = device->model_config.num_routed_expert * e_tp_dg / stage_n;
+
+  // stage_n/ne_tp_dg == dp (the stage device_list already excludes other pp
+  // stages, so no separate /pp_dg is needed here -- equals the prior
+  // (total_num_device/ne_tp_dg)/pp_dg at every pp, byte-identical at pp==1).
+  for(int dst_dp_idx = 0; dst_dp_idx < stage_n / ne_tp_dg; dst_dp_idx ++){
     if(dst_dp_idx != src_dp_rank){ // to other dp space
 
-      int dst_device_rank = dst_dp_idx * ne_tp_dg;
+      int dst_device_rank = device_list[dst_dp_idx * ne_tp_dg]; // GLOBAL rank, for the node check
       int dst_node = dst_device_rank / device->config.num_device;
 
       if(dst_node == src_node){ 
@@ -434,33 +482,13 @@ TensorVec MoEGather::forward(const TensorVec input_vec,
     return input_vec;
   }
 
-  if(sequences_metadata->get_sum_process_token() > 0){
-    // prefill & mixed stage - use both NVLink and InfiniBand
-
-    time_ns intra_node_latency = intra_node_comm_size / device->config.device_ict_bandwidth * 1000 * 1000 * 1000
-                                + device->config.device_ict_latency;
-                                
-    time_ns inter_node_latency = inter_node_comm_size / device->config.node_ict_bandwidth * 1000 * 1000 * 1000
-                                + device->config.node_ict_latency;
-
-    send_time = std::max(intra_node_latency, inter_node_latency);
-  }
-  else if (sequences_metadata->get_gen_process_token() > 0){
-    // decode - same physical links as prefill: intra-node bytes ride NVLink,
-    // inter-node bytes ride InfiniBand, and the two links run concurrently
-    // (max composition). A zero-byte direction charges nothing. At
-    // num_node == 1 inter_node_comm_size is structurally 0, so this reduces
-    // to the old NVLink-only path bit-for-bit.
-    time_ns intra_node_latency = intra_node_comm_size > 0 ?
-        intra_node_comm_size / device->config.device_ict_bandwidth * 1000 * 1000 * 1000
-        + device->config.device_ict_latency : 0;
-    time_ns inter_node_latency = inter_node_comm_size > 0 ?
-        inter_node_comm_size / device->config.node_ict_bandwidth * 1000 * 1000 * 1000
-        + device->config.node_ict_latency : 0;
-    send_time = std::max(intra_node_latency, inter_node_latency);
-  }
+  std::tie(send_time, send_dep) = moeLinkTime(
+      intra_node_comm_size, inter_node_comm_size, is_prefill, is_decode,
+      device->config.device_ict_bandwidth, device->config.device_ict_latency,
+      device->config.node_ict_bandwidth, device->config.node_ict_latency);
 
   total_time = std::max(send_time, receive_time);
+  time_ns total_dep = (send_time >= receive_time) ? send_dep : receive_dep;
 
   if (input->parallel_execution && !device->config.communication_hiding) {
     if (input->isPerformHigh()) {
@@ -470,6 +498,7 @@ TensorVec MoEGather::forward(const TensorVec input_vec,
     }
   }
   device->status.device_time += total_time;
+  device->status.device_time_dep += total_dep;
 
   return input_vec;
 }
@@ -556,35 +585,34 @@ Tensor::Ptr PipelineStage::forward(const Tensor::Ptr input,
   }
 
   device->status.device_time += comm_time;
+  // PP_FIX_SPEC.md §3.5: also record this stage's own hop cost separately from
+  // device_time, so the pp>1 reconstruction (cluster.cpp) can read back
+  // exactly what this stage's PipelineStage contributed and account for it
+  // once (as the explicit (pp-1)*hop term) instead of leaving it embedded in
+  // this stage's own device_time (which would double-count it, since the
+  // reconstruction already adds one hop per non-last stage explicitly).
+  device->status.pipeline_hop_time += comm_time;
 
-  // Propagate elapsed time to the destination stage's device. A token cannot
-  // begin stage (k+1)'s compute before stage k's output has physically arrived,
-  // and in autoregressive decode the stages of one token pass are strictly
-  // sequential (a request's token t+1 cannot enter stage 0 before token t
-  // leaves the last stage, and even micro-batch pipelining leaves the
-  // steady-state rate at batch / sum-of-stages) -- so the destination's clock
-  // must end at src's send-complete time PLUS the destination's own stage work.
-  //
-  // This is an ADDITION of the upstream cumulative time, not a max() bump.
-  // Every device's clock is reset to 0 at the start of each iteration
-  // (Cluster::run -> restartModuleGraph -> reset_status), so at this moment
-  // dst's device_time holds exactly its own locally-accumulated stage work
-  // (plus any upstream time already chained in by an earlier stage's
-  // PipelineStage -- devices execute in rank order = pipeline-stage order, so
-  // upstream bumps land before this stage's own PipelineStage runs).
-  //
-  // Addition is exact for both device-execution orderings the round-robin
-  // scheduler (Cluster::run) produces: when dst has not yet run (tp==1, no
-  // intra-stage sync blocks it, so devices drain in rank = pipeline order) it
-  // contributes 0 and stages serialize; when dst has already accumulated its
-  // stage work (tp>=2, per-layer AllReduce advances all stages in lock-step) it
-  // contributes that work on top of the upstream time. Either way the destination
-  // clock ends at src's send-complete time plus its own stage work. Serialization
-  // is the correct decode accounting (autoregressive dependency; steady-state rate
-  // is batch / sum-of-stages regardless of micro-batch pipelining). See CHANGES.md
-  // items 22/35.
-  Device::Ptr dst_device = device->cluster->get_device(dst_rank);
-  dst_device->status.device_time += device->status.device_time;
+  // PP_FIX_SPEC.md §3.4 (the double-count fix): this used to also do
+  // `dst_device->status.device_time += device->status.device_time;` --
+  // propagating THIS device's entire cumulative clock (this stage's own work
+  // PLUS the hop) onto the next stage's device. That models strict
+  // serialization across pipeline stages at the FULL per-replica batch, which
+  // is exactly the "3rd stage" double-count/over-serialization this fix
+  // removes (see PP_FIX_SPEC.md §1 root-cause trace): the non-atomic
+  // round-robin device scheduler lets a stage-1 group AllReduce's
+  // sync_devices max-broadcast (module_graph.cpp) land between the 8 per-tp-
+  // peer PipelineStage adds, re-stamping an already-added clock onto the two
+  // devices that had not yet been added to, which then get added to a SECOND
+  // time. Stages are no longer serialized through this propagation; each
+  // stage's device_time now holds only its own locally-accumulated work (plus
+  // its own one-hop send cost above). Cluster::runIterationMixed /
+  // runIterationSumGenSplit reconstruct the correct pp>1 reported time as
+  // full_model(B/pp) + (pp-1)*hop directly from each stage's own clock
+  // (device_time/device_time_dep/pipeline_hop_time), rather than relying on
+  // clocks chained stage-to-stage through this module. dst_rank is retained
+  // as a PipelineStage member (constructor) for module-graph wiring, but is
+  // no longer dereferenced here.
 
   return output;
 }

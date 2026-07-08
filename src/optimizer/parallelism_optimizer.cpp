@@ -30,6 +30,22 @@ std::vector<ParallelConfig> ParallelismOptimizer::EnumerateCandidates(
       if (total_gpus % (tp * pp) != 0) continue;  // prevent stranded GPUs (non-divisible configs)
       if (model_config.num_layers % pp != 0) continue;
 
+      // PP_FLAGS_SPEC §3.1: inter-node-only PP. A pipeline replica occupies tp*pp
+      // contiguous ranks (rank = d*(tp*pp) + s*tp + t, LLM::LLM/llm.cpp). With
+      // node size N = num_device (GPUs/node) and power-of-2 tp,pp,N the replicas
+      // tile node boundaries exactly, so:
+      //   tp*pp <= N  <=>  every replica fits inside ONE node
+      //                    => all pp stages co-located => every PP hop intra-node
+      //   tp*pp >  N  <=>  a replica spans >= 2 nodes => at least one PP hop is
+      //                    inter-node (the benefit PP is meant to buy).
+      // Intra-node pp>1 never wins a cell under the pipelined model (Hunt B) and
+      // is disallowed here so the analytic listing, the pruning seed, AND
+      // Optimize() all agree (this function feeds all three). pp==1 always allowed.
+      if (system_config.pp_internode_only && pp > 1 &&
+          (long long)tp * pp <= system_config.num_device) {
+        continue;
+      }
+
       int dp = total_gpus / (tp * pp);
       // Skip configs where batch cannot be evenly divided across DP groups.
       // This is physically correct: uneven DP creates load imbalance.  The
@@ -94,6 +110,16 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
       // Memory footprint calculation
       double layers_per_stage = (double)model_config.num_layers / pp;
       double batch_size_per_gpu = (double)batch_size / dp;
+      // PP_FIX_SPEC.md §4: the analytic latency mirror of the pp>1 runtime fix
+      // (cluster.cpp's reportedIterationTime()) -- the true per-stage decode
+      // latency is a function of the MICROBATCH (B/pp), not the full
+      // per-replica batch (capacity/KV/PEC accounting stays at full
+      // batch_size_per_gpu; ONLY the latency terms below use this). Reduces to
+      // batch_size_per_gpu exactly when pp==1 (regression-safe).
+      // PP_FLAGS_SPEC §2.2: microbatch latency basis only when pipelined timing ships.
+      double batch_for_latency = system_config.pp_pipelined_timing
+                                   ? batch_size_per_gpu / pp
+                                   : batch_size_per_gpu;
       double precision = model_config.precision_byte;
       double hidden_dim = model_config.hidden_dim;
 
@@ -252,7 +278,17 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
         double experts_per_device = (double)model_config.num_routed_expert / devices_per_stage;
         double assignments        = (double)batch_size * model_config.top_k;
         double device_share       = experts_per_device / model_config.num_routed_expert;
-        e_active = std::min(experts_per_device, std::ceil(assignments * device_share));
+        // MOE_TAG_FIX_SPEC §7 / PP_FLAGS_SPEC §4.5: microbatch basis, mirroring
+        // the runtime cold-at-micro correction and PP_FIX_SPEC §4's
+        // batch_for_latency = batch_size_per_gpu/pp. Latency streams only
+        // A(B/pp) experts per stage per step; capacity is unaffected
+        // (weight_per_gpu above keeps ALL experts resident). Keyed to the SAME
+        // pp_pipelined_timing flag as batch_for_latency so the MoE tag's
+        // optimizer mirror stays consistent with the runtime's dep-tag
+        // (inert whenever pipelined timing is off -- PP_FLAGS_SPEC §4.5 proof).
+        // pp==1 => eactive_pp==1 either way => regression-safe.
+        double eactive_pp = system_config.pp_pipelined_timing ? pp : 1;
+        e_active = std::min(experts_per_device, std::ceil(assignments * device_share / eactive_pp));
         if (e_active < 1.0) e_active = 1.0;
       }
 
@@ -323,8 +359,18 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
       double num_routed_expert_per_device = (model_config.num_routed_expert > 0)
           ? (double)model_config.num_routed_expert * e_tp_dg / devices_per_stage
           : 0.0;
+      // peakIntermediateBytes/intermediateExtrasBytes divide the routed-expert
+      // activation term by model.e_tp_dg internally (footprint.h:231, :367) to
+      // undo the ×e_tp_dg baked into num_routed_expert_per_device above. But
+      // model_config here is the caller's const config, whose e_tp_dg is the
+      // sweep-invariant default (1) -- not this candidate's swept e_tp_dg. Use
+      // a local copy with e_tp_dg patched to the swept value so the division
+      // actually cancels; otherwise ep>1 candidates over-charge routed
+      // activation bytes by a factor of ep.
+      ModelConfig mc = model_config;
+      mc.e_tp_dg = e_tp_dg;
       double act_size = peakIntermediateBytes(
-          model_config, batch_size_per_gpu, tp, expert_batch_size,
+          mc, batch_size_per_gpu, tp, expert_batch_size,
           num_routed_expert_per_device,
           /*has_moe_layer=*/model_config.num_routed_expert > 0,
           /*has_dense_layer=*/hasDenseFfnLayer(model_config));
@@ -337,7 +383,7 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
       // stage's layer count (num_layers/pp), matching the weight/KV terms
       // above. Mirrors the live-sim gate (cluster.cpp) so the two never
       // drift.
-      act_size += intermediateExtrasBytes(model_config, batch_size_per_gpu, tp,
+      act_size += intermediateExtrasBytes(mc, batch_size_per_gpu, tp,
                                           layers_per_stage);
 
       // ---- Memory limit verification (via shared checkCapacity) ---------------
@@ -404,9 +450,9 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
       // factor must not appear here because compute_peak_flops is in op/s not byte-op/s.
       double total_flops = layers_per_stage *
                            (2.0 * attn_weights_params + 2.0 * mlp_weights_params) *
-                           batch_size_per_gpu / tp;
+                           batch_for_latency / tp;
       double compute_time = total_flops /
-          (system_config.compute_peak_flops * effectiveMFU(system_config, batch_size_per_gpu)) * 1e9;
+          (system_config.compute_peak_flops * effectiveMFU(system_config, batch_for_latency)) * 1e9;
 
       // KV read time (decode). CONTEXT BASIS: the capacity term above sizes the
       // FULL lifetime (input+output — a sequence must fit at its longest), but
@@ -427,11 +473,11 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
       if (model_config.compressed_kv) {
         kv_read_size = layers_per_stage *
             (model_config.kv_lora_rank + model_config.qk_rope_head_dim) *
-            precision * batch_size_per_gpu * steady_ctx;
+            precision * batch_for_latency * steady_ctx;
       } else {
         kv_read_size = (effectiveKvLenSumAllLayers(model_config, (int)steady_ctx) / pp) *
             (2.0 * (model_config.num_kv_heads / (double)tp) * model_config.head_dim * precision) *
-            batch_size_per_gpu;
+            batch_for_latency;
       }
       double kv_read_time = 0.0;
       if (use_flash) {
@@ -476,16 +522,16 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
       double kv_write_time = 0.0;
       if (use_flash) {
         const auto& hbf = system_config.hbf_config;
-        double num_new_queries = batch_size_per_gpu /
+        double num_new_queries = batch_for_latency /
                                  (model_config.output_len > 0 ? model_config.output_len : 1);
 
         // Attention-only compute per layer (the hiding budget). Basis matches the
         // simulator exactly: attention_gen_impl.cpp's unhidden_write overlaps only the
         // attention kernel's own compute (FFN is a separate kernel). Identical for every
         // layer, so computed once.
-        double attn_flops_per_layer = 2.0 * attn_weights_params * batch_size_per_gpu / tp;
+        double attn_flops_per_layer = 2.0 * attn_weights_params * batch_for_latency / tp;
         double single_layer_attn_compute = attn_flops_per_layer /
-            (system_config.compute_peak_flops * effectiveMFU(system_config, batch_size_per_gpu)) * 1e9;
+            (system_config.compute_peak_flops * effectiveMFU(system_config, batch_for_latency)) * 1e9;
         // Hiding budget is ATTENTION-ONLY compute (not attn+FFN), matching the simulator's
         // basis exactly: attention_gen_impl.cpp's unhidden_write = max(0, kv_write -
         // exec_status.compute_duration) only accumulates the attention kernel's own
@@ -544,7 +590,7 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
 
       // Communication latency
       // TP All-Reduce (2 per layer) and PP send/receive share the same message shape.
-      double inter_stage_message_size = batch_size_per_gpu * hidden_dim * precision;
+      double inter_stage_message_size = batch_for_latency * hidden_dim * precision;
       // All-reduce cost model, mirroring the live AllReduce::forward
       // (src/module/communication.cpp): bandwidth-optimal volume 2(N-1)/N * size per
       // link, plus a LOGARITHMIC latency term 2*ceil(log2(N)) (recursive-doubling on
@@ -590,7 +636,7 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
       //    group spans nodes when e_tp_dg > gpus_per_node).
       double moe_comm_time = 0.0;
       if (model_config.num_routed_expert > 0) {
-        double token_bytes = batch_size_per_gpu * model_config.top_k *
+        double token_bytes = batch_for_latency * model_config.top_k *
                              hidden_dim * precision;
         // Node-aware link split, mirroring the fixed live MoEScatter/MoEGather decode
         // branches (communication.cpp): intra-node crossing bytes ride NVLink,
@@ -617,7 +663,7 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
         // Live e_tp AR (expert.cpp:188, all_reduce_for_e_tp) reduces the (batch, hidden)
         // block -- the un-duplicated input tensor -- not the top_k-duplicated scatter/gather
         // volume above, so it gets its own message size.
-        double e_tp_ar_volume = batch_size_per_gpu * hidden_dim * precision;
+        double e_tp_ar_volume = batch_for_latency * hidden_dim * precision;
         double e_tp_ar_ns  = allreduce_ns(e_tp_dg, e_tp_ar_volume);
         double ne_tp_ar_ns = allreduce_ns(tp, inter_stage_message_size);
         moe_comm_time = moe_layers_in_stage *

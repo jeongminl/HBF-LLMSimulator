@@ -1,5 +1,7 @@
 #include "scheduler/sequence.h"
 
+#include <cmath>
+
 #include "scheduler/scheduler.h"
 
 namespace llm_system {
@@ -170,6 +172,19 @@ void BatchedSequence::update_expert(int num_expert, int top_k,
     skewness_weight[i] = 1.0 / pow((i + 1), scheduler->model_config.skewness);
   }
 
+  // MOE_TAG_FIX_SPEC §4.4: fill num_token_in_expert_micro in the SAME pass,
+  // reusing the SAME per-token draws -- no new RNG call, so num_token_in_expert
+  // (full) stays bit-identical to pre-fix.
+  num_token_in_expert_micro.assign(num_expert, 0);
+  int pp = scheduler->model_config.pp_dg;
+  // Microbatch cutoff: first ceil(total_process_tokens/pp) tokens of THIS replica.
+  int total_process_tokens = 0;
+  for (auto seq : sequence) total_process_tokens += seq->num_process_token;
+  int micro_cutoff = (pp > 1)
+      ? (int)std::ceil((double)total_process_tokens / pp)
+      : total_process_tokens;              // pp==1 => micro == full (never read anyway)
+  int micro_seen = 0;                      // running token index over the sequence-major loop
+
   for (auto seq : sequence) {
     if (seq->num_process_token == 0) {
       continue;
@@ -179,12 +194,14 @@ void BatchedSequence::update_expert(int num_expert, int top_k,
 
     for (int token_id = current_len;
          token_id < current_len + seq->num_process_token; token_id++) {
+      bool in_micro = (micro_seen < micro_cutoff);
       if (seq->get_expert_from_list) {
         for (int k = 0; k < top_k; k++) {
           int e_id = 0;
           e_id = scheduler->sequences_info[seq_id]
                      ->expert_list[token_id * num_layer + cur_layer][k];
           num_token_in_expert[e_id] += 1;
+          if (in_micro) num_token_in_expert_micro[e_id] += 1;
         }
       } else {
         std::set<int> expert_list;
@@ -196,8 +213,10 @@ void BatchedSequence::update_expert(int num_expert, int top_k,
         }
         for (auto idx : expert_list) {
           num_token_in_expert[idx] += 1;
+          if (in_micro) num_token_in_expert_micro[idx] += 1;
         }
       }
+      micro_seen++;   // exactly one increment per token
     }
   }
 

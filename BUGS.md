@@ -8,6 +8,15 @@ to live in this file and in the now-deleted `BUGS_HIDDEN_BY_FLAGS.md`. Full inve
 verification detail for that session lives in `ledgers/BUGS_FIXES.md`. Listed roughly in order of
 how likely each is to actually bite someone.
 
+> **2026-07-08 — correctness-first campaign.** This campaign abandoned paper-number
+> reproduction as a goal and prioritised technical correctness. A codebase-wide
+> internal-inconsistency audit (17 items, see `CODEBASE_INCONSISTENCIES.md`) plus a CB1↔worktree
+> source diff surfaced the new items **#28-#33** below and re-scoped several existing ones. Items
+> being actively fixed this campaign are marked **FIX SCOPED (2026-07-08)** — they are NOT yet
+> merged (the first implementation wave was accidentally built on a stale worktree base and is
+> being redone in-place). The `use_flash_attention` master-flag work (`FA_FLAG_SPEC.md`) resolves
+> the score/softmax-materialization family coherently and is NOT tracked as a bug here.
+
 ## 1. Disaggregated path (`disagg_system=on`) lost its prefill→decode KV transfer term
 
 An earlier session deleted a block in `cluster.cpp::runIterationSumGenSplit` (the
@@ -70,7 +79,7 @@ audit comment added directly above the function. Its capacity-math inconsistency
 unaddressed and should not be trusted if the function is ever wired back up; the decision of
 delete-vs-repair-vs-keep is left to the user now that its dead-code status is unambiguous.
 
-## 4. MLA prefill attention on flash never models KV-read timing
+## 4. MLA prefill attention on flash never models KV-read timing — **FIX SCOPED (2026-07-08): audit item I15**
 
 `MultiLatentAttentionSumExecutionGPU/Logic/PIM` and `AbsorbMLASumExecutionGPU/Logic/PIM` (6
 functions, `attention_sum_impl.cpp`) never route flash KV-read timing through
@@ -199,6 +208,13 @@ derivation exists for it and no current preset reaches it (only `deepseekV3` set
 so it was left alone rather than guessing; the missing-tensor UNDER-count above is still open and
 requires the separate liveness-sweep merge (or hand-adding the missing terms) to close.
 
+**Note (2026-07-07, paper-1 bug-hunt campaign):** the gate merge above fixed Fig-3's batch match for
+llama3/HBF+ (batch error down to +6.4%) but this in turn EXPOSED a separate tpot-realism gap in
+Fig-7's online PEC metric — llama3/HBF+ PEC error jumped from a stale-low 37.8% to a freshly-measured
+**60.5%** at 8/16-GPU, because PEC folds batch error together with the sim-vs-paper tpot ratio, and
+fixing the batch side alone left the tpot side (an MFU-class deferred lever, not this gate) fully
+exposed. See `PAPER_INCONSISTENCIES.md`'s Fig-7 entry for the full zero-free-parameter decomposition.
+
 ## 10. `LmHead::forward` bypasses `device->execution()` — its FLOPs/DRAM-energy are uncounted
 
 `src/module/lm_head.cpp` writes timing straight into `device->status` (`lm_head.cpp:67-74`) instead
@@ -263,7 +279,206 @@ Safe to delete; kept only because no one has.
 (no named fields), which is easy to misalign on future edits. A designated-initializer or builder
 refactor would remove a whole class of silent-misalignment bugs. Cleanup, not a live bug.
 
+## 19. Runtime PP time-propagation charges 3× stage-time for a 2-stage pipeline — **FIX IN PROGRESS on branch `bughunt-paper1-campaign`**
+
+**Confirmed, byte/ratio-exact (2026-07-07, paper-1 bug-hunt campaign, Hunt B + refuter).** The
+runtime charges exactly **3× stage_time** for a pp=2 pipeline (a correct serialized 2-stage pipeline
+should charge 2×). Discriminator (forced tp8/pp2/dp1, batch 16/64/128/256/400): measured/stage ratio
+= **2.999/3.005/3.009/3.014/3.017** — a flat +50% over-count (one whole extra stage-time), not noise.
+Physical hop cost is negligible (0.021 ms); the large "comm" bucket seen on pp>1 runs is this
+propagation artifact being stamped into the Comm bucket (`cluster.cpp:943`), not real communication
+(a refuter's initial "18.1ms real hop" reading was itself this same artifact).
+
+**Root cause:** CHANGES-35 flipped `PipelineStage::forward`'s propagation from `max()` to `+=`
+(`communication.cpp:587-588`). With tp≥2, the destination stage has already accumulated its own work
+by the time this fires, and `sync_devices()`'s max-broadcast (`module_graph.cpp:73`) then spreads the
+already-bumped clock across the destination stage's own AR group on every layer — compounding to a
+net 3-stage total instead of 2. History: pre-35 undercounted at ~1×stage; item-35 overshot to 3×,
+skipping the correct 2× entirely. Affects every tp≥2, pp>1 forced or optimizer-selected run, and
+retroactively invalidates CHANGES-26's PP measurements (which measured this same artifact).
+
+**Fix (two parts, under review):** (A) the accounting bug itself — 3S→2S in the
+PipelineStage/lock-step propagation path (uncontroversial once isolated). (B) a paired
+physical-realism model change — decode PP with continuous batching should overlap microbatches
+(steady-state period `W + K·B/pp` + hop, not the naive sum of stages); the paper is silent on PP
+scheduling (verified by PDF grep), so (B) is argued from physics, not paper-conformance, and (A) alone
+is not sufficient to reproduce the paper's 16-GPU Fig-3/Fig-4 growth (a correct-serialized 2S still
+loses to dp2 everywhere). See `PAPER_INCONSISTENCIES.md`'s Fig-5 entry for the interaction with the
+16-GPU communication-share item, and `ledgers/FINDINGS_REGISTER.md` (2026-07-07 section) for the full
+verdict trail.
+
+## 20. Optimizer's analytic activation-gate reads a stale `e_tp_dg` for `ep>1` configs — **FIX IN PROGRESS on branch `bughunt-paper1-campaign`**
+
+**Confirmed, byte-exact (2026-07-07, paper-1 bug-hunt campaign, Hunt E).** `peakIntermediateBytes`
+(`footprint.h:231`) and `intermediateExtrasBytes` (`footprint.h:367`) both read `model.e_tp_dg` from
+the optimizer's const `ModelConfig` (always **1** in the analytic sweep), while
+`num_routed_expert_per_device` (`parallelism_optimizer.cpp:323-324`) correctly uses the swept `ep` —
+so the `×ep`/`÷e_tp` cancellation the formula relies on fails for every `ep>1` config, and the analytic
+capacity ceiling undershoots the true simulator ceiling. Byte-exact repro at ep2: 43.51 MB over-charge
+(18.68 MB peak + 24.83 MB GateOut, the un-cancelled `e_tp=2` term); analytic cap comes out 3027
+vs a true 3476. The live simulator itself is correct (it writes `e_tp` into its own config before
+running) — this is an optimizer-analytic-only bug.
+
+**Consequences:** (1) a latent pruning-invariant violation — the deflated `seed_tps` for `ep>1`
+configs could prune a borderline true `ep>1` winner unverified (no confirmed case of an actual winner
+being dropped in audited cells, but the invariant is violated in principle); (2) this is also the
+dominant driver of PEC offline-sweep cost — ~94% of the probe runs in maverick multi-GPU cells are
+`ep>1` probe walks caused by this bug (~82% of those cells' total cost), because the deflated ceiling
+forces the exponential prune-verification search to walk many more candidate configs than necessary.
+
+**Fix (surgical, under review):** pass a local `ModelConfig` copy with `mc.e_tp_dg` set to the swept
+`ep` into both `footprint.h` calls inside `EvaluateConfig`, instead of reading the shared const
+config's default. Audited blast radius: `e_tp_dg` is the *only* stale sweep field in these formulas
+(dense/1-GPU cells are already byte-exact and untouched by this fix). See
+`ledgers/FINDINGS_REGISTER.md` (2026-07-07 section) for the full verification trail.
+
+## 21. `classify_failure` mislabels HBM-capacity OOM failures as `"flash"` (cosmetic)
+
+`run_experiments.py:481`'s `classify_failure` maps an "HBM capacity exceeded" failure message into
+the `"flash"` bucket — semantically it should be `"capacity"`. Affects only Fig-3's failure-cause
+hatching/labeling in generated plots; no numeric consequence for any reported figure. Low priority,
+cosmetic-label fix only.
+
+## 22. CHANGES#61 documents the gen-path `fill_amortize` fix but not the still-open sum/MLA residual — **FIX SCOPED (2026-07-08): audit item I3**
+
+`CHANGES.md` item 61 documents fixing the gen-path K/V double-fill (`fill_amortize`), but the same
+class of asymmetry remains on the sum (prefill) and MLA-gen paths, which still effectively run at
+`fill_amortize=1` rather than the gen-path's corrected value. Confirmed dormant for paper-1: the sum
+path never executes under `decode_mode: on` (this repo's config for every reported sweep), and MLA-gen
+is not exercised by either paper-1 model (llama3/llama4 are both GQA). Doc-gap only — worth a note so
+a future paper-2/prefill or MLA-model sweep doesn't rediscover this as a "new" bug.
+
+## 23. `attention_sum_impl.cpp` memory_util divisor drift (print-only)
+
+`attention_sum_impl.cpp:358`'s `memory_util` diagnostic computation uses a divisor that has drifted
+from the value it's nominally supposed to track. This field is print/logging-only — it never feeds
+into any timing, capacity, or energy calculation — so the drift has no effect on any reported number.
+Cosmetic; flagged so a future diagnostic-trust exercise doesn't need to re-derive this from scratch.
+
+## 24. Cross-node AllReduce is flat (no hierarchical NCCL model) — **FIX SCOPED (2026-07-08): audit item I8 (hierarchical AllReduce)**
+
+`communication.cpp`'s AllReduce charges the full ring volume `2(n−1)/n · size` over ONE link — the
+inter-node IB link (100 GB/s) whenever the group spans nodes — instead of a hierarchical
+NVLink-reduce-scatter → IB-exchange(size/gpus_per_node) → NVLink-all-gather decomposition (~8× cheaper
+on the IB leg at 2×8 GPUs). Attention-TP and MoE-gather AR groups are contiguous `ne_tp_dg` blocks and
+never span nodes for the swept models (tp ≤ num_kv_heads = 8). The one reachable cross-node case is
+`all_reduce_for_e_tp` (`expert.cpp:106-108`, group sized by `e_tp_dg` — bounded by devices-per-stage,
+NOT num_kv_heads): maverick ep16 at 16 GPU spans both nodes. Both the analytic ranker and the runtime
+price it identically flat (verified — no ranker/runtime skew, pruning invariant holds), so such
+configs self-suppress consistently. Measured (refF_etp16, b=512): ep16 loses to ep1 by 6.07% as-is;
+a hand-corrected hierarchical AR would flip it to +5.15% at that batch — but at the figures'
+throughput-max batches ep16 loses by ~26%, far beyond any AR correction (the n=16 latency floor
+doesn't shrink), so **no paper-figure winner is suppressed**. Fix (only if a num_kv_heads ≥ 16 model
+or small-batch cross-node ep study is ever swept): hierarchical AR in both `communication.cpp` and the
+optimizer's comm term, in lock-step.
+
+## 25. `logic_memory_bandwidth`/`pim_memory_bandwidth` go stale after the Table-I memory override — disagg/PIM-only
+
+`SystemConfig`'s ctor computes `logic_memory_bandwidth = memory_bandwidth × logic_x` (and pim
+equivalent) ONCE at construction (`hardware_config.h:90-93`) from the GPU preset's ctor argument
+(e.g. Rubin's non-load-bearing 22 TB/s). `eval/test.cpp:144-145` later overwrites
+`system_config.memory_bandwidth` from the memory preset (Table-I values, e.g. HBM4's 12.8 TB/s) but
+never recomputes the logic/pim derivatives — they stay Rubin-derived on every preset. Dead for this
+campaign: only the Logic/PIM execution variants read them (`attention_gen_impl.cpp:250,402,…`), and
+`processor_type: GPU` means those paths never run. Would bite any future GPU+LOGIC/PIM or
+disagg sweep. Fix when needed: recompute the derivatives after the override (or make them accessors).
+
+**Related — CB1 source diff (2026-07-08):** independent of the stale-value issue above, the
+worktree ctor also **dropped CB1's `/2.0`** on both derivatives — CB1 (`LLMSimulator_HBF`,
+`hardware_config.h:100-101`) computes `logic_memory_bandwidth = memory_bandwidth * logic_x / 2.0`
+(and pim likewise), so the worktree's are **2× CB1's**. Same PIM/LOGIC-only dormancy. Reconcile
+against the paper's Table-I hardware model when either path is exercised — determine whether the 2×
+is an intentional worktree change or an accidental drop before trusting it.
+
+## 26. `batch % dp != 0` strands up to dp−1 sequences permanently (unreachable via the sweep driver)
+
+`batch_size_per_dp = total_batch_size / dp_degree` floors (scheduler.cpp:17), every shard caps at the
+floored value, but `fillSequenceQueue`/`fillRunningQueue` compute the refill gap against the
+un-floored `total_batch_size` — so when `total_batch_size % dp_degree != 0`, up to `dp−1` sequences
+can never be placed and pile up in `sequence_queue` forever (a PERMANENT running-batch shortfall vs
+what the caller believes it configured, growing queue memory). Unreachable through
+`run_experiments.py` (its search only ever probes batch values that are exact multiples of the
+config's dp — verified in code and empirically in the CSV corpus), so no paper-comparison number is
+affected. Bites anyone driving the binary directly with a non-divisible batch. Fix when touched:
+either assert `batch % dp == 0` loudly at scheduler construction, or compute the gap against
+`dp_degree × batch_size_per_dp`. (Found by the Hunt-H refuter, 2026-07-07.)
+
+## 27. `all_reduce_for_e_tp` message sized on the full pre-routing batch — e_tp>1-only over-charge
+
+`expert.cpp:188` passes ExpertFFN's own `input` (shape `[batch_per_dp, hidden]`) to the expert-TP
+AllReduce, but the tensor that physically needs reducing is the e_tp-group's partial down-proj
+outputs, whose true row-count is the tokens routed to this device's resident experts. Over-charge
+factor ≈ `parallel_num/e_tp_dg`: EP1 → AllReduce is an algebraic no-op (n_ranks=1), bug inert;
+EP2/TP4 → exactly 2× (measured: correct 5,335,040 B vs used 10,670,080 B per MoE layer); EP4/TP4 →
+coincidentally exact (one group holds all tokens). NOT an optimizer/runtime divergence — the
+optimizer's comment (`parallelism_optimizer.cpp:663-666`) documents deliberately replicating this
+exact sizing, so ranker and runtime agree and the pruning invariant is unaffected; the disagreement
+is with the true MoE architecture. Live exposure: only e_tp>1 configs, which currently lose the
+searches (partly *because* of this over-charge — fixing it makes ep2-class configs slightly
+cheaper). Fix when touched: size the AR from the routed-token count (Σ tokens over resident
+experts), and update the optimizer mirror in lock-step. (Hunt-J refuter, 2026-07-07;
+`refJ_etp_check.py`.)
+
+## 28. LM-head logits materialized in timing but tiled in capacity (audit item I2, deferred)
+
+`lm_head.cpp:58,92` charge the full `m·(n_vocab/tp)` logits **write** as memory traffic, while the
+capacity gate (`footprint.h:390`) counts only a 2048-wide argmax tile. Greedy-argmax decode never
+needs the full vocab row resident, so timing over-charges a tensor capacity treats as a bounded
+tile — the same "materialized-in-timing / tiled-in-capacity" pattern as the attention score
+(handled by the `use_flash_attention` flag), but a *different* physical mechanism (argmax logits,
+not attention) so it is NOT covered by that flag. Low numeric impact: on flash configs the
+hidden×vocab weight read dominates under `max()`, and on HBM4 it's a small additive term. Deferred
+this campaign. Fix: charge only the argmax-tile write in timing to match capacity.
+
+## 29. MoE GateUpdate aggregation leader gated on the wrong device (PP bug, CB1 diff) — **FIX QUEUED (2026-07-08)**
+
+`route.cpp:157` reads `if (device->device_total_rank == 0)`; CB1 uses `== device_list.front()`
+("With PP, device 0 may not belong to this stage's MoE layer"). Under `pp_dg>1`, any MoE layer on a
+pipeline stage whose `device_list` excludes global rank 0 has no device satisfying `==0`, so
+`aggregate_expert` (the per-layer `update_expert` regen + batch-sum of
+`num_token_in_expert`/`local_num_token_in_expert` + the token-conservation `assertTrue`) silently
+never runs for that layer — it reuses whatever draw rank 0 last produced for a different layer, and
+MoEScatter/MoEGather then size the all-to-all off stale counts. Timing impact is bounded
+(same-distribution draw) but it is incorrect and it disables the invariant check for non-zero
+stages. Only bites llama4 + pp>1. The MOE_TAG_FIX_SPEC §4.5 micro-vector block (`route.cpp:193-202`)
+is inside the same `==0` block and inherits the defect. One-line fix (`==0` → `==device_list.front()`);
+queued behind the current campaign wave.
+
+## 30. Sequence token accessors are `int`, should be `int64_t` (CB1 diff) — **FIX QUEUED (2026-07-08)**
+
+`src/scheduler/sequence.h`'s `get_gen_process_token()`/`get_sum_process_token()`/
+`get_total_sequence_length()` return `int`; CB1 uses `int64_t`. These feed comm-size and footprint
+byte/FLOP math. Safe at paper-1 scale (batch × seq_len ≈ 5×10⁷ ≪ 2³¹) but a large-batch/long-context
+sweep can overflow 2³¹ and silently corrupt sizing. Cheap widen, no effect on current figures; queued.
+
+## 31. KV-write reuse / seeded-steady-state model absent vs CB1 (dormant divergence)
+
+The worktree folds KV-write inline with HBF flash physics (page-program latency + double-buffer
+hiding) and amortizes only the prompt write; CB1 has a standalone `decode_kv_write.cpp` modeling
+prompt-prefix reuse / seeded steady-state bulk writes. Both are GQA/TP-correct. Moot for paper-1
+(`reuse_kv_cache: off`), but if reuse or seeded steady-state is ever enabled the worktree lacks that
+accounting — a conscious divergence, flagged so it is not rediscovered as a "bug."
+
+## 32. PIM/LOGIC GQA attention never model the score matrix (documented `use_flash_attention` gap)
+
+The `use_flash_attention` master flag gates score/softmax materialization on the GPU attention
+paths, but the PIM/LOGIC GQA roofline variants (`attention_gen_impl.cpp` G2/G3,
+`attention_sum_impl.cpp` S2/S3) never modeled the score in either branch and were deliberately left
+as-is (ruling, 2026-07-08 — see `FA_FLAG_SPEC.md`). Consequence: the flag's `OFF` (materialized)
+semantics are **not modeled on PIM/LOGIC** — those paths behave as always-`ON` there, and must stay
+byte-identical across `ON`/`OFF` (a regression tripwire). Only matters for hetero/disaggregated runs,
+never the paper-1 GPU sweeps.
+
+## 33. Missing `#include <cstdint>` in ramulator2 `utils.h` (GCC-13 build break)
+
+`src/dram/ramulator2/src/base/utils.h` uses `uint64_t` without including `<cstdint>`, which fails
+to compile under GCC-13. The submodule + `patch/ramulator2_pim.patch` otherwise handle the
+ramulator2 setup correctly — this single missing include is the only outstanding build fault. Add
+the include.
+
 ---
 
-Paper-vs-simulator numeric/qualitative comparison items live in `PAPER_INCONSISTENCIES.md`
-(still-open/explained-not-bugs) and `CHANGES.md` (resolved), not here.
+Resolved fixes and the (now historical) paper-vs-simulator comparison items live in `CHANGES.md`.
+This campaign's internal-inconsistency audit is in `CODEBASE_INCONSISTENCIES.md`; the
+`use_flash_attention` flag design is in `FA_FLAG_SPEC.md`. `PAPER_INCONSISTENCIES.md` is superseded
+(2026-07-08, paper-conformance abandoned) — its dispositions were absorbed into `CHANGES.md`.
