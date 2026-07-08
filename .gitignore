@@ -53,6 +53,7 @@ paper_text.txt
 /fixetp_*
 /fixpec_*
 /i5679_*
+/fa_*
 /noise_check_*
 /overlap_*
 /comm_linearity.py

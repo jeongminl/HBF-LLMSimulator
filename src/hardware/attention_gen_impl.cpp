@@ -835,7 +835,15 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
       memory_size = use_flash_attention ? 0.0 : (2.0 * m * n * num_heads) *input->precision_byte;
 
       compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
-      memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+      // Materialized score/P is scarce-tier activation traffic; on HBF-family
+      // memory_bandwidth is repurposed to flash_read_bandwidth (device.cpp:32-33),
+      // so price the softmax round-trip at the activation tier (matches
+      // getAttentionMemoryDuration's act-tier bandwidth).
+      hw_metric softmax_bw = (config.use_hbf && config.hbf_config.num_flash_stacks > 0)
+          ? ((config.hbf_config.num_hbm_stacks > 0) ? config.hbf_config.hbm_read_bandwidth
+                                                    : config.hbf_config.logic_sram_bandwidth)
+          : memory_bandwidth;
+      memory_duration = memory_size / softmax_bw * 1000 * 1000 * 1000;
 
       // Softmax score read + P write into the energy counters only when materialized.
       if (!use_flash_attention) {
@@ -1216,7 +1224,15 @@ ExecStatus MultiLatentAttentionGenExecutionLogic(Device_Ptr device,
       memory_size = use_flash_attention ? 0.0 : (2.0 * m * n * num_heads) *input->precision_byte;
 
       compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
-      memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+      // Materialized score/P is scarce-tier activation traffic; on HBF-family
+      // memory_bandwidth is repurposed to flash_read_bandwidth (device.cpp:32-33),
+      // so price the softmax round-trip at the activation tier (matches
+      // getAttentionMemoryDuration's act-tier bandwidth).
+      hw_metric softmax_bw = (config.use_hbf && config.hbf_config.num_flash_stacks > 0)
+          ? ((config.hbf_config.num_hbm_stacks > 0) ? config.hbf_config.hbm_read_bandwidth
+                                                    : config.hbf_config.logic_sram_bandwidth)
+          : memory_bandwidth;
+      memory_duration = memory_size / softmax_bw * 1000 * 1000 * 1000;
 
       // Softmax score read + P write into the energy counters only when materialized.
       if (!use_flash_attention) {
@@ -1569,7 +1585,15 @@ ExecStatus MultiLatentAttentionGenExecutionPIM(Device_Ptr device,
       memory_size = use_flash_attention ? 0.0 : (2.0 * m * n * num_heads) *input->precision_byte;
 
       compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
-      memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+      // Materialized score/P is scarce-tier activation traffic; on HBF-family
+      // memory_bandwidth is repurposed to flash_read_bandwidth (device.cpp:32-33),
+      // so price the softmax round-trip at the activation tier (matches
+      // getAttentionMemoryDuration's act-tier bandwidth).
+      hw_metric softmax_bw = (config.use_hbf && config.hbf_config.num_flash_stacks > 0)
+          ? ((config.hbf_config.num_hbm_stacks > 0) ? config.hbf_config.hbm_read_bandwidth
+                                                    : config.hbf_config.logic_sram_bandwidth)
+          : memory_bandwidth;
+      memory_duration = memory_size / softmax_bw * 1000 * 1000 * 1000;
 
       // Softmax score read + P write into the energy counters only when materialized.
       if (!use_flash_attention) {
@@ -1995,7 +2019,12 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
       memory_size = use_flash_attention ? 0.0 : (2.0 * m * n * num_heads) * input->precision_byte;
       total_memory_size += memory_size;
       compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
-      memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+      // Materialized score/P priced at the scarce activation tier -- see Block-A note.
+      hw_metric softmax_bw = (config.use_hbf && config.hbf_config.num_flash_stacks > 0)
+          ? ((config.hbf_config.num_hbm_stacks > 0) ? config.hbf_config.hbm_read_bandwidth
+                                                    : config.hbf_config.logic_sram_bandwidth)
+          : memory_bandwidth;
+      memory_duration = memory_size / softmax_bw * 1000 * 1000 * 1000;
 
       // Softmax score read + P write into the energy counters only when materialized.
       if (!use_flash_attention) {
@@ -2289,7 +2318,8 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
       flops = 1.0 * m * k * n * 2.0 * num_heads;
       total_flops += flops;
 
-      memory_size = (1.0 * m * k * num_heads + 1.0 * k * n + 1.0 * m * n * num_heads) * input->precision_byte;
+      // ON: nope-score (m*n*heads) never materializes -> drop (ruling #3).
+      memory_size = (1.0 * m * k * num_heads + 1.0 * k * n + (use_flash_attention ? 0.0 : 1.0 * m * n * num_heads)) * input->precision_byte;
       total_memory_size += memory_size;
 
       compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
@@ -2320,12 +2350,14 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
       exec_status += temp;
       accumul_memory_duration += temp.memory_duration;
 
-      // store intermediate value
-      input->setShape({num_heads, accumul_len});
-      temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::LOGIC,
-              DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
-      exec_status += temp;
-      accumul_memory_duration += temp.memory_duration;
+      // store intermediate value (score) -- only when materialized (OFF).
+      if (!use_flash_attention) {
+        input->setShape({num_heads, accumul_len});
+        temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::LOGIC,
+                DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
+        exec_status += temp;
+        accumul_memory_duration += temp.memory_duration;
+      }
     }
     else{
       ExecStatus temp;
@@ -2340,10 +2372,12 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
       temp = getIdealMemoryStatus(device, ProcessorType::LOGIC, DRAMRequestType::kRead, input);
       exec_status += temp;
 
-      // store intermediate value
-      input->setShape({num_heads, accumul_len});
-      temp = getIdealMemoryStatus(device, ProcessorType::LOGIC, DRAMRequestType::kWrite, input);
-      exec_status += temp;
+      // store intermediate value (score) -- only when materialized (OFF).
+      if (!use_flash_attention) {
+        input->setShape({num_heads, accumul_len});
+        temp = getIdealMemoryStatus(device, ProcessorType::LOGIC, DRAMRequestType::kWrite, input);
+        exec_status += temp;
+      }
     }
 
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
@@ -2363,7 +2397,8 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
       flops = 1.0 * m * k * n * 2.0 * num_heads;
       total_flops += flops;
 
-      memory_size = (1.0 * m * k * num_heads + 1.0 * k * n + 1.0 * m * n * num_heads) * input->precision_byte;
+      // ON: rope-score (m*n*heads) never materializes -> drop (ruling #3).
+      memory_size = (1.0 * m * k * num_heads + 1.0 * k * n + (use_flash_attention ? 0.0 : 1.0 * m * n * num_heads)) * input->precision_byte;
       total_memory_size += memory_size;
 
       compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
@@ -2395,12 +2430,14 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
       exec_status += temp;
       accumul_memory_duration += temp.memory_duration;
 
-      // store intermediate value
-      input->setShape({num_heads, accumul_len});
-      temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::LOGIC,
-              DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
-      exec_status += temp;
-      accumul_memory_duration += temp.memory_duration;
+      // store intermediate value (score) -- only when materialized (OFF).
+      if (!use_flash_attention) {
+        input->setShape({num_heads, accumul_len});
+        temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::LOGIC,
+                DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
+        exec_status += temp;
+        accumul_memory_duration += temp.memory_duration;
+      }
     }
     else{
       ExecStatus temp;
@@ -2415,10 +2452,12 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
       temp = getIdealMemoryStatus(device, ProcessorType::LOGIC, DRAMRequestType::kRead, input);
       exec_status += temp;
 
-      // store intermediate value
-      input->setShape({num_heads, accumul_len});
-      temp = getIdealMemoryStatus(device, ProcessorType::LOGIC, DRAMRequestType::kWrite, input);
-      exec_status += temp;
+      // store intermediate value (score) -- only when materialized (OFF).
+      if (!use_flash_attention) {
+        input->setShape({num_heads, accumul_len});
+        temp = getIdealMemoryStatus(device, ProcessorType::LOGIC, DRAMRequestType::kWrite, input);
+        exec_status += temp;
+      }
     }
     
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
@@ -2438,40 +2477,49 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
       flops = 7.0 * m * n * num_heads; // scale + mask + softmax
       total_flops += flops;
 
-      memory_size = (2.0 * m * n * num_heads) * input->precision_byte;
+      // ON: softmax on-chip -> zero memory (ruling #3). OFF: 2*m*n*heads.
+      memory_size = use_flash_attention ? 0.0 : (2.0 * m * n * num_heads) * input->precision_byte;
       total_memory_size += memory_size;
       compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
-      memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+      // Materialized score/P priced at the scarce activation tier -- see Block-A note.
+      hw_metric softmax_bw = (config.use_hbf && config.hbf_config.num_flash_stacks > 0)
+          ? ((config.hbf_config.num_hbm_stacks > 0) ? config.hbf_config.hbm_read_bandwidth
+                                                    : config.hbf_config.logic_sram_bandwidth)
+          : memory_bandwidth;
+      memory_duration = memory_size / softmax_bw * 1000 * 1000 * 1000;
 
-      if(use_ramulator){
-        memory_duration = 0;
+      // Softmax score read + P write into the energy counters only when materialized.
+      if (!use_flash_attention) {
+        if(use_ramulator){
+          memory_duration = 0;
 
-        ExecStatus temp;
+          ExecStatus temp;
 
-        // read input
-        input->setShape({m, n * num_heads});
-        temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::LOGIC,
-                DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
-        exec_status += temp;
-        memory_duration += temp.memory_duration;
+          // read input
+          input->setShape({m, n * num_heads});
+          temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::LOGIC,
+                  DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
+          exec_status += temp;
+          memory_duration += temp.memory_duration;
 
-        // store output
-        temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::LOGIC,
-                DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
-        exec_status += temp;
-        memory_duration += temp.memory_duration;
-      }
-      else{
-        ExecStatus temp;
+          // store output
+          temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::LOGIC,
+                  DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
+          exec_status += temp;
+          memory_duration += temp.memory_duration;
+        }
+        else{
+          ExecStatus temp;
 
-        // read input
-        input->setShape({m, n * num_heads});
-        temp = getIdealMemoryStatus(device, ProcessorType::LOGIC, DRAMRequestType::kRead, input);
-        exec_status += temp;
+          // read input
+          input->setShape({m, n * num_heads});
+          temp = getIdealMemoryStatus(device, ProcessorType::LOGIC, DRAMRequestType::kRead, input);
+          exec_status += temp;
 
-        // store output
-        temp = getIdealMemoryStatus(device, ProcessorType::LOGIC, DRAMRequestType::kWrite, input);
-        exec_status += temp;
+          // store output
+          temp = getIdealMemoryStatus(device, ProcessorType::LOGIC, DRAMRequestType::kWrite, input);
+          exec_status += temp;
+        }
       }
 
       exec_status.total_duration += std::max(compute_duration, memory_duration);
@@ -2493,7 +2541,8 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
 
       flops = 1.0 * m * k * n * 2.0 * num_heads;
       total_flops += flops;
-      memory_size = (1.0 * m * k * num_heads + 1.0 * k * n +
+      // ON: the softmax-weight P (read here as m*k*heads) never materializes -> drop.
+      memory_size = ((use_flash_attention ? 0.0 : 1.0 * m * k * num_heads) + 1.0 * k * n +
         1.0 * m * n * num_heads) * input->precision_byte;
       total_memory_size += memory_size;
 
@@ -2513,12 +2562,14 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
 
       ExecStatus temp;
 
-      // read score output
-      input->setShape({num_heads, accumul_len});
-      temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::LOGIC,
-              DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
-      exec_status += temp;
-      accumul_memory_duration += temp.memory_duration;
+      // read score output -- only when materialized (OFF).
+      if (!use_flash_attention) {
+        input->setShape({num_heads, accumul_len});
+        temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::LOGIC,
+                DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
+        exec_status += temp;
+        accumul_memory_duration += temp.memory_duration;
+      }
 
       // read compressed_kv
       input->setShape({accumul_len, kv_lora_rank});
@@ -2537,16 +2588,18 @@ ExecStatus AbsorbMLAGenExecutionLogic(Device_Ptr device,
     else{
       ExecStatus temp;
 
-      // read score output
-      input->setShape({num_heads, accumul_len});
-      temp = getIdealMemoryStatus(device, ProcessorType::LOGIC, DRAMRequestType::kRead, input);
-      exec_status += temp;
+      // read score output -- only when materialized (OFF).
+      if (!use_flash_attention) {
+        input->setShape({num_heads, accumul_len});
+        temp = getIdealMemoryStatus(device, ProcessorType::LOGIC, DRAMRequestType::kRead, input);
+        exec_status += temp;
+      }
 
       // read compressed_kv
       input->setShape({accumul_len, kv_lora_rank});
       temp = getIdealMemoryStatus(device, ProcessorType::LOGIC, DRAMRequestType::kRead, input);
       exec_status += temp;
-      
+
       // store context out
       input->setShape({num_seq * kv_lora_rank, num_heads});
       temp = getIdealMemoryStatus(device, ProcessorType::LOGIC, DRAMRequestType::kWrite, input);
@@ -2589,6 +2642,8 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
   int qk_rope_head_dim = layer_info.qk_rope_head_dim;
   int kv_lora_rank = layer_info.kv_lora_rank;
   bool use_flash_mla = layer_info.use_flash_mla;
+  // FA master flag (ruling #3, materialized else-branch only). Dormant for paper-1.
+  bool use_flash_attention = layer_info.use_flash_attention;
 
   int m, n, k;
   double flops, memory_size;
@@ -2697,7 +2752,8 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
       flops = 1.0 * m * k * n * 2.0 * num_heads;
       total_flops += flops;
 
-      memory_size = (1.0 * m * k * num_heads + 1.0 * k * n + 1.0 * m * n * num_heads) * input->precision_byte;
+      // ON: nope-score (m*n*heads) never materializes -> drop (ruling #3).
+      memory_size = (1.0 * m * k * num_heads + 1.0 * k * n + (use_flash_attention ? 0.0 : 1.0 * m * n * num_heads)) * input->precision_byte;
       total_memory_size += memory_size;
 
       compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
@@ -2728,12 +2784,14 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
       exec_status += temp;
       accumul_memory_duration += temp.memory_duration;
 
-      // store intermediate value
-      input->setShape({num_heads, accumul_len});
-      temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::PIM,
-              DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
-      exec_status += temp;
-      accumul_memory_duration += temp.memory_duration;
+      // store intermediate value (score) -- only when materialized (OFF).
+      if (!use_flash_attention) {
+        input->setShape({num_heads, accumul_len});
+        temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::PIM,
+                DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
+        exec_status += temp;
+        accumul_memory_duration += temp.memory_duration;
+      }
     }
     else{
       ExecStatus temp;
@@ -2748,10 +2806,12 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
       temp = getIdealMemoryStatus(device, ProcessorType::PIM, DRAMRequestType::kRead, input);
       exec_status += temp;
 
-      // store intermediate value
-      input->setShape({num_heads, accumul_len});
-      temp = getIdealMemoryStatus(device, ProcessorType::PIM, DRAMRequestType::kWrite, input);
-      exec_status += temp;
+      // store intermediate value (score) -- only when materialized (OFF).
+      if (!use_flash_attention) {
+        input->setShape({num_heads, accumul_len});
+        temp = getIdealMemoryStatus(device, ProcessorType::PIM, DRAMRequestType::kWrite, input);
+        exec_status += temp;
+      }
     }
 
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
@@ -2771,7 +2831,8 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
       flops = 1.0 * m * k * n * 2.0 * num_heads;
       total_flops += flops;
 
-      memory_size = (1.0 * m * k * num_heads + 1.0 * k * n + 1.0 * m * n * num_heads) * input->precision_byte;
+      // ON: rope-score (m*n*heads) never materializes -> drop (ruling #3).
+      memory_size = (1.0 * m * k * num_heads + 1.0 * k * n + (use_flash_attention ? 0.0 : 1.0 * m * n * num_heads)) * input->precision_byte;
       total_memory_size += memory_size;
 
       compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
@@ -2803,12 +2864,14 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
       exec_status += temp;
       accumul_memory_duration += temp.memory_duration;
 
-      // store intermediate value
-      input->setShape({num_heads, accumul_len});
-      temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::PIM,
-              DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
-      exec_status += temp;
-      accumul_memory_duration += temp.memory_duration;
+      // store intermediate value (score) -- only when materialized (OFF).
+      if (!use_flash_attention) {
+        input->setShape({num_heads, accumul_len});
+        temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::PIM,
+                DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
+        exec_status += temp;
+        accumul_memory_duration += temp.memory_duration;
+      }
     }
     else{
       ExecStatus temp;
@@ -2823,10 +2886,12 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
       temp = getIdealMemoryStatus(device, ProcessorType::PIM, DRAMRequestType::kRead, input);
       exec_status += temp;
 
-      // store intermediate value
-      input->setShape({num_heads, accumul_len});
-      temp = getIdealMemoryStatus(device, ProcessorType::PIM, DRAMRequestType::kWrite, input);
-      exec_status += temp;
+      // store intermediate value (score) -- only when materialized (OFF).
+      if (!use_flash_attention) {
+        input->setShape({num_heads, accumul_len});
+        temp = getIdealMemoryStatus(device, ProcessorType::PIM, DRAMRequestType::kWrite, input);
+        exec_status += temp;
+      }
     }
     
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
@@ -2846,40 +2911,49 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
       flops = 7.0 * m * n * num_heads; // scale + mask + softmax
       total_flops += flops;
 
-      memory_size = (2.0 * m * n * num_heads) * input->precision_byte;
+      // ON: softmax on-chip -> zero memory (ruling #3). OFF: 2*m*n*heads.
+      memory_size = use_flash_attention ? 0.0 : (2.0 * m * n * num_heads) * input->precision_byte;
       total_memory_size += memory_size;
       compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
-      memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+      // Materialized score/P priced at the scarce activation tier -- see Block-A note.
+      hw_metric softmax_bw = (config.use_hbf && config.hbf_config.num_flash_stacks > 0)
+          ? ((config.hbf_config.num_hbm_stacks > 0) ? config.hbf_config.hbm_read_bandwidth
+                                                    : config.hbf_config.logic_sram_bandwidth)
+          : memory_bandwidth;
+      memory_duration = memory_size / softmax_bw * 1000 * 1000 * 1000;
 
-      if(use_ramulator){
-        memory_duration = 0;
+      // Softmax score read + P write into the energy counters only when materialized.
+      if (!use_flash_attention) {
+        if(use_ramulator){
+          memory_duration = 0;
 
-        ExecStatus temp;
+          ExecStatus temp;
 
-        // read input
-        input->setShape({m, n * num_heads});
-        temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::PIM,
-                DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
-        exec_status += temp;
-        memory_duration += temp.memory_duration;
+          // read input
+          input->setShape({m, n * num_heads});
+          temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::PIM,
+                  DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
+          exec_status += temp;
+          memory_duration += temp.memory_duration;
 
-        // store output
-        temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::PIM,
-                DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
-        exec_status += temp;
-        memory_duration += temp.memory_duration;
-      }
-      else{
-        ExecStatus temp;
+          // store output
+          temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::PIM,
+                  DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
+          exec_status += temp;
+          memory_duration += temp.memory_duration;
+        }
+        else{
+          ExecStatus temp;
 
-        // read input
-        input->setShape({m, n * num_heads});
-        temp = getIdealMemoryStatus(device, ProcessorType::PIM, DRAMRequestType::kRead, input);
-        exec_status += temp;
+          // read input
+          input->setShape({m, n * num_heads});
+          temp = getIdealMemoryStatus(device, ProcessorType::PIM, DRAMRequestType::kRead, input);
+          exec_status += temp;
 
-        // store output
-        temp = getIdealMemoryStatus(device, ProcessorType::PIM, DRAMRequestType::kWrite, input);
-        exec_status += temp;
+          // store output
+          temp = getIdealMemoryStatus(device, ProcessorType::PIM, DRAMRequestType::kWrite, input);
+          exec_status += temp;
+        }
       }
 
       exec_status.total_duration += std::max(compute_duration, memory_duration);
@@ -2901,7 +2975,8 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
 
       flops = 1.0 * m * k * n * 2.0 * num_heads;
       total_flops += flops;
-      memory_size = (1.0 * m * k * num_heads + 1.0 * k * n +
+      // ON: the softmax-weight P (read here as m*k*heads) never materializes -> drop.
+      memory_size = ((use_flash_attention ? 0.0 : 1.0 * m * k * num_heads) + 1.0 * k * n +
         1.0 * m * n * num_heads) * input->precision_byte;
 
       total_memory_size += memory_size;
@@ -2920,12 +2995,14 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
 
       ExecStatus temp;
 
-      // read score output
-      input->setShape({num_heads, accumul_len});
-      temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::PIM,
-              DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
-      exec_status += temp;
-      accumul_memory_duration += temp.memory_duration;
+      // read score output -- only when materialized (OFF).
+      if (!use_flash_attention) {
+        input->setShape({num_heads, accumul_len});
+        temp = issueRamulator(device, LayerType::ABSORBED_MLA_GEN, ProcessorType::PIM,
+                DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
+        exec_status += temp;
+        accumul_memory_duration += temp.memory_duration;
+      }
 
       // read compressed_kv
       input->setShape({accumul_len, kv_lora_rank});
@@ -2944,10 +3021,12 @@ ExecStatus AbsorbMLAGenExecutionPIM(Device_Ptr device,
     else{
       ExecStatus temp;
 
-      // read score output
-      input->setShape({num_heads, accumul_len});
-      temp = getIdealMemoryStatus(device, ProcessorType::PIM, DRAMRequestType::kRead, input);
-      exec_status += temp;
+      // read score output -- only when materialized (OFF).
+      if (!use_flash_attention) {
+        input->setShape({num_heads, accumul_len});
+        temp = getIdealMemoryStatus(device, ProcessorType::PIM, DRAMRequestType::kRead, input);
+        exec_status += temp;
+      }
 
       // read compressed_kv
       input->setShape({accumul_len, kv_lora_rank});

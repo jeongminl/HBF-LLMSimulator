@@ -1077,7 +1077,13 @@ ExecStatus MultiLatentAttentionSumExecutionGPU(Device_Ptr device,
       total_memory_size += memory_size;
 
       compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
-      memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+      // Materialized score/P priced at the scarce activation tier: on HBF-family
+      // memory_bandwidth is repurposed to flash_read_bandwidth (device.cpp:32-33).
+      hw_metric softmax_bw = (config.use_hbf && config.hbf_config.num_flash_stacks > 0)
+          ? ((config.hbf_config.num_hbm_stacks > 0) ? config.hbf_config.hbm_read_bandwidth
+                                                    : config.hbf_config.logic_sram_bandwidth)
+          : memory_bandwidth;
+      memory_duration = memory_size / softmax_bw * 1000 * 1000 * 1000;
 
       if (use_ramulator) {
         time_ns accumul_memory_duration = 0;
@@ -1563,7 +1569,13 @@ ExecStatus MultiLatentAttentionSumExecutionLogic(Device_Ptr device,
       total_memory_size += memory_size;
 
       compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
-      memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+      // Materialized score/P priced at the scarce activation tier: on HBF-family
+      // memory_bandwidth is repurposed to flash_read_bandwidth (device.cpp:32-33).
+      hw_metric softmax_bw = (config.use_hbf && config.hbf_config.num_flash_stacks > 0)
+          ? ((config.hbf_config.num_hbm_stacks > 0) ? config.hbf_config.hbm_read_bandwidth
+                                                    : config.hbf_config.logic_sram_bandwidth)
+          : memory_bandwidth;
+      memory_duration = memory_size / softmax_bw * 1000 * 1000 * 1000;
 
       if (use_ramulator) {
         time_ns accumul_memory_duration = 0;
@@ -2029,7 +2041,12 @@ ExecStatus MultiLatentAttentionSumExecutionPIM(Device_Ptr device,
       total_memory_size += memory_size;
 
       compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
-      memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+      // Materialized score/P priced at the scarce activation tier -- see above.
+      hw_metric softmax_bw = (config.use_hbf && config.hbf_config.num_flash_stacks > 0)
+          ? ((config.hbf_config.num_hbm_stacks > 0) ? config.hbf_config.hbm_read_bandwidth
+                                                    : config.hbf_config.logic_sram_bandwidth)
+          : memory_bandwidth;
+      memory_duration = memory_size / softmax_bw * 1000 * 1000 * 1000;
 
       if (use_ramulator) {
         time_ns accumul_memory_duration = 0;
@@ -2451,7 +2468,12 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
     total_memory_size += memory_size;
 
     compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
-    memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+    // Materialized score/P priced at the scarce activation tier -- see MLA-Sum note.
+    hw_metric softmax_bw = (config.use_hbf && config.hbf_config.num_flash_stacks > 0)
+        ? ((config.hbf_config.num_hbm_stacks > 0) ? config.hbf_config.hbm_read_bandwidth
+                                                  : config.hbf_config.logic_sram_bandwidth)
+        : memory_bandwidth;
+    memory_duration = memory_size / softmax_bw * 1000 * 1000 * 1000;
 
     exec_status.compute_duration += compute_duration;
 
