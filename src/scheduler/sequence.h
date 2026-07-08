@@ -1,5 +1,6 @@
 #pragma once
 #include <chrono>  // for timing of loading sequence
+#include <cstdint>
 #include <ctime>
 #include <fstream>
 #include <iomanip>
@@ -108,10 +109,15 @@ class BatchedSequence {
   void pop(Sequence::Ptr seq);
   int get_num_seq();
   int get_process_token();
-  int get_gen_process_token();
-  int get_sum_process_token();
+  // BUGS #30 (CB1): widened to int64_t -- these sum num_process_token/
+  // current_len (each individually bounded by max_seq_len, safe as int)
+  // across an entire batch, which at the large batch sizes the offline/
+  // capacity-search paths can reach (tens of thousands of sequences x
+  // up to ~131072 current_len) can exceed INT32_MAX and silently wrap.
+  int64_t get_gen_process_token();
+  int64_t get_sum_process_token();
   int get_average_sequence_length();
-  int get_total_sequence_length();
+  int64_t get_total_sequence_length();
 
   void add_dummy_sequence(int num_seq, int input_len, int output_len);
 

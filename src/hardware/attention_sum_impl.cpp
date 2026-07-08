@@ -82,7 +82,7 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
     // act_size = (query + output score) = (m*k*heads + m*n*heads).
     if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
       total_kv_read_size += (hw_metric)k * n * num_kv_heads * input->precision_byte;
-      total_act_size += (hw_metric)(m * k * num_heads + m * n * num_heads) * input->precision_byte;
+      total_act_size += ((hw_metric)m * k * num_heads + (hw_metric)m * n * num_heads) * input->precision_byte;
       accumul_compute_duration += compute_duration;
     } else {
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
@@ -275,8 +275,8 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
     // Context phase uses the flash model on HBF presets (same as Scoring above).
     // kv_read_size = score(m*k*heads) + V-cache(k*n*kv_heads); act_size = output write (m*n*heads).
     if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
-      context_total_kv_read_size += (hw_metric)(k * n * num_kv_heads) * input->precision_byte;
-      context_total_act_size += (hw_metric)(m * k * num_heads + m * n * num_heads) * input->precision_byte;
+      context_total_kv_read_size += (hw_metric)k * n * num_kv_heads * input->precision_byte;
+      context_total_act_size += ((hw_metric)m * k * num_heads + (hw_metric)m * n * num_heads) * input->precision_byte;
       context_accumul_compute_duration += compute_duration;
     } else {
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
@@ -941,7 +941,7 @@ ExecStatus MultiLatentAttentionSumExecutionGPU(Device_Ptr device,
       // act_size = (query + output score) = (m*k*heads + m*n*heads).
       if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
         total_kv_read_size += (hw_metric)k * n * num_heads * input->precision_byte;
-        total_act_size += (hw_metric)(m * k * num_heads + m * n * num_heads) * input->precision_byte;
+        total_act_size += ((hw_metric)m * k * num_heads + (hw_metric)m * n * num_heads) * input->precision_byte;
         accumul_compute_duration += compute_duration;
       } else {
         memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
@@ -1118,8 +1118,8 @@ ExecStatus MultiLatentAttentionSumExecutionGPU(Device_Ptr device,
       // kv_read_size = V-cache(k*n*heads); act_size = score read(m*k*heads) + output write(m*n*heads)
       // (mirrors GQA-Sum's Context split: kv_read is the KV-cache term only).
       if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
-        context_total_kv_read_size += (hw_metric)(k * n * num_heads) * input->precision_byte;
-        context_total_act_size += (hw_metric)(m * k * num_heads + m * n * num_heads) * input->precision_byte;
+        context_total_kv_read_size += (hw_metric)k * n * num_heads * input->precision_byte;
+        context_total_act_size += ((hw_metric)m * k * num_heads + (hw_metric)m * n * num_heads) * input->precision_byte;
         context_accumul_compute_duration += compute_duration;
       } else {
         memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;

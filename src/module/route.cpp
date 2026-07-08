@@ -154,7 +154,13 @@ void GateUpdate::aggregate_expert(BatchedSequence::Ptr sequences_metadata) {
   int num_expert = device->model_config.num_routed_expert;
   int top_k = device->model_config.top_k;
 
-  if (device->device_total_rank == 0) {
+  // BUGS #29 (CB1): compare against this stage's own device_list.front(),
+  // not the global rank 0 -- under pp>1, a stage whose device_list excludes
+  // global rank 0 (every stage but the first) previously never ran
+  // aggregate_expert at all, since device_total_rank==0 could never be true
+  // for any of its devices. device_list.front() is this stage's designated
+  // aggregator (rank-0-of-stage), always present and unique per stage.
+  if (device->device_total_rank == device_list.front()) {
     // update each sequences_metadata
     Scheduler::Ptr scheduler = sequences_metadata->scheduler;
     if (scheduler == nullptr) {
