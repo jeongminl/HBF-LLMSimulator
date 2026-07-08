@@ -74,51 +74,72 @@ Tensor::Ptr AllReduce::forward(const Tensor::Ptr input,
 
   // All-reduce time = latency term + bandwidth term, modeled SEPARATELY.
   //
-  // Bandwidth term: the bandwidth-optimal all-reduce volume 2(N-1)/N * size per
-  // link (ring / reduce-scatter + all-gather lower bound) -- unchanged.
+  // I8: HIERARCHICAL two-phase model instead of a single flat link selected
+  // by "does this group span more than one node". The prior model priced the
+  // WHOLE group's bandwidth-optimal ring volume, and ALL its hops' latency,
+  // on whichever single link (NVLink or IB) the group's node-span picked --
+  // so a group that spans 2 nodes paid IB cost for every hop, including the
+  // ones between same-node peers that physically ride NVLink. Real
+  // hierarchical AllReduce (e.g. NCCL) instead runs an intra-node
+  // reduce-scatter/all-gather on NVLink among each node's local ranks, plus a
+  // second inter-node pass on IB among the per-node representatives:
+  //   intra-node phase (device_ict/NVLink), R = ranks/node:
+  //     bandwidth: 2*(R-1)/R * size / device_ict_bandwidth   (0 if R<=1)
+  //     latency:   2*ceil(log2(R)) * device_ict_latency       (0 if R<=1)
+  //   inter-node phase (node_ict/IB), P = nodes spanned:
+  //     bandwidth: 2*(P-1)/P * size / node_ict_bandwidth      (0 if P<=1)
+  //     latency:   2*ceil(log2(P)) * node_ict_latency          (0 if P<=1)
+  //   total = intra + inter
+  // Each phase reuses the SAME bandwidth-optimal ring formula (bw_hops =
+  // 2*(X-1), volume/X per link) and the SAME logarithmic latency schedule
+  // (2*ceil(log2(X)) hops) the prior single-link code used, just
+  // parameterized by R or P instead of the whole group's n_ranks.
   //
-  // Latency term: 2*ceil(log2(N)) link latencies (recursive-doubling schedule),
-  // NOT the ring's 2(N-1) sequential hops. The paper's reference system is a
-  // DGX Rubin NVL8 whose GPUs are fully connected through NVSwitch, where the
-  // latency-optimal schedule is logarithmic; chaining 2(N-1) fixed hop latencies
-  // produced a batch-independent floor (e.g. 2.8 ms/step for llama3 TP=8) that
-  // contradicts SS-III's "the inter-GPU communication increases almost linearly
-  // with batch size" and Fig. 5's communication shares.
+  // R is computed as n_ranks/P, assuming the group is evenly split across
+  // the nodes it spans -- true for every paper-1 swept config (tp/pp/ep/dp
+  // are all powers of 2 and node-aligned by construction; see
+  // set_device_list, model/util.h).
+  //
+  // Reduces EXACTLY to the prior single-link formula when P == 1 (R ==
+  // n_ranks, the inter-node phase is gated to 0 by P<=1): every single-node
+  // group -- all gpu<=8 configs, and any >8-GPU group whose tp*pp/ep/dp
+  // layout still fits inside one node -- is BYTE-IDENTICAL to before. Only a
+  // group that actually spans >1 node (16-GPU tp/ep > devices-per-node) now
+  // pays the cheaper two-phase cost instead of the flat IB over-charge.
   int n_ranks = (int)device_list.size();
-  int bw_hops = (n_ranks - 1) * 2;
-  int latency_hops =
-      (n_ranks > 1) ? 2 * (int)std::ceil(std::log2((double)n_ranks)) : 0;
-
-  // Link selection: a group confined to one node runs on NVLink
-  // (device_ict); a group spanning nodes is bottlenecked by the
-  // inter-node link (node_ict), same rule as MoEScatter/MoEGather's
-  // decode path and PipelineStage.
   int num_device_per_node = device->config.num_device;
-  int min_node = device_list.front() / num_device_per_node;
-  int max_node = min_node;
+  std::unordered_set<int> nodes_spanned;
   for (int rank : device_list) {
-    int node = rank / num_device_per_node;
-    min_node = std::min(min_node, node);
-    max_node = std::max(max_node, node);
+    nodes_spanned.insert(rank / num_device_per_node);
   }
-  bool cross_node = (max_node != min_node);
-  hw_metric link_latency = cross_node ? device->config.node_ict_latency
-                                      : device->config.device_ict_latency;
-  hw_metric link_bandwidth = cross_node ? device->config.node_ict_bandwidth
-                                        : device->config.device_ict_bandwidth;
+  int p_nodes = (int)nodes_spanned.size();
+  int r_ranks_per_node = (p_nodes > 0) ? n_ranks / p_nodes : n_ranks;
+
+  auto phase_terms = [size](int x, hw_metric bw, time_ns lat) -> std::pair<time_ns, time_ns> {
+    if (x <= 1) return std::make_pair((time_ns)0, (time_ns)0);
+    int bw_hops = (x - 1) * 2;
+    time_ns lat_term = (time_ns)(2 * (int)std::ceil(std::log2((double)x)) * lat);
+    time_ns bw_term = (time_ns)((double)bw_hops * ((double)size / x) / bw * 1e9);
+    return std::make_pair(lat_term, bw_term);
+  };
+
+  std::pair<time_ns, time_ns> intra = phase_terms(
+      r_ranks_per_node, device->config.device_ict_bandwidth, device->config.device_ict_latency);
+  std::pair<time_ns, time_ns> inter = phase_terms(
+      p_nodes, device->config.node_ict_bandwidth, device->config.node_ict_latency);
 
   // PP_FIX_SPEC.md §3.3: like PipelineStage, AllReduce::forward manipulates
   // device_time directly (never goes through ExecStatus/set_pop_status), so
   // the mechanical batch_dependent_duration tagging applied to the Linear/
   // Activation/AttentionGen impl files never reaches it. Split total_time
   // into its batch-INDEPENDENT latency term (fixed hop count, independent of
-  // message size) and its batch-DEPENDENT bandwidth term (size/n_ranks scales
+  // message size) and its batch-DEPENDENT bandwidth term (volume scales
   // with the batch-sized message) so the pp>1 reconstruction's device_time -
   // device_time_dep split (cluster.cpp) correctly treats only the volume
-  // term as something to divide by pp, not the whole AR cost.
-  time_ns latency_term = (time_ns)(latency_hops * link_latency);
-  time_ns bandwidth_term = (time_ns)((double)bw_hops * ((double)size / n_ranks) /
-                                     link_bandwidth * 1e9);
+  // term as something to divide by pp, not the whole AR cost. Both phases'
+  // bandwidth terms are batch-dependent; both phases' latency terms are not.
+  time_ns latency_term = intra.first + inter.first;
+  time_ns bandwidth_term = intra.second + inter.second;
   time_ns total_time = latency_term + bandwidth_term;
 
   if (input->parallel_execution && !device->config.communication_hiding) {
