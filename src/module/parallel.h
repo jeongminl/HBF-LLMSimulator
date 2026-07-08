@@ -132,11 +132,13 @@ class SelfAttentionParallel : public Module {
   [[nodiscard]] static Ptr Create(std::string prefix, std::string name,
                                   int head_dim, int num_heads, int num_kv_heads,
                                   int max_seq_len, int batch_size, int qk_rope_head_dim, bool compressed_kv,
+                                  bool use_flash_attention,
                                   std::vector<int> device_list,
                                   Device::Ptr device, int gen_max_seq_len = -1) {
     Ptr ptr = Ptr(new SelfAttentionParallel(prefix, name, head_dim, num_heads,
                                             num_kv_heads, max_seq_len,
-                                            batch_size, qk_rope_head_dim, compressed_kv, device_list, device,
+                                            batch_size, qk_rope_head_dim, compressed_kv,
+                                            use_flash_attention, device_list, device,
                                             gen_max_seq_len));
     ptr->set_tensor_module();
     return ptr;
@@ -145,7 +147,8 @@ class SelfAttentionParallel : public Module {
  private:
   SelfAttentionParallel(std::string& prefix, std::string& name, int head_dim,
                         int num_heads, int num_kv_heads, int max_seq_len, int qk_rope_head_dim,
-                        int batch_size, bool compressed_kv, std::vector<int> device_list,
+                        int batch_size, bool compressed_kv, bool use_flash_attention,
+                        std::vector<int> device_list,
                         Device::Ptr device, int gen_max_seq_len);
   SelfAttentionParallel() = default;
 
@@ -159,6 +162,9 @@ class SelfAttentionParallel : public Module {
   int num_kv_heads;
   int qk_rope_head_dim;
   bool compressed_kv;
+  // FlashAttention master flag, forwarded to the Gen/Sum GQA sub-modules'
+  // Create calls (see FA_FLAG_SPEC.md flag-plumbing section).
+  bool use_flash_attention;
 };
 
 class RowSplit : public Module {
@@ -254,19 +260,22 @@ class AbsorbMLAParallel : public Module {
    [[nodiscard]] static Ptr Create(std::string prefix, std::string name,
                                    int head_dim, int num_heads, int num_kv_heads,
                                    int max_seq_len, int batch_size, int qk_rope_head_dim, int kv_lora_rank,
-                                   bool compressed_kv, bool use_flash_mla, std::vector<int> device_list,
+                                   bool compressed_kv, bool use_flash_mla, bool use_flash_attention,
+                                   std::vector<int> device_list,
                                    Device::Ptr device) {
      Ptr ptr = Ptr(new AbsorbMLAParallel(prefix, name, head_dim, num_heads,
                                              num_kv_heads, max_seq_len,
-                                             batch_size, qk_rope_head_dim, kv_lora_rank, compressed_kv, use_flash_mla, device_list, device));
+                                             batch_size, qk_rope_head_dim, kv_lora_rank, compressed_kv, use_flash_mla,
+                                             use_flash_attention, device_list, device));
      ptr->set_tensor_module();
      return ptr;
    };
- 
+
   private:
     AbsorbMLAParallel(std::string& prefix, std::string& name, int head_dim,
                          int num_heads, int num_kv_heads, int max_seq_len, int qk_rope_head_dim,
-                         int batch_size, int kv_lora_rank, bool compressed_kv, bool use_flash_mla, std::vector<int> device_list,
+                         int batch_size, int kv_lora_rank, bool compressed_kv, bool use_flash_mla,
+                         bool use_flash_attention, std::vector<int> device_list,
                          Device::Ptr device);
     AbsorbMLAParallel() = default;
  

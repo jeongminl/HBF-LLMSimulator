@@ -130,7 +130,7 @@ SelfAttentionParallel::SelfAttentionParallel(std::string& prefix,
                                              std::string& name, int head_dim,
                                              int num_heads, int num_kv_heads,
                                              int max_seq_len, int batch_size, int qk_rope_head_dim,
-                                             bool compressed_kv,
+                                             bool compressed_kv, bool use_flash_attention,
                                              std::vector<int> device_list,
                                              Device::Ptr device,
                                              int gen_max_seq_len)
@@ -139,7 +139,8 @@ SelfAttentionParallel::SelfAttentionParallel(std::string& prefix,
       num_heads(num_heads),
       num_kv_heads(num_kv_heads),
       qk_rope_head_dim(qk_rope_head_dim),
-      compressed_kv(compressed_kv) {
+      compressed_kv(compressed_kv),
+      use_flash_attention(use_flash_attention) {
   int parallel_num = device_list.size();
 
   assertTrue(num_heads % parallel_num == 0, "num_head mod parallel_num == 0");
@@ -162,7 +163,8 @@ SelfAttentionParallel::SelfAttentionParallel(std::string& prefix,
   // mirroring the Gen path's iRoPE local-attention handling for the prefill phase.
   Module::Ptr attention_sum = SelfAttentionSum::Create(
   module_map_name, "AttentionSum", head_dim, num_heads / parallel_num,
-  num_kv_heads / parallel_num, max_seq_len, batch_size, qk_rope_head_dim, device_list,
+  num_kv_heads / parallel_num, max_seq_len, batch_size, qk_rope_head_dim,
+  use_flash_attention, device_list,
   device, resolved_gen_max_seq_len);
   add_module(attention_sum);
 
@@ -172,7 +174,8 @@ SelfAttentionParallel::SelfAttentionParallel(std::string& prefix,
   // allocation (and thus the capacity gate that reads it) correctly for local layers.
   Module::Ptr attention_gen = SelfAttentionGen::Create(
   module_map_name, "AttentionGen", head_dim, num_heads / parallel_num,
-  num_kv_heads / parallel_num, resolved_gen_max_seq_len, batch_size, qk_rope_head_dim, device_list,
+  num_kv_heads / parallel_num, resolved_gen_max_seq_len, batch_size, qk_rope_head_dim,
+  use_flash_attention, device_list,
   device);
   add_module(attention_gen);
 
@@ -251,7 +254,8 @@ MultiLatentAttentionParallel::MultiLatentAttentionParallel(std::string& prefix,
 
   Module::Ptr attention_gen = MultiLatentAttentionGen::Create(
   module_map_name, "AttentionGen", head_dim, num_heads / parallel_num,
-  num_kv_heads / parallel_num, max_seq_len, batch_size, qk_rope_head_dim, compressed_kv, use_flash_mla, device_list,
+  num_kv_heads / parallel_num, max_seq_len, batch_size, qk_rope_head_dim, compressed_kv, use_flash_mla,
+  use_flash_attention, device_list,
   device);
   add_module(attention_gen);
 
@@ -293,7 +297,7 @@ AbsorbMLAParallel::AbsorbMLAParallel(std::string& prefix,
     int num_heads, int num_kv_heads,
     int max_seq_len, int batch_size, int qk_rope_head_dim,
     int kv_lora_rank, bool compressed_kv, bool use_flash_mla,
-    std::vector<int> device_list,
+    bool use_flash_attention, std::vector<int> device_list,
     Device::Ptr device)
   : Module(prefix, name, device, device_list),
   head_dim(head_dim),
@@ -315,14 +319,15 @@ AbsorbMLAParallel::AbsorbMLAParallel(std::string& prefix,
 
   Module::Ptr attention_sum = AbsorbMLASum::Create(
   module_map_name, "AttentionSum", head_dim, num_heads / parallel_num,
-  num_kv_heads / parallel_num, max_seq_len, batch_size, qk_rope_head_dim, kv_lora_rank, device_list,
+  num_kv_heads / parallel_num, max_seq_len, batch_size, qk_rope_head_dim, kv_lora_rank,
+  use_flash_attention, device_list,
   device);
   add_module(attention_sum);
 
   Module::Ptr attention_gen = AbsorbMLAGen::Create(
   module_map_name, "AttentionGen", head_dim, num_heads / parallel_num,
-  num_kv_heads / parallel_num, max_seq_len, batch_size, qk_rope_head_dim, kv_lora_rank, compressed_kv, 
-  use_flash_mla, device_list, device);
+  num_kv_heads / parallel_num, max_seq_len, batch_size, qk_rope_head_dim, kv_lora_rank, compressed_kv,
+  use_flash_mla, use_flash_attention, device_list, device);
   add_module(attention_gen);
 
   Module::Ptr attention_merge = AttentionMerge::Create(

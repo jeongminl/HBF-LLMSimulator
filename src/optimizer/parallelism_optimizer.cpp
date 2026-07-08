@@ -369,22 +369,38 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
       // activation bytes by a factor of ep.
       ModelConfig mc = model_config;
       mc.e_tp_dg = e_tp_dg;
-      double act_size = peakIntermediateBytes(
-          mc, batch_size_per_gpu, tp, expert_batch_size,
-          num_routed_expert_per_device,
-          /*has_moe_layer=*/model_config.num_routed_expert > 0,
-          /*has_dense_layer=*/hasDenseFfnLayer(model_config));
+      // FA_FLAG_SPEC.md capacity switch: ON excludes the resident score
+      // (peakIntermediateBytes); OFF materializes the full resident score
+      // (scoreInclusiveIntermediateBytes). Applied in LOCK-STEP with the live-sim
+      // gate (cluster.cpp) so the two scarce-tier gates never drift.
+      double act_size;
+      if (system_config.use_flash_attention) {
+        act_size = peakIntermediateBytes(
+            mc, batch_size_per_gpu, tp, expert_batch_size,
+            num_routed_expert_per_device,
+            /*has_moe_layer=*/model_config.num_routed_expert > 0,
+            /*has_dense_layer=*/hasDenseFfnLayer(model_config));
+      } else {
+        act_size = scoreInclusiveIntermediateBytes(
+            mc, batch_size_per_gpu, tp, expert_batch_size,
+            num_routed_expert_per_device,
+            /*has_moe_layer=*/model_config.num_routed_expert > 0,
+            /*has_dense_layer=*/hasDenseFfnLayer(model_config),
+            sequence_length);
+      }
 
       // Full faithful paper-1 intermediate-data accounting: add the complete
       // resident intermediate set (footprint.h::intermediateExtrasBytes --
       // KV-write on-chip staging + score tile + all-reduce scratch + MoE
-      // dispatch/GateOut + tiled LM-head logits) on top of
-      // peakIntermediateBytes. layers_per_stage is this representative
+      // dispatch/GateOut + tiled LM-head logits) on top of the peak above.
+      // The score-tile term is dropped when OFF (resident full score already
+      // counted above -- ruling #4). layers_per_stage is this representative
       // stage's layer count (num_layers/pp), matching the weight/KV terms
       // above. Mirrors the live-sim gate (cluster.cpp) so the two never
       // drift.
       act_size += intermediateExtrasBytes(mc, batch_size_per_gpu, tp,
-                                          layers_per_stage);
+                                          layers_per_stage,
+                                          system_config.use_flash_attention);
 
       // ---- Memory limit verification (via shared checkCapacity) ---------------
       // Uses hbm_per_stack_bytes and the same partitioning rule as cluster.cpp (via footprint.h).

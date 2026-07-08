@@ -107,8 +107,10 @@ int BatchedSequence::get_process_token() {
   return token;
 }
 
-int BatchedSequence::get_gen_process_token() {
-  int token = 0;
+int64_t BatchedSequence::get_gen_process_token() {
+  // BUGS #30 (CB1): int64_t accumulator -- see sequence.h's comment above
+  // the declaration.
+  int64_t token = 0;
   std::vector<Sequence::Ptr> gen_seq = get_gen();
 
   for (auto& seq : gen_seq) {
@@ -117,8 +119,8 @@ int BatchedSequence::get_gen_process_token() {
   return token;
 }
 
-int BatchedSequence::get_sum_process_token() {
-  int token = 0;
+int64_t BatchedSequence::get_sum_process_token() {
+  int64_t token = 0;
   std::vector<Sequence::Ptr> sum_seq = get_sum();
 
   for (auto& seq : sum_seq) {
@@ -141,9 +143,11 @@ int BatchedSequence::get_average_sequence_length() {
   return total_length;
 }
 
-int BatchedSequence::get_total_sequence_length() {
+int64_t BatchedSequence::get_total_sequence_length() {
+  // BUGS #30 (CB1): int64_t accumulator -- see sequence.h's comment above
+  // the declaration.
   std::vector<Sequence::Ptr> gen_seq = get_gen();
-  int total_length = 0;
+  int64_t total_length = 0;
   for (auto seq : gen_seq) {
     total_length += seq->current_len;
   }

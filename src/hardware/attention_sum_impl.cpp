@@ -29,6 +29,13 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
   int head_dim = layer_info.head_dim;
   int num_heads = layer_info.num_heads;
   int num_kv_heads = layer_info.num_kv_heads;
+  // FlashAttention master flag (FA_FLAG_SPEC.md, item I1/I14). ON: score/P never
+  // materialize -> drop the score term from Scoring, the P (score-read) term from
+  // Context, charge softmax ZERO memory, and DO NOT issue the score write / softmax
+  // read+write / context score-read into the energy/util counters. OFF (new
+  // default): keep the materialized score/P terms, charge softmax 2*m*n*heads, and
+  // keep those energy counters firing.
+  bool use_flash_attention = layer_info.use_flash_attention;
 
   int m, n, k;
   double flops, memory_size;
@@ -72,17 +79,18 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
     flops = 1.0 * m * k * n * 2.0 * num_heads;
     total_flops += flops;
 
+    // ON: score (m*n*heads) never materializes -> drop from Scoring traffic.
     memory_size =
-        1.0 * (m * k * num_heads + k * n * num_kv_heads + m * n * num_heads) *
+        1.0 * (m * k * num_heads + k * n * num_kv_heads + (use_flash_attention ? 0.0 : (double)m * n * num_heads)) *
         input->precision_byte;
     total_memory_size += memory_size;
 
     compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
     // kv_read_size = k*n*kv_heads (the key cache rows read for scoring);
-    // act_size = (query + output score) = (m*k*heads + m*n*heads).
+    // act_size = (query + output score) = (m*k*heads + m*n*heads); score dropped under ON.
     if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
       total_kv_read_size += (hw_metric)k * n * num_kv_heads * input->precision_byte;
-      total_act_size += ((hw_metric)m * k * num_heads + (hw_metric)m * n * num_heads) * input->precision_byte;
+      total_act_size += ((hw_metric)m * k * num_heads + (use_flash_attention ? (hw_metric)0 : (hw_metric)m * n * num_heads)) * input->precision_byte;
       accumul_compute_duration += compute_duration;
     } else {
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
@@ -114,16 +122,18 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
                          DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
       exec_status += temp;
 
-      // write score
-      shape.at(0) = m;
-      shape.at(1) = n * num_heads;
+      // write score -- only when materialized (OFF); ON keeps it on-chip (I14).
+      if (!use_flash_attention) {
+        shape.at(0) = m;
+        shape.at(1) = n * num_heads;
 
-      input->setShape(shape);
-      temp =
-          issueRamulator(device, LayerType::ATTENTION_SUM, ProcessorType::GPU,
-                         DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
-      exec_status += temp;
-      accumul_memory_duration += temp.memory_duration;
+        input->setShape(shape);
+        temp =
+            issueRamulator(device, LayerType::ATTENTION_SUM, ProcessorType::GPU,
+                           DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
+        exec_status += temp;
+        accumul_memory_duration += temp.memory_duration;
+      }
       memory_duration = accumul_memory_duration;
     }
     else{
@@ -147,14 +157,16 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
           getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, input);
       exec_status += temp;
 
-      // write score
-      shape.at(0) = m;
-      shape.at(1) = n * num_heads;
+      // write score -- only when materialized (OFF); ON keeps it on-chip (I14).
+      if (!use_flash_attention) {
+        shape.at(0) = m;
+        shape.at(1) = n * num_heads;
 
-      input->setShape(shape);
-      temp =
-          getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kWrite, input);
-      exec_status += temp;
+        input->setShape(shape);
+        temp =
+            getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kWrite, input);
+        exec_status += temp;
+      }
     }
     // Flash-analytic path (HBF, non-ramulator): memory_duration is deferred to a
     // single post-loop getAttentionMemoryDuration call (see below) so the page-read
@@ -194,49 +206,64 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
     flops = 7.0 * m * n * num_heads;
     total_flops += flops;
 
-    // Softmax scoring is purely compute (no weight reads, activations overlapped
-    // with compute); memory_size is 0 here by design.
-    memory_size = 0;
+    // ON: softmax runs on-chip -> zero memory (today's behavior). OFF (materialized):
+    // read the resident score + write P back = 2*m*n*heads, unifying GQA-Sum to MLA's
+    // existing 2*m*n softmax-memory term (I1/I9). This closes I14: today the score
+    // read/write below fires into the energy counters even though memory_size==0.
+    memory_size = use_flash_attention ? 0.0 : 2.0 * (double)m * n * num_heads * input->precision_byte;
     total_memory_size += memory_size;
 
     compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
-    memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
+    // The materialized score/P round-trip is activation traffic on the SCARCE tier
+    // (HBM stack or logic SRAM), NOT flash. Mirror getAttentionMemoryDuration's
+    // act-tier bandwidth: on HBF-family the local `memory_bandwidth` is repurposed to
+    // flash_read_bandwidth (device.cpp:32-33 / test.cpp:144), so use hbm_read_bandwidth
+    // (num_hbm_stacks>0) else logic_sram_bandwidth; plain-HBM keeps memory_bandwidth.
+    // (memory_size==0 under ON, so this is a no-op there.)
+    hw_metric softmax_bw = (config.use_hbf && config.hbf_config.num_flash_stacks > 0)
+        ? ((config.hbf_config.num_hbm_stacks > 0) ? config.hbf_config.hbm_read_bandwidth
+                                                  : config.hbf_config.logic_sram_bandwidth)
+        : memory_bandwidth;
+    memory_duration = memory_size / softmax_bw * 1000 * 1000 * 1000;
 
-    if (use_ramulator) {
-      time_ns accumul_memory_duration = 0;
+    // Score read + P write into the energy/util counters only when materialized (OFF).
+    if (!use_flash_attention) {
+      if (use_ramulator) {
+        time_ns accumul_memory_duration = 0;
 
-      auto shape = input->getShape();
-      shape.at(0) = m;
-      shape.at(1) = n * num_heads;
+        auto shape = input->getShape();
+        shape.at(0) = m;
+        shape.at(1) = n * num_heads;
 
-      input->setShape(shape);
-      ExecStatus temp;
-      temp =
-          issueRamulator(device, LayerType::ATTENTION_SUM, ProcessorType::GPU,
-                         DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
-      exec_status += temp;
-      accumul_memory_duration += temp.memory_duration;
+        input->setShape(shape);
+        ExecStatus temp;
+        temp =
+            issueRamulator(device, LayerType::ATTENTION_SUM, ProcessorType::GPU,
+                           DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
+        exec_status += temp;
+        accumul_memory_duration += temp.memory_duration;
 
-      temp =
-          issueRamulator(device, LayerType::ATTENTION_SUM, ProcessorType::GPU,
-                         DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
-      exec_status += temp;
-      accumul_memory_duration += temp.memory_duration;
-    }
-    else{
-      auto shape = input->getShape();
-      shape.at(0) = m;
-      shape.at(1) = n * num_heads;
+        temp =
+            issueRamulator(device, LayerType::ATTENTION_SUM, ProcessorType::GPU,
+                           DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
+        exec_status += temp;
+        accumul_memory_duration += temp.memory_duration;
+      }
+      else{
+        auto shape = input->getShape();
+        shape.at(0) = m;
+        shape.at(1) = n * num_heads;
 
-      input->setShape(shape);
-      ExecStatus temp;
-      temp =
-          getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, input);
-      exec_status += temp;
+        input->setShape(shape);
+        ExecStatus temp;
+        temp =
+            getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, input);
+        exec_status += temp;
 
-      temp =
-          getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kWrite, input);
-      exec_status += temp;
+        temp =
+            getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kWrite, input);
+        exec_status += temp;
+      }
     }
 
     exec_status.total_duration += std::max(compute_duration, memory_duration);
@@ -265,18 +292,21 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
     flops = 1.0 * m * k * n * 2.0 * num_heads;
     total_flops += flops;
 
+    // ON: the softmax-weight P (read here as m*k*heads) never materializes -> drop
+    // from Context traffic. m*n*heads is the context output write (kept).
     memory_size =
-        1.0 * (m * k * num_heads + k * n * num_kv_heads + m * n * num_heads) *
+        1.0 * ((use_flash_attention ? 0.0 : (double)m * k * num_heads) + k * n * num_kv_heads + m * n * num_heads) *
         input->precision_byte;
     total_memory_size += memory_size;
 
     compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
 
     // Context phase uses the flash model on HBF presets (same as Scoring above).
-    // kv_read_size = score(m*k*heads) + V-cache(k*n*kv_heads); act_size = output write (m*n*heads).
+    // kv_read_size = V-cache(k*n*kv_heads); act_size = P read (m*k*heads, dropped
+    // under ON) + output write (m*n*heads).
     if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
       context_total_kv_read_size += (hw_metric)k * n * num_kv_heads * input->precision_byte;
-      context_total_act_size += ((hw_metric)m * k * num_heads + (hw_metric)m * n * num_heads) * input->precision_byte;
+      context_total_act_size += ((use_flash_attention ? (hw_metric)0 : (hw_metric)m * k * num_heads) + (hw_metric)m * n * num_heads) * input->precision_byte;
       context_accumul_compute_duration += compute_duration;
     } else {
       memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
@@ -287,17 +317,19 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
       // Overwriting would leave only the final write's latency (ramulator path only).
       time_ns accumul_memory_duration = 0;
       auto shape = input->getShape();
-
-      // read score
-      shape.at(0) = m;
-      shape.at(1) = k * num_heads;
-      input->setShape(shape);
       ExecStatus temp;
-      temp =
-          issueRamulator(device, LayerType::ATTENTION_SUM, ProcessorType::GPU,
-                         DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
-      exec_status += temp;
-      accumul_memory_duration += temp.memory_duration;
+
+      // read score -- only when materialized (OFF); ON keeps it on-chip (I1/I14).
+      if (!use_flash_attention) {
+        shape.at(0) = m;
+        shape.at(1) = k * num_heads;
+        input->setShape(shape);
+        temp =
+            issueRamulator(device, LayerType::ATTENTION_SUM, ProcessorType::GPU,
+                           DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
+        exec_status += temp;
+        accumul_memory_duration += temp.memory_duration;
+      }
 
       // read kv
       shape.at(0) = k;
@@ -323,16 +355,19 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
       memory_duration = accumul_memory_duration;
     }
     else{
-      // read score
       auto shape = input->getShape();
-      shape.at(0) = m;
-      shape.at(1) = k * num_heads;
-
-      input->setShape(shape);
       ExecStatus temp;
-      temp =
-          getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, input);
-      exec_status += temp;
+
+      // read score -- only when materialized (OFF); ON keeps it on-chip (I1/I14).
+      if (!use_flash_attention) {
+        shape.at(0) = m;
+        shape.at(1) = k * num_heads;
+
+        input->setShape(shape);
+        temp =
+            getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, input);
+        exec_status += temp;
+      }
 
       // read kv
       shape.at(0) = k;
@@ -2167,7 +2202,12 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
   int num_kv_heads = layer_info.num_kv_heads;
   int qk_rope_head_dim = layer_info.qk_rope_head_dim;
   int kv_lora_rank = layer_info.kv_lora_rank;
-  
+  // FA master flag (FA_FLAG_SPEC.md, dormant Absorb-Sum path). ON: score/P never
+  // materialize -> drop score(nope+rope) and Context-P memory terms, charge softmax
+  // ZERO memory, and skip the score-write / softmax rd+wr / context-score-read energy
+  // issues. OFF: materialized (today's behavior).
+  bool use_flash_attention = layer_info.use_flash_attention;
+
   int m, n, k;
   double flops, memory_size;
   double total_flops = 0;
@@ -2199,8 +2239,9 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
     flops = 1.0 * m * k * n * 2.0 * num_heads;
     total_flops += flops;
 
+    // ON: nope-score (m*n*heads) never materializes -> drop from traffic.
     memory_size = (1.0 * m * k * num_heads + 1.0 * k * n +
-                   1.0 * m * n * num_heads) *
+                   (use_flash_attention ? 0.0 : 1.0 * m * n * num_heads)) *
                   input->precision_byte;
     total_memory_size += memory_size;
 
@@ -2236,16 +2277,18 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
       exec_status += temp;
       accumul_memory_duration += temp.memory_duration;
 
-      // write score for nope
-      shape.at(0) = m;
-      shape.at(1) = n * num_heads;
-      input->shape.resize(0);
-      input->setShape(shape);
-      temp =
-          issueRamulator(device, LayerType::ABSORBED_MLA_SUM, ProcessorType::GPU,
-                         DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
-      exec_status += temp;
-      accumul_memory_duration += temp.memory_duration;
+      // write score for nope -- only when materialized (OFF).
+      if (!use_flash_attention) {
+        shape.at(0) = m;
+        shape.at(1) = n * num_heads;
+        input->shape.resize(0);
+        input->setShape(shape);
+        temp =
+            issueRamulator(device, LayerType::ABSORBED_MLA_SUM, ProcessorType::GPU,
+                           DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
+        exec_status += temp;
+        accumul_memory_duration += temp.memory_duration;
+      }
       memory_duration = accumul_memory_duration;
     }
     else{
@@ -2269,14 +2312,16 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
           getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, input);
       exec_status += temp;
 
-      // write score for nope
-      shape.at(0) = m;
-      shape.at(1) = n * num_heads;
-      input->shape.resize(0);
-      input->setShape(shape);
-      temp =
-          getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kWrite, input);
-      exec_status += temp;
+      // write score for nope -- only when materialized (OFF).
+      if (!use_flash_attention) {
+        shape.at(0) = m;
+        shape.at(1) = n * num_heads;
+        input->shape.resize(0);
+        input->setShape(shape);
+        temp =
+            getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kWrite, input);
+        exec_status += temp;
+      }
     }
     exec_status.total_duration += std::max(compute_duration, memory_duration);
   }
@@ -2295,8 +2340,9 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
     flops = 1.0 * m * k * n * 2.0 * num_heads;
     total_flops += flops;
 
+    // ON: rope-score (m*n*heads) never materializes -> drop from traffic.
     memory_size = (1.0 * m * k * num_heads + 1.0 * k * n +
-                   1.0 * m * n * num_heads) *
+                   (use_flash_attention ? 0.0 : 1.0 * m * n * num_heads)) *
                   input->precision_byte;
     total_memory_size += memory_size;
 
@@ -2334,17 +2380,19 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
       exec_status += temp;
       accumul_memory_duration += temp.memory_duration;
 
-      // write score for rope
-      shape.at(0) = m;
-      shape.at(1) = n * num_heads;
+      // write score for rope -- only when materialized (OFF).
+      if (!use_flash_attention) {
+        shape.at(0) = m;
+        shape.at(1) = n * num_heads;
 
-      input->shape.resize(0);
-      input->setShape(shape);
-      temp =
-          issueRamulator(device, LayerType::ABSORBED_MLA_SUM, ProcessorType::GPU,
-                         DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
-      exec_status += temp;
-      accumul_memory_duration += temp.memory_duration;
+        input->shape.resize(0);
+        input->setShape(shape);
+        temp =
+            issueRamulator(device, LayerType::ABSORBED_MLA_SUM, ProcessorType::GPU,
+                           DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
+        exec_status += temp;
+        accumul_memory_duration += temp.memory_duration;
+      }
       memory_duration = accumul_memory_duration;
     }
     else{
@@ -2370,15 +2418,17 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
           getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, input);
       exec_status += temp;
 
-      // write score for rope
-      shape.at(0) = m;
-      shape.at(1) = n * num_heads;
+      // write score for rope -- only when materialized (OFF).
+      if (!use_flash_attention) {
+        shape.at(0) = m;
+        shape.at(1) = n * num_heads;
 
-      input->shape.resize(0);
-      input->setShape(shape);
-      temp =
-          getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kWrite, input);
-      exec_status += temp;
+        input->shape.resize(0);
+        input->setShape(shape);
+        temp =
+            getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kWrite, input);
+        exec_status += temp;
+      }
     }
     exec_status.total_duration += std::max(compute_duration, memory_duration);
   }
@@ -2396,8 +2446,8 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
     flops = 7.0 * m * n * num_heads;
     total_flops += flops;
 
-    memory_size = 2.0 * (1.0 * m * n * num_heads) * input->precision_byte;
-    // memory_size = 0; // can be overlapped
+    // ON: softmax on-chip -> zero memory. OFF: score read + P write = 2*m*n*heads.
+    memory_size = use_flash_attention ? 0.0 : 2.0 * (1.0 * m * n * num_heads) * input->precision_byte;
     total_memory_size += memory_size;
 
     compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
@@ -2405,48 +2455,51 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
 
     exec_status.compute_duration += compute_duration;
 
-    if (use_ramulator) {
-      time_ns accumul_memory_duration = 0;
+    // Score read + P write into the energy counters only when materialized (OFF).
+    if (!use_flash_attention) {
+      if (use_ramulator) {
+        time_ns accumul_memory_duration = 0;
 
-      // read input
-      std::vector<int> shape = {1,1};
-      shape.at(0) = m;
-      shape.at(1) = n * num_heads;
+        // read input
+        std::vector<int> shape = {1,1};
+        shape.at(0) = m;
+        shape.at(1) = n * num_heads;
 
-      input->shape.resize(0);
-      input->setShape(shape);
-      ExecStatus temp;
-      temp =
-          issueRamulator(device, LayerType::ABSORBED_MLA_SUM, ProcessorType::GPU,
-                         DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
-      exec_status += temp;
-      accumul_memory_duration += temp.memory_duration;
+        input->shape.resize(0);
+        input->setShape(shape);
+        ExecStatus temp;
+        temp =
+            issueRamulator(device, LayerType::ABSORBED_MLA_SUM, ProcessorType::GPU,
+                           DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
+        exec_status += temp;
+        accumul_memory_duration += temp.memory_duration;
 
-      // store output
-      temp =
-          issueRamulator(device, LayerType::ABSORBED_MLA_SUM, ProcessorType::GPU,
-                         DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
-      exec_status += temp;
-      accumul_memory_duration += temp.memory_duration;
-      memory_duration = accumul_memory_duration;
-    }
-    else{
-      // read input
-      std::vector<int> shape = {1,1};
-      shape.at(0) = m;
-      shape.at(1) = n * num_heads;
+        // store output
+        temp =
+            issueRamulator(device, LayerType::ABSORBED_MLA_SUM, ProcessorType::GPU,
+                           DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
+        exec_status += temp;
+        accumul_memory_duration += temp.memory_duration;
+        memory_duration = accumul_memory_duration;
+      }
+      else{
+        // read input
+        std::vector<int> shape = {1,1};
+        shape.at(0) = m;
+        shape.at(1) = n * num_heads;
 
-      input->shape.resize(0);
-      input->setShape(shape);
-      ExecStatus temp;
-      temp =
-          getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, input);
-      exec_status += temp;
+        input->shape.resize(0);
+        input->setShape(shape);
+        ExecStatus temp;
+        temp =
+            getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, input);
+        exec_status += temp;
 
-      // store output
-      temp =
-          getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kWrite, input);
-      exec_status += temp;
+        // store output
+        temp =
+            getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kWrite, input);
+        exec_status += temp;
+      }
     }
 
     exec_status.total_duration += std::max(compute_duration, memory_duration);
@@ -2466,8 +2519,9 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
     flops = 1.0 * m * k * n * 2.0 * num_heads;
     total_flops += flops;
 
+    // ON: the softmax-weight P (read here as m*k*heads) never materializes -> drop.
     memory_size = 1.0 *
-                  (1.0 * m * k * num_heads + 1.0 * k * n +
+                  ((use_flash_attention ? 0.0 : 1.0 * m * k * num_heads) + 1.0 * k * n +
                    1.0 * m * n * num_heads) *
                   input->precision_byte;
     total_memory_size += memory_size;
@@ -2482,17 +2536,20 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
       time_ns accumul_memory_duration = 0;
 
       std::vector<int> shape = {1,1};
-
-      shape.at(0) = m;
-      shape.at(1) = k * num_heads;
-      input->shape.resize(0);
-      input->setShape(shape);
       ExecStatus temp;
-      temp =
-          issueRamulator(device, LayerType::ABSORBED_MLA_SUM, ProcessorType::GPU,
-                         DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
-      exec_status += temp;
-      accumul_memory_duration += temp.memory_duration;
+
+      // read score -- only when materialized (OFF).
+      if (!use_flash_attention) {
+        shape.at(0) = m;
+        shape.at(1) = k * num_heads;
+        input->shape.resize(0);
+        input->setShape(shape);
+        temp =
+            issueRamulator(device, LayerType::ABSORBED_MLA_SUM, ProcessorType::GPU,
+                           DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
+        exec_status += temp;
+        accumul_memory_duration += temp.memory_duration;
+      }
 
       // read compressed_kv
 
@@ -2521,16 +2578,19 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
       memory_duration = accumul_memory_duration;
     }
     else{
-      // read score
       std::vector<int> shape = {1,1};
-      shape.at(0) = m;
-      shape.at(1) = k * num_heads;
-      input->shape.resize(0);
-      input->setShape(shape);
       ExecStatus temp;
-      temp =
-          getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, input);
-      exec_status += temp;
+
+      // read score -- only when materialized (OFF).
+      if (!use_flash_attention) {
+        shape.at(0) = m;
+        shape.at(1) = k * num_heads;
+        input->shape.resize(0);
+        input->setShape(shape);
+        temp =
+            getIdealMemoryStatus(device, ProcessorType::GPU, DRAMRequestType::kRead, input);
+        exec_status += temp;
+      }
 
       // read compressed_kv
       shape.at(0) = k;
@@ -2565,7 +2625,7 @@ ExecStatus AbsorbMLASumExecutionGPU(Device_Ptr device,
   assertTrue(total_memory_size > 0, "fail");
 
   input->setShape(orig_shape);
-  
+
   return exec_status;
 };
 
@@ -2591,6 +2651,9 @@ ExecStatus AbsorbMLASumExecutionLogic(Device_Ptr device,
   int num_kv_heads = layer_info.num_kv_heads;
   int qk_rope_head_dim = layer_info.qk_rope_head_dim;
   int kv_lora_rank = layer_info.kv_lora_rank;
+  // FA master flag (dormant Absorb-Sum Logic path). ON: drop score/P memory terms,
+  // zero softmax memory, skip the rope score-write + context score-read energy.
+  bool use_flash_attention = layer_info.use_flash_attention;
 
   int m, n, k;
   double flops, memory_size;
@@ -2623,8 +2686,9 @@ ExecStatus AbsorbMLASumExecutionLogic(Device_Ptr device,
     flops = 1.0 * m * k * n * 2.0 * num_heads;
     total_flops += flops;
 
+    // ON: nope-score (m*n*heads) never materializes -> drop from traffic.
     memory_size = (1.0 * m * k * num_heads + 1.0 * k * n +
-      1.0 * m * n * num_heads) * input->precision_byte;
+      (use_flash_attention ? 0.0 : 1.0 * m * n * num_heads)) * input->precision_byte;
     total_memory_size += memory_size;
 
     compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
@@ -2702,8 +2766,9 @@ ExecStatus AbsorbMLASumExecutionLogic(Device_Ptr device,
     flops = 1.0 * m * k * n * 2.0 * num_heads;
     total_flops += flops;
 
+    // ON: rope-score (m*n*heads) never materializes -> drop from traffic.
     memory_size = (1.0 * m * k * num_heads + 1.0 * k * n +
-                   1.0 * m * n * num_heads) *
+                   (use_flash_attention ? 0.0 : 1.0 * m * n * num_heads)) *
                   input->precision_byte;
     total_memory_size += memory_size;
 
@@ -2740,19 +2805,21 @@ ExecStatus AbsorbMLASumExecutionLogic(Device_Ptr device,
                          DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
       exec_status += temp;
 
-      // write score for rope
-      shape.at(0) = m;
-      shape.at(1) = n * num_heads;
+      // write score for rope -- only when materialized (OFF).
+      if (!use_flash_attention) {
+        shape.at(0) = m;
+        shape.at(1) = n * num_heads;
 
-      input->shape.resize(0);
-      input->setShape(shape);
-      temp =
-          issueRamulator(device, LayerType::ABSORBED_MLA_SUM, ProcessorType::LOGIC,
-                         DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
-      exec_status += temp;
-      accumul_memory_duration += temp.memory_duration;
+        input->shape.resize(0);
+        input->setShape(shape);
+        temp =
+            issueRamulator(device, LayerType::ABSORBED_MLA_SUM, ProcessorType::LOGIC,
+                           DRAMRequestType::kWrite, PIMOperandType::kDRAM, input);
+        exec_status += temp;
+        accumul_memory_duration += temp.memory_duration;
 
-      accumul_memory_duration += temp.memory_duration;
+        accumul_memory_duration += temp.memory_duration;
+      }
       memory_duration = accumul_memory_duration;
     }
     else{
@@ -2778,15 +2845,17 @@ ExecStatus AbsorbMLASumExecutionLogic(Device_Ptr device,
           getIdealMemoryStatus(device, ProcessorType::LOGIC, DRAMRequestType::kRead, input);
       exec_status += temp;
 
-      // write score for rope
-      shape.at(0) = m;
-      shape.at(1) = n * num_heads;
+      // write score for rope -- only when materialized (OFF).
+      if (!use_flash_attention) {
+        shape.at(0) = m;
+        shape.at(1) = n * num_heads;
 
-      input->shape.resize(0);
-      input->setShape(shape);
-      temp =
-          getIdealMemoryStatus(device, ProcessorType::LOGIC, DRAMRequestType::kWrite, input);
-      exec_status += temp;
+        input->shape.resize(0);
+        input->setShape(shape);
+        temp =
+            getIdealMemoryStatus(device, ProcessorType::LOGIC, DRAMRequestType::kWrite, input);
+        exec_status += temp;
+      }
     }
     exec_status.total_duration += std::max(compute_duration, memory_duration);
   }
@@ -2804,7 +2873,9 @@ ExecStatus AbsorbMLASumExecutionLogic(Device_Ptr device,
     flops = 7.0 * m * n * num_heads;
     total_flops += flops;
 
-    memory_size = 2.0 * (1.0 * m * n * num_heads) * input->precision_byte;
+    // ON: softmax on-chip -> zero memory (this Logic path never issued softmax
+    // energy or memory_duration; only total_memory_size reflected it).
+    memory_size = use_flash_attention ? 0.0 : 2.0 * (1.0 * m * n * num_heads) * input->precision_byte;
     compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
 
     exec_status.compute_duration += compute_duration;
@@ -2828,8 +2899,9 @@ ExecStatus AbsorbMLASumExecutionLogic(Device_Ptr device,
     flops = 1.0 * m * k * n * 2.0 * num_heads;
     total_flops += flops;
 
+    // ON: the softmax-weight P (read here as m*k*heads) never materializes -> drop.
     memory_size = 1.0 *
-                  (1.0 * m * k * num_heads + 1.0 * k * n +
+                  ((use_flash_attention ? 0.0 : 1.0 * m * k * num_heads) + 1.0 * k * n +
                    1.0 * m * n * num_heads) *
                   input->precision_byte;
     total_memory_size += memory_size;
@@ -2840,20 +2912,22 @@ ExecStatus AbsorbMLASumExecutionLogic(Device_Ptr device,
     exec_status.compute_duration += compute_duration;
 
     if (use_ramulator) {
-      // read score
       std::vector<int> shape = {1,1};
-
-      shape.at(0) = m;
-      shape.at(1) = k * num_heads;
-
-      input->shape.resize(0);
-      input->setShape(shape);
       ExecStatus temp;
-      temp =
-          issueRamulator(device, LayerType::ABSORBED_MLA_SUM, ProcessorType::LOGIC,
-                         DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
-      exec_status += temp;
-      memory_duration = temp.memory_duration;
+
+      // read score -- only when materialized (OFF).
+      if (!use_flash_attention) {
+        shape.at(0) = m;
+        shape.at(1) = k * num_heads;
+
+        input->shape.resize(0);
+        input->setShape(shape);
+        temp =
+            issueRamulator(device, LayerType::ABSORBED_MLA_SUM, ProcessorType::LOGIC,
+                           DRAMRequestType::kRead, PIMOperandType::kDRAM, input);
+        exec_status += temp;
+        memory_duration = temp.memory_duration;
+      }
 
       // read compressed kv
       shape.at(0) = k;
@@ -2882,16 +2956,19 @@ ExecStatus AbsorbMLASumExecutionLogic(Device_Ptr device,
       memory_duration = temp.memory_duration;
     }
     else{
-      // read score
       std::vector<int> shape = {1,1};
-      shape.at(0) = m;
-      shape.at(1) = k * num_heads;
-      input->shape.resize(0);
-      input->setShape(shape);
       ExecStatus temp;
-      temp =
-          getIdealMemoryStatus(device, ProcessorType::LOGIC, DRAMRequestType::kRead, input);
-      exec_status += temp;
+
+      // read score -- only when materialized (OFF).
+      if (!use_flash_attention) {
+        shape.at(0) = m;
+        shape.at(1) = k * num_heads;
+        input->shape.resize(0);
+        input->setShape(shape);
+        temp =
+            getIdealMemoryStatus(device, ProcessorType::LOGIC, DRAMRequestType::kRead, input);
+        exec_status += temp;
+      }
 
       // read compressed_kv
       shape.at(0) = k;
@@ -2946,6 +3023,10 @@ ExecStatus AbsorbMLASumExecutionPIM(Device_Ptr device,
   int num_kv_heads = layer_info.num_kv_heads;
   int qk_rope_head_dim = layer_info.qk_rope_head_dim;
   int kv_lora_rank = layer_info.kv_lora_rank;
+  // FA master flag (dormant Absorb-Sum PIM path). ON: drop score/P memory terms.
+  // (This roofline path issues only GEMV reads -- no separate score read/write
+  // energy to gate; softmax already charges no memory here.)
+  bool use_flash_attention = layer_info.use_flash_attention;
 
   int m, n, k;
   double flops, memory_size;
@@ -2978,8 +3059,9 @@ ExecStatus AbsorbMLASumExecutionPIM(Device_Ptr device,
     flops = 1.0 * m * k * n * 2.0 * num_heads;
     total_flops += flops;
 
+    // ON: nope-score (m*n*heads) never materializes -> drop from traffic.
     memory_size = (1.0 * m * k * num_heads + 1.0 * k * n +
-                   1.0 * m * n * num_heads) *
+                   (use_flash_attention ? 0.0 : 1.0 * m * n * num_heads)) *
                   input->precision_byte;
     total_memory_size += memory_size;
 
@@ -3028,8 +3110,9 @@ ExecStatus AbsorbMLASumExecutionPIM(Device_Ptr device,
     flops = 1.0 * m * k * n * 2.0 * num_heads;
     total_flops += flops;
 
+    // ON: rope-score (m*n*heads) never materializes -> drop from traffic.
     memory_size = (1.0 * m * k * num_heads + 1.0 * k * n+
-                   1.0 * m * n * num_heads) *
+                   (use_flash_attention ? 0.0 : 1.0 * m * n * num_heads)) *
                   input->precision_byte;
     total_memory_size += memory_size;
 
@@ -3103,7 +3186,8 @@ ExecStatus AbsorbMLASumExecutionPIM(Device_Ptr device,
     flops = 1.0 * m * k * n * 2.0 * num_heads;
     total_flops += flops;
 
-    memory_size = (1.0 * m * k * num_heads + k * n + 1.0 * m * n * num_heads) * input->precision_byte;
+    // ON: the softmax-weight P (read here as m*k*heads) never materializes -> drop.
+    memory_size = ((use_flash_attention ? 0.0 : 1.0 * m * k * num_heads) + k * n + 1.0 * m * n * num_heads) * input->precision_byte;
     total_memory_size += memory_size;
 
     compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;

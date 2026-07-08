@@ -173,24 +173,39 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
     // op's output) -- see footprint.h::peakIntermediateBytes. Must stay the
     // single shared definition with parallelism_optimizer.cpp so the two
     // scarce-tier gates (Part C below / checkCapacity) never drift apart.
-    activation_size = (long long)peakIntermediateBytes(
-        device->model_config, batch_size_per_dp, ne_tp_dg, expert_batch_size,
-        num_routed_expert_per_device,
-        /*has_moe_layer=*/device->model_config.num_routed_expert > 0,
-        /*has_dense_layer=*/hasDenseFfnLayer(device->model_config));
+    // FA_FLAG_SPEC.md capacity switch: ON (FlashAttention) excludes the resident
+    // score (peakIntermediateBytes); OFF materializes the full resident score
+    // (scoreInclusiveIntermediateBytes). Applied in LOCK-STEP with the optimizer
+    // gate (parallelism_optimizer.cpp) so the two scarce-tier gates never drift.
+    if (config.use_flash_attention) {
+      activation_size = (long long)peakIntermediateBytes(
+          device->model_config, batch_size_per_dp, ne_tp_dg, expert_batch_size,
+          num_routed_expert_per_device,
+          /*has_moe_layer=*/device->model_config.num_routed_expert > 0,
+          /*has_dense_layer=*/hasDenseFfnLayer(device->model_config));
+    } else {
+      activation_size = (long long)scoreInclusiveIntermediateBytes(
+          device->model_config, batch_size_per_dp, ne_tp_dg, expert_batch_size,
+          num_routed_expert_per_device,
+          /*has_moe_layer=*/device->model_config.num_routed_expert > 0,
+          /*has_dense_layer=*/hasDenseFfnLayer(device->model_config),
+          (double)device->model_config.input_len + device->model_config.output_len);
+    }
 
     // Full faithful paper-1 intermediate-data accounting: add the complete
     // resident intermediate set (footprint.h::intermediateExtrasBytes --
     // KV-write on-chip staging + score tile + all-reduce scratch + MoE
-    // dispatch/GateOut + tiled LM-head logits) on top of peakIntermediateBytes.
-    // Mirrors the optimizer gate (parallelism_optimizer.cpp) so the two never
-    // drift.
+    // dispatch/GateOut + tiled LM-head logits) on top of the peak above.
+    // The score-tile term is dropped when OFF (resident full score already
+    // counted above -- ruling #4). Mirrors the optimizer gate
+    // (parallelism_optimizer.cpp) so the two never drift.
     {
       int pp = device->model_config.pp_dg > 0 ? device->model_config.pp_dg : 1;
       int layers_per_stage = device->model_config.num_layers / pp;
       if (layers_per_stage < 1) layers_per_stage = 1;
       activation_size += (long long)intermediateExtrasBytes(
-          device->model_config, batch_size_per_dp, ne_tp_dg, layers_per_stage);
+          device->model_config, batch_size_per_dp, ne_tp_dg, layers_per_stage,
+          config.use_flash_attention);
     }
   }
   else{ // prefill mode & colocated system (mixed)

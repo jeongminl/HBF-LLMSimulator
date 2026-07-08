@@ -12,14 +12,16 @@ namespace llm_system {
 SelfAttentionGen::SelfAttentionGen(std::string& prefix, std::string& name,
                                    int head_dim, int num_heads,
                                    int num_kv_heads, int max_seq_len,
-                                   int batch_size, int qk_rope_head_dim, std::vector<int> device_list,
+                                   int batch_size, int qk_rope_head_dim, bool use_flash_attention,
+                                   std::vector<int> device_list,
                                    Device::Ptr device)
     : Module(prefix, name, device, device_list, true),
       head_dim(head_dim),
       num_heads(num_heads),
       num_kv_heads(num_kv_heads),
       qk_rope_head_dim(qk_rope_head_dim),
-      max_seq_len(max_seq_len) {
+      max_seq_len(max_seq_len),
+      use_flash_attention(use_flash_attention) {
   int parallel_num = device_list.size();
 
   // NOTE: for Llama-4-style local/chunked attention layers, the caller
@@ -68,6 +70,7 @@ Tensor::Ptr SelfAttentionGen::forward(const Tensor::Ptr input,
   layer_info.head_dim = head_dim;
   layer_info.qk_rope_head_dim = qk_rope_head_dim;
   layer_info.use_chunked_attention = true; // chunked attention should always be used regardless of configuration
+  layer_info.use_flash_attention = use_flash_attention; // FA master flag -> gate score/softmax in AttentionGenExecutionGPU
   // Llama-4-style interleaved local/global attention: caps this layer's decode-phase
   // KV read at max_seq_len (see the constructor's comment; for every model except
   // llama4_maverick/llama4_scout's local layers, max_seq_len == full context, so this
@@ -90,13 +93,15 @@ Tensor::Ptr SelfAttentionGen::forward(const Tensor::Ptr input,
 SelfAttentionSum::SelfAttentionSum(std::string& prefix, std::string& name,
                                    int head_dim, int num_heads,
                                    int num_kv_heads, int max_seq_len,
-                                   int batch_size, int qk_rope_head_dim, std::vector<int> device_list,
+                                   int batch_size, int qk_rope_head_dim, bool use_flash_attention,
+                                   std::vector<int> device_list,
                                    Device::Ptr device, int gen_max_seq_len)
     : Module(prefix, name, device, device_list, true),
       head_dim(head_dim),
       num_heads(num_heads),
       num_kv_heads(num_kv_heads),
       qk_rope_head_dim(qk_rope_head_dim),
+      use_flash_attention(use_flash_attention),
       local_attention_window(gen_max_seq_len > 0 ? gen_max_seq_len : max_seq_len) {
   int parallel_num = device_list.size();
 
@@ -125,6 +130,7 @@ Tensor::Ptr SelfAttentionSum::forward(const Tensor::Ptr input,
   layer_info.head_dim = head_dim;
   layer_info.qk_rope_head_dim = qk_rope_head_dim;
   layer_info.use_chunked_attention = true; // chunked attention should always be used regardless of configuration
+  layer_info.use_flash_attention = use_flash_attention; // FA master flag -> gate score/softmax in AttentionSumExecutionGPU
   // Llama-4-style interleaved local/global attention: caps this layer's prefill-phase
   // scoring/context read at local_attention_window (see the constructor's comment;
   // for every model except llama4_maverick/llama4_scout's local layers, this equals
@@ -148,13 +154,15 @@ SelfAttentionMixed::SelfAttentionMixed(std::string& prefix, std::string& name,
                                        int head_dim, int num_heads,
                                        int num_kv_heads, int max_seq_len,
                                        int batch_size, int qk_rope_head_dim,
+                                       bool use_flash_attention,
                                        std::vector<int> device_list,
                                        Device::Ptr device)
     : Module(prefix, name, device, device_list, true),
       head_dim(head_dim),
       num_heads(num_heads),
       num_kv_heads(num_kv_heads),
-      qk_rope_head_dim(qk_rope_head_dim) {
+      qk_rope_head_dim(qk_rope_head_dim),
+      use_flash_attention(use_flash_attention) {
   int parallel_num = device_list.size();
 
   std::vector<int> shape = {batch_size, max_seq_len, num_kv_heads, head_dim};
@@ -173,6 +181,7 @@ Tensor::Ptr SelfAttentionMixed::forward(
   layer_info.head_dim = head_dim;
   layer_info.qk_rope_head_dim = qk_rope_head_dim;
   layer_info.use_chunked_attention = true; // chunked attention should always be used regardless of configuration
+  layer_info.use_flash_attention = use_flash_attention; // FA master flag (dead-code path, kept flag-aware)
 
   std::vector<Tensor::Ptr> tensor_list;
   tensor_list.resize(0);
@@ -327,14 +336,16 @@ TensorVec AttentionMerge::forward(const TensorVec input,
 MultiLatentAttentionGen::MultiLatentAttentionGen(std::string& prefix, std::string& name,
     int head_dim, int num_heads,
     int num_kv_heads, int max_seq_len,
-    int batch_size, int qk_rope_head_dim, bool compressed_kv, bool use_flash_mla, std::vector<int> device_list,
+    int batch_size, int qk_rope_head_dim, bool compressed_kv, bool use_flash_mla,
+    bool use_flash_attention, std::vector<int> device_list,
     Device::Ptr device)
   : Module(prefix, name, device, device_list, true),
   head_dim(head_dim),
   num_heads(num_heads),
   qk_rope_head_dim(qk_rope_head_dim),
   compressed_kv(compressed_kv),
-  use_flash_mla(use_flash_mla) {
+  use_flash_mla(use_flash_mla),
+  use_flash_attention(use_flash_attention) {
   int parallel_num = device_list.size();
 
   std::vector<int> shape = {max_seq_len, head_dim};
@@ -379,6 +390,7 @@ Tensor::Ptr MultiLatentAttentionGen::forward(const Tensor::Ptr input,
   layer_info.head_dim = head_dim;
   layer_info.qk_rope_head_dim = qk_rope_head_dim;
   layer_info.use_flash_mla = use_flash_mla;
+  layer_info.use_flash_attention = use_flash_attention; // FA master flag -> gate materialized else-branch (ruling #3)
   layer_info.use_chunked_attention = true; // chunked attention should always be used regardless of configuration
 
   std::vector<Tensor::Ptr> tensor_list;
@@ -455,15 +467,16 @@ Tensor::Ptr MultiLatentAttentionSum::forward(const Tensor::Ptr input,
 AbsorbMLAGen::AbsorbMLAGen(std::string& prefix, std::string& name,
     int head_dim, int num_heads,
     int num_kv_heads, int max_seq_len,
-    int batch_size, int qk_rope_head_dim, int kv_lora_rank, bool compressed_kv, 
-    bool use_flash_mla, std::vector<int> device_list, Device::Ptr device)
+    int batch_size, int qk_rope_head_dim, int kv_lora_rank, bool compressed_kv,
+    bool use_flash_mla, bool use_flash_attention, std::vector<int> device_list, Device::Ptr device)
   : Module(prefix, name, device, device_list, true),
   head_dim(head_dim),
   num_heads(num_heads),
   qk_rope_head_dim(qk_rope_head_dim),
   kv_lora_rank(kv_lora_rank),
   compressed_kv(compressed_kv),
-  use_flash_mla(use_flash_mla) {
+  use_flash_mla(use_flash_mla),
+  use_flash_attention(use_flash_attention) {
   // num_kv_heads is already TP-sharded by the caller (parallel.cpp passes
   // num_kv_heads/parallel_num) -- do NOT divide by parallel_num again here (that was a
   // double-division bug: e.g. num_kv_heads=8,tp=8 -> caller passes 1 -> dividing again
@@ -508,6 +521,7 @@ Tensor::Ptr AbsorbMLAGen::forward(const Tensor::Ptr input,
   layer_info.qk_rope_head_dim = qk_rope_head_dim;
   layer_info.kv_lora_rank = kv_lora_rank;
   layer_info.use_flash_mla = use_flash_mla;
+  layer_info.use_flash_attention = use_flash_attention; // FA master flag -> gate materialized else-branch (ruling #3)
   layer_info.use_chunked_attention = true; // chunked attention should always be used regardless of configuration
 
   std::vector<Tensor::Ptr> tensor_list;
@@ -530,14 +544,16 @@ Tensor::Ptr AbsorbMLAGen::forward(const Tensor::Ptr input,
 AbsorbMLASum::AbsorbMLASum(std::string& prefix, std::string& name,
   int head_dim, int num_heads,
   int num_kv_heads, int max_seq_len,
-  int batch_size, int qk_rope_head_dim, int kv_lora_rank, std::vector<int> device_list,
+  int batch_size, int qk_rope_head_dim, int kv_lora_rank, bool use_flash_attention,
+  std::vector<int> device_list,
   Device::Ptr device)
   : Module(prefix, name, device, device_list, true),
   head_dim(head_dim),
   num_heads(num_heads),
   num_kv_heads(num_kv_heads),
   qk_rope_head_dim(qk_rope_head_dim),
-  kv_lora_rank(kv_lora_rank) {
+  kv_lora_rank(kv_lora_rank),
+  use_flash_attention(use_flash_attention) {
   // num_kv_heads is already TP-sharded by the caller (parallel.cpp passes
   // num_kv_heads/parallel_num) -- do NOT divide by parallel_num again here (see the
   // identical fix/comment in AbsorbMLAGen's constructor above).
@@ -569,6 +585,7 @@ Tensor::Ptr AbsorbMLASum::forward(const Tensor::Ptr input,
   layer_info.head_dim = head_dim;
   layer_info.qk_rope_head_dim = qk_rope_head_dim;
   layer_info.kv_lora_rank = kv_lora_rank;
+  layer_info.use_flash_attention = use_flash_attention; // FA master flag -> gate materialized score/softmax (ruling #3)
 
   std::vector<Tensor::Ptr> tensor_list;
   tensor_list.resize(0);

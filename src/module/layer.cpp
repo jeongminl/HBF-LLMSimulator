@@ -31,7 +31,8 @@ Attention::Attention(std::string& prefix, std::string& name,
       module_map_name, "self_attention", model_config.head_dim,
       model_config.num_heads, model_config.num_kv_heads,
       full_context_len, scheduler->batch_size_per_dp, model_config.qk_rope_head_dim,
-      model_config.compressed_kv, device_list, device, gen_seq_len);
+      model_config.compressed_kv, scheduler->system_config.use_flash_attention,
+      device_list, device, gen_seq_len);
   add_module(self_attention);
 
   auto attn_o_proj =
@@ -124,9 +125,9 @@ MultiLatentAttention::MultiLatentAttention(std::string& prefix, std::string& nam
     add_module(attn_tr_k_up_proj);
 
     auto attn_mla_absorbed = AbsorbMLAParallel::Create(module_map_name, "attn_mla_absorbed", model_config.head_dim,
-      model_config.num_heads, model_config.num_kv_heads, model_config.input_len + model_config.output_len, 
+      model_config.num_heads, model_config.num_kv_heads, model_config.input_len + model_config.output_len,
       scheduler->batch_size_per_dp, model_config.qk_rope_head_dim, model_config.kv_lora_rank, model_config.compressed_kv,
-      scheduler->system_config.use_flash_mla, device_list, device);
+      scheduler->system_config.use_flash_mla, scheduler->system_config.use_flash_attention, device_list, device);
     add_module(attn_mla_absorbed);
 
     auto attn_v_up_proj = BatchedColumnParallelLinear::Create(

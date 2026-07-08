@@ -279,16 +279,19 @@ inline double peakIntermediateBytes(const ModelConfig& model,
   return std::max({attn_total, ffn_total, residual_oop});
 }
 
-// DIAGNOSTIC ONLY -- never gates capacity or batch. Paper-style "score-inclusive"
-// intermediate footprint: peakIntermediateBytes plus the chunked-attention
-// score/softmax working set (2 buffers x heads/tp x min(seq_len, attn_chunk_size)
-// x precision) charged against the SRAM tier the way the paper's tool evidently
-// does (its Fig-3 llama4/SHORT/HBF+ bar is flat & SRAM-marked at ~855 seq/GPU =
-// ~374 KB/seq implied, reachable only with an O(ctx) score charge). A full A/B
-// (worktree ab-score-accounting) showed adopting this as the REAL gate reproduces
-// that one bar but regresses llama4-MID / llama3-MID / llama3-LONG by 2-4x vs the
-// paper -- no context-scaled score charge fits all six HBF+ bars simultaneously --
-// so it is logged for comparison only. See PAPER_INCONSISTENCIES.md U7.
+// Paper-style "score-inclusive" intermediate footprint: peakIntermediateBytes plus
+// the chunked-attention score/softmax working set (2 buffers x heads/tp x
+// min(seq_len, attn_chunk_size) x precision) charged against the SRAM tier.
+//
+// This is the LIVE scarce-tier gate whenever use_flash_attention == false (the
+// coherent "materialized / no-scratchpad" model per FA_FLAG_SPEC.md): the full
+// resident score IS counted against the intermediate-data pool, matching the OFF
+// timing model that keeps the materialized score/P traffic. Under
+// use_flash_attention == true it is NOT used as the gate (score lives on-chip in a
+// separate double-buffer) -- peakIntermediateBytes is the gate there and this stays
+// a comparison-only diagnostic. Historically (both flags conflated) this reproduced
+// the paper's Fig-3 llama4/SHORT/HBF+ bar but regressed llama4-MID / llama3-MID /
+// llama3-LONG by 2-4x -- see PAPER_INCONSISTENCIES.md U7.
 inline double scoreInclusiveIntermediateBytes(const ModelConfig& model,
                                               double batch_per_dp,
                                               int tp,
@@ -391,12 +394,19 @@ inline double kvWriteStagingBytes(const ModelConfig& model,
 inline double intermediateExtrasBytes(const ModelConfig& model,
                                       double batch_per_gpu,
                                       int tp,
-                                      double layers_per_stage) {
+                                      double layers_per_stage,
+                                      bool use_flash_attention = true) {
   double precision = model.precision_byte;
   double per_seq = 0.0;
 
   // Score tile: flash-attention compute tile, O(chunk)=256 columns per head.
-  per_seq += (model.num_heads / (double)tp) * 256.0 * precision;
+  // FA_FLAG_SPEC.md ruling #4: this O(chunk) tile is the ON (FlashAttention)
+  // resident score. Under OFF the FULL resident score is instead counted via
+  // scoreInclusiveIntermediateBytes at the caller, so drop this tile here to
+  // avoid double-counting against the now-resident full score.
+  if (use_flash_attention) {
+    per_seq += (model.num_heads / (double)tp) * 256.0 * precision;
+  }
 
   // TP all-reduce scratch: in-place ring reduces one hidden_dim/tp chunk at a time.
   per_seq += (model.hidden_dim / (double)tp) * precision;
