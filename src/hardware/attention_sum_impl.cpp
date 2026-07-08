@@ -167,7 +167,14 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
     }
   }
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0 && !use_ramulator) {
-    time_ns accumul_memory_duration = getAttentionMemoryDuration(config, total_kv_read_size, total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size);
+    // I3: fill_amortize_calls=2, standardizing this K+V page-fill amortization
+    // to match GQA-gen's convention (attention_gen_impl.cpp:98,187) -- one
+    // staging pool serves both the K and V page-fill per layer, so the
+    // pipeline-fill latency should be shared across 2 calls, not charged in
+    // full to each. Was defaulting to 1 (2x over-charge). Prefill-only path
+    // (GQA-Sum runs on the prefill/sum leg) -- report whether any published
+    // decode cell moves (should be none; this loop never executes for decode).
+    time_ns accumul_memory_duration = getAttentionMemoryDuration(config, total_kv_read_size, total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size, 2);
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
   }
 
@@ -349,7 +356,8 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
     }
   }
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0 && !use_ramulator) {
-    time_ns context_accumul_memory_duration = getAttentionMemoryDuration(config, context_total_kv_read_size, context_total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size);
+    // I3: fill_amortize_calls=2 -- see the Scoring loop's I3 comment above.
+    time_ns context_accumul_memory_duration = getAttentionMemoryDuration(config, context_total_kv_read_size, context_total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size, 2);
     exec_status.total_duration += std::max(context_accumul_compute_duration, context_accumul_memory_duration);
   }
 

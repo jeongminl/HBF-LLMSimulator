@@ -734,7 +734,11 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
       accumul_len += n;
     }
     if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
-      accumul_memory_duration = getAttentionMemoryDuration(config, total_kv_read_size, total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size);
+      // I3: fill_amortize_calls=2, standardizing to GQA-gen's convention
+      // (attention_gen_impl.cpp:98,187) -- one staging pool serves both the
+      // Score and Context page-fill per layer, so the pipeline-fill latency
+      // should be shared across 2 calls, not charged in full to each.
+      accumul_memory_duration = getAttentionMemoryDuration(config, total_kv_read_size, total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size, 2);
     }
 
     if(use_ramulator) {
@@ -863,7 +867,8 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
       accumul_len += k;
     }
     if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
-      accumul_memory_duration = getAttentionMemoryDuration(config, total_kv_read_size, total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size);
+      // I3: fill_amortize_calls=2 -- see the Score loop's I3 comment above.
+      accumul_memory_duration = getAttentionMemoryDuration(config, total_kv_read_size, total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size, 2);
     }
 
     if (use_ramulator) {

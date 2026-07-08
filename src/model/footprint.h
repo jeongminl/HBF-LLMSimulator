@@ -356,8 +356,27 @@ inline double kvWriteStagingBytes(const ModelConfig& model,
 // the short-lived compute tiles and communication scratch buffers that paper 1
 // sizes the 320-MB logic SRAM by (peak occupancy). This helper returns the SUM
 // of the additional per-GPU resident terms that must be added on TOP of
-// peakIntermediateBytes. All SINGLE-buffered (paper 1 sizes by peak occupancy,
-// no double buffering); all per-seq terms scaled by batch_per_gpu:
+// peakIntermediateBytes.
+//
+// I4: the per-stack staging pool this function charges for KV-write staging
+// (kvWriteStagingBytes -> sram_per_stack_bytes*num_flash_stacks, e.g. the
+// 3.13 MB/stack HBF constant) IS the physical double-buffer, not an
+// unbuffered single pool on top of which a second, separately-sized buffer
+// would be needed -- the timing side (getAttentionMemoryDuration /
+// getLinearMemoryDuration, layer_impl.h) already double-buffers WITHIN this
+// same pool size (chunk N+1's page-read latency overlaps chunk N's transfer
+// using the same sram_per_stack_bytes*num_flash_stacks chunk; see
+// layer_impl.h's "double-buffer" comments), so charging the full pool size
+// once here is the correct capacity accounting for that double-buffered
+// pool, not an inconsistency with it. (Checked empirically: halving the
+// timing side's chunk to sram_capacity/2 -- i.e. modeling the pool as two
+// separately-sized half-buffers -- is INERT for every published preset: the
+// half-size chunk's transfer time [HBF/HBF+ ~1.03us, CONV/CONV+ ~4.7us]
+// still exceeds the flash page-read latency [1us / 3us respectively], so the
+// per-extra-chunk residual max(0, page_latency - chunk_transfer) stays 0 and
+// the bulk transfer term is chunk-size-independent -- consistent with the
+// "under every current preset's constants" note in layer_impl.h above.) All
+// per-seq terms scaled by batch_per_gpu:
 //   - KV-write staging  : kvWriteStagingBytes(...)  (context-independent burst)
 //   - Score tile        : (num_heads/tp) x 256 x precision   (flash-attn O(chunk) tile)
 //   - TP all-reduce scratch : (hidden_dim/tp) x precision    (in-place ring chunk)
