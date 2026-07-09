@@ -83,6 +83,15 @@ class Module : public std::enable_shared_from_this<Module> {
 
   void set_tensor_module();
 
+  // paper2 §IV first-activated-expert page-latency exposure (see tensor.h's
+  // exposeFirstExpertPageLatency comment for the full mechanism). Default
+  // no-op so every module except the specific chain that actually leads to
+  // an expert's first weight-bearing Linear (Linear itself, and the
+  // FeedForward2Way/3Way + ColumnParallelLinear wrappers that forward to it)
+  // does nothing -- callers can invoke this on any Module::Ptr without
+  // knowing its concrete type.
+  virtual void armExposeFirstExpertPageLatency() {}
+
   std::string name;
   std::string module_map_name;
   bool sync;

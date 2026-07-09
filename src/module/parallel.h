@@ -28,6 +28,14 @@ class ColumnParallelLinear : public Module {
     return ptr;
   };
 
+ public:
+  // paper2 §IV: forwards the arm to the wrapped "Linear" submodule (see
+  // linear.h). ColumnParallelLinear is the type of gate_proj/ffn_up_proj --
+  // the first weight-bearing projection an expert FFN executes.
+  void armExposeFirstExpertPageLatency() override {
+    get_module("Linear")->armExposeFirstExpertPageLatency();
+  }
+
  private:
   ColumnParallelLinear(std::string& prefix, std::string& name, int input_size,
                        int output_size, std::vector<int> device_list,

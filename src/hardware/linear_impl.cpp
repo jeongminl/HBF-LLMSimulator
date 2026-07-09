@@ -68,6 +68,15 @@ static ExecStatus linearCore(
   else
     total_memory_size = (m * k + k * n + m * n) * num_heads * weight->precision_byte;
 
+  // paper2 §IV first-activated-expert exposure: one-shot arm/consume flag on
+  // the weight tensor (see tensor.h's exposeFirstExpertPageLatency and
+  // module/expert.cpp's arming logic). Read and reset UNCONDITIONALLY here,
+  // before the zero-size early return below, so the flag can never persist
+  // into a later call on this same weight tensor regardless of which code
+  // path this call takes.
+  bool expose_first_expert_latency = weight->exposeFirstExpertPageLatency;
+  weight->exposeFirstExpertPageLatency = false;
+
   ExecStatus exec_status;
   if (input->getSize() == 0) return exec_status;
 
@@ -75,7 +84,8 @@ static ExecStatus linearCore(
       (desc.compute_peak_flops * effectiveMFU(config, m)) * 1000 * 1000 * 1000;
   time_ns memory_duration  = getLinearMemoryDuration(config, m, k, n, weight->precision_byte,
                                                       total_memory_size, desc.memory_bandwidth,
-                                                      num_heads, duplicated_input);
+                                                      num_heads, duplicated_input,
+                                                      expose_first_expert_latency);
   exec_status.compute_duration = compute_duration;
 
   if (use_ramulator) {

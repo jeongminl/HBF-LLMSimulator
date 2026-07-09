@@ -14,7 +14,20 @@
 
 namespace llm_system {
 
-inline time_ns getLinearMemoryDuration(const SystemConfig& config, double m, double k, double n, int precision, hw_metric total_memory_size, hw_metric memory_bandwidth, int num_heads = 1, bool duplicated_input = false) {
+// expose_full_page_latency: paper2 §IV MoE first-activated-expert exception.
+// Armed by the caller (linearCore, hardware/linear_impl.cpp) from the weight
+// tensor's one-shot exposeFirstExpertPageLatency flag (tensor.h), itself set
+// by Route::forward (module/route.cpp) on exactly the first locally-owned
+// expert that receives nonzero routed tokens each decode step -- Route, not
+// ExpertFFN, because Route is the graph_execution leaf that actually
+// re-runs every decode step with live per-step token counts (see
+// module/expert.cpp's ctor comment for why ExpertFFN::forward can't be used
+// for this). Every existing call site (layernorm.cpp, lm_head.cpp, and
+// linearCore's own non-expert calls) never passes true, so this parameter
+// defaults false and is a complete no-op for every non-MoE-expert Linear
+// call and for every paper1
+// config (expose_first_expert_latency defaults false in SystemConfig too).
+inline time_ns getLinearMemoryDuration(const SystemConfig& config, double m, double k, double n, int precision, hw_metric total_memory_size, hw_metric memory_bandwidth, int num_heads = 1, bool duplicated_input = false, bool expose_full_page_latency = false) {
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
     auto& hbf = config.hbf_config;
     // Weight (k×n) is on flash; batched linear (num_heads>1) has num_heads
@@ -57,6 +70,30 @@ inline time_ns getLinearMemoryDuration(const SystemConfig& config, double m, dou
     double weight_exposed_latency_ns =
         (double)hbf.flash_page_read_latency_ns / weight_fill_amortize +
         (weight_num_chunks - 1) * std::max(0.0, (double)hbf.flash_page_read_latency_ns - weight_chunk_transfer_ns);
+    // paper2 §IV assumes double-buffering fully hides HBF read latency (except
+    // the first activated MoE expert, charged separately just below via
+    // expose_full_page_latency). Zero the ENTIRE exposed term (both the
+    // pipeline-fill and any per-chunk residual), not just the fill, so no page
+    // latency of any kind leaks into paper2_mode's weight-read time.
+    if (config.paper2_mode) {
+      weight_exposed_latency_ns = 0.0;
+    }
+    // paper2 §IV MoE sub-block exception: "double buffering hides HBF read
+    // latency for all layers except the MoE sub-block, where it is exposed
+    // only when loading the first activated expert." Nothing precedes the
+    // first activated expert's weight fetch to prefetch behind (the
+    // double-buffer has nothing queued yet), so its page-read latency is NOT
+    // hidden -- unlike every other weight tensor in the per-iteration stream,
+    // which the pipeline-fill amortization above already accounts for.
+    // Un-amortized (the full hbf.flash_page_read_latency_ns, not divided by
+    // weight_stream_ops_per_iter): this is a structurally distinct, one-time
+    // charge per MoE layer per step, not part of the cross-op amortized
+    // stream. Added independently of the paper2_mode zeroing directly above
+    // -- gated only on the two conditions in the comment above the function
+    // signature -- so it applies whether or not that zeroing already ran.
+    if (expose_full_page_latency && config.expose_first_expert_latency) {
+      weight_exposed_latency_ns += (double)hbf.flash_page_read_latency_ns;
+    }
     double weight_read_time = (weight_size / hbf.flash_read_bandwidth * 1e9) + weight_exposed_latency_ns;
 
     // Activations: input and output are on HBM or logic-die SRAM.
@@ -121,6 +158,13 @@ inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric 
       double chunk_transfer_ns = chunk_bytes / hbf.flash_read_bandwidth * 1e9;
       double exposed_latency_ns = (double)hbf.flash_page_read_latency_ns / fill_amortize +
           (num_chunks - 1) * std::max(0.0, (double)hbf.flash_page_read_latency_ns - chunk_transfer_ns);
+      // paper2 §IV assumes double-buffering fully hides HBF read latency (except
+      // the first activated MoE expert, charged separately at its call site --
+      // placeholder for a later change). Zero the ENTIRE exposed term (fill AND
+      // residual), not just the fill.
+      if (config.paper2_mode) {
+        exposed_latency_ns = 0.0;
+      }
       kv_read_time = (kv_read_size / hbf.flash_read_bandwidth * 1e9) + exposed_latency_ns;
     } else {
       // No chunked attention: still double-buffer by SRAM-sized chunks (plane-level
@@ -134,6 +178,13 @@ inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric 
       double chunk_transfer_ns = sram_capacity / hbf.flash_read_bandwidth * 1e9;
       double exposed_latency_ns = (double)hbf.flash_page_read_latency_ns / fill_amortize +
           (num_chunks - 1) * std::max(0.0, (double)hbf.flash_page_read_latency_ns - chunk_transfer_ns);
+      // paper2 §IV assumes double-buffering fully hides HBF read latency (except
+      // the first activated MoE expert, charged separately at its call site --
+      // placeholder for a later change). Zero the ENTIRE exposed term (fill AND
+      // residual), not just the fill.
+      if (config.paper2_mode) {
+        exposed_latency_ns = 0.0;
+      }
       kv_read_time = (kv_read_size / hbf.flash_read_bandwidth * 1e9) + exposed_latency_ns;
     }
 
@@ -146,6 +197,35 @@ inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric 
     return std::max(kv_read_time, act_time);
   }
   return 0;
+}
+
+// paper2 §IV CPU-memory/NVLink-C2C KV offload tier: EXCESS KV beyond this
+// device's local HBM-KV budget lives in CPU memory and is read directly over
+// NVLink-C2C during attention. f_off is BatchedSequence::p2_kv_offload_fraction
+// (Scheduler::setMetadata(), reservation-based, recomputed once per step per
+// dp-shard -- see that function's doc comment). The resident (HBM-local)
+// fraction of the KV read, plus ALL activation traffic, goes over this
+// device's own memory_bandwidth exactly like the non-offload path; only the
+// offloaded fraction of the KV read goes over config.c2c_bandwidth.
+//
+// How the two composes is genuinely ambiguous without vendor-published
+// overlap details: SUM (serial, the default -- config.c2c_read_composition
+// == 0) was adopted after an adversarial review hand-fit both compositions
+// against paper2 Fig5's NVLink6.0 TPOT anchors and found SUM the better
+// match; MAX (fully overlapped independent channels, == 1) is kept for the
+// confirmation experiment.
+//
+// Only the READ path is modeled here. Writes are deliberately un-modeled on
+// C2C: a newly generated token's KV entry always lands in local HBM (never
+// offloaded on write), and lifetime write volume is ~1/avg_context of read
+// volume -- 3-4 orders of magnitude below the read bottleneck -- so this
+// matches paper2 §IV, which discusses only the read path.
+inline time_ns hbmKvOffloadReadDuration(const SystemConfig& config, hw_metric kv_read_size, hw_metric act_size, double f_off) {
+  double resident_time = (kv_read_size * (1.0 - f_off) + act_size) / config.memory_bandwidth * 1e9;
+  double offload_time = (kv_read_size * f_off) / config.c2c_bandwidth * 1e9;
+  return (config.c2c_read_composition == 1)
+      ? std::max(resident_time, offload_time)
+      : resident_time + offload_time;
 }
 
 // program_latency_amortize_calls: number of per-layer calls whose writes together

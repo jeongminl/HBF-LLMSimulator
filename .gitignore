@@ -73,3 +73,7 @@ paper_text.txt
 /kvflag_*
 /tmp_*.py
 /fixetp_*.txt
+
+# Paper-2 (KV-endurance replication) scratch outputs
+paper2_results/
+scratch/

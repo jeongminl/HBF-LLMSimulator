@@ -26,6 +26,15 @@ class Linear : public Module {
     return ptr;
   };
 
+ public:
+  // paper2 §IV: arms this Linear's persistent weight tensor ("A") so its NEXT
+  // execution (linearCore, hardware/linear_impl.cpp) charges one un-amortized
+  // flash page-read latency. See tensor.h's exposeFirstExpertPageLatency for
+  // the full one-shot arm/consume contract.
+  void armExposeFirstExpertPageLatency() override {
+    tensor_list.at("A")->exposeFirstExpertPageLatency = true;
+  }
+
  private:
   Linear(std::string& prefix, std::string& name, int input_size,
          int output_size, std::vector<int> device_list, Device::Ptr device);

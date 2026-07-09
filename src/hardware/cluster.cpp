@@ -294,6 +294,85 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
                  
   std::cout << "Total: " << size / 1024.0 / 1024 / 1024 << "GB" << std::endl;
 
+  // ---- paper2 §IV required-SRAM-per-device output markers -------------------
+  // Paper2 reports required on-chip SRAM/device as an OUTPUT of the analysis
+  // (Fig5 table: 89-431 MB), backing three assumed on-chip buffers: (1)
+  // input/output activation buffering, (2) a read double-buffer that hides
+  // HBF page-read latency, and (3) a per-decode-stage KV write buffer (each
+  // newly generated token's KV entry, buffered on-chip before one stream
+  // write per decode stage). Emitted unconditionally, like the other P2_
+  // markers -- these are diagnostic outputs, never a capacity gate, so every
+  // preset/run prints them (0 for the two flash-specific terms on non-flash
+  // presets).
+  //
+  // P2_SRAM_ACT_BYTES reuses `activation_size` computed just above -- the
+  // exact same peak concurrently-live intermediate-data footprint already
+  // used for the Part C scarce-tier gate and the printed "ACT:" line
+  // (peakIntermediateBytes in decode_mode; the older summed prefill/mixed
+  // formula otherwise -- see the comment at this function's top). This is
+  // the metric that matches the paper's "input/output activation buffering":
+  // the peak concurrently-live intermediate footprint, not
+  // scoreInclusiveIntermediateBytes's diagnostic addition (that models the
+  // SEPARATE chunked-attention score-matrix staging pool, which shares the
+  // same physical double-buffer as P2_SRAM_DBUF_BYTES below, not the
+  // activation-buffer term).
+  double p2_sram_act_bytes = (double)activation_size;
+
+  // P2_SRAM_DBUF_BYTES: the read double-buffer that hides HBF page-read latency
+  // (tR) in getAttentionMemoryDuration / getLinearMemoryDuration (layer_impl.h)
+  // = 2 x effective chunk bytes (one chunk draining while the next fills). The
+  // REQUIRED buffer is the MINIMAL chunk that fully hides tR, which is the
+  // bandwidth-delay product of the flash read pipeline: the KV bytes that stream
+  // in during one tR window at the flash read bandwidth. This is precisely the
+  // timing model's own break-even -- a chunk whose transfer time (chunk_bytes /
+  // flash_read_bandwidth) is >= tR exposes ZERO per-chunk read residual, so only
+  // the single pipeline-fill tR is ever charged (layer_impl.h:156); any chunk
+  // >= flash_read_bandwidth * tR meets that bound. The timing model, when
+  // system.chunk_size==0, streams through full-staging-capacity chunks for
+  // simplicity, but does NOT need that much SRAM to hide tR -- reporting the
+  // minimal required buffer (not the full physical staging capacity) is what the
+  // paper's "required SRAM per device" metric means, and the decode timing is
+  // identical either way (residual == 0 in both). An explicit system.chunk_size
+  // overrides the bandwidth-delay chunk; either way it is capped at the physical
+  // per-device staging-SRAM capacity (a double-buffer can't stage more than the
+  // SRAM holds). 0 on non-flash presets (no HBF staging SRAM at all).
+  double p2_effective_chunk_bytes = 0.0;
+  if (config.use_hbf && config.hbf_config.num_flash_stacks > 0 &&
+      config.hbf_config.flash_read_bandwidth > 0) {
+    double p2_staging_capacity_bytes =
+        (double)config.hbf_config.sram_per_stack_bytes * config.hbf_config.num_flash_stacks;
+    double p2_bandwidth_delay_bytes = config.hbf_config.flash_read_bandwidth *
+        ((double)config.hbf_config.flash_page_read_latency_ns * 1e-9);
+    double requested_chunk_bytes = (config.chunk_size > 0)
+        ? (double)config.chunk_size : p2_bandwidth_delay_bytes;
+    p2_effective_chunk_bytes = std::min(requested_chunk_bytes, p2_staging_capacity_bytes);
+  }
+  double p2_sram_dbuf_bytes = 2.0 * p2_effective_chunk_bytes;
+
+  // P2_SRAM_KVWRITE_BYTES: this device's per-decode-stage new-token KV burst,
+  // buffered on-chip before the once-per-stage stream write (getKVWriteDuration,
+  // layer_impl.h) = batch_per_device x kvBytesPerLayerToken(model) x
+  // layers-per-pipeline-stage-on-this-device. batch_per_device follows this
+  // function's own per-device batch scoping (batch_size_per_dp, used
+  // identically throughout checkMemorySize above -- the DP-shard batch this
+  // GPU handles). layers-per-stage mirrors weightReadOpsPerIteration's
+  // (model_config.h) pp-aware computation; paper2 always runs pp_dg==1, which
+  // reduces this to the model's full num_layers, matching the "layers_per_stage
+  // on this device" the task spec calls for.
+  int p2_pp = (device->model_config.pp_dg > 0) ? device->model_config.pp_dg : 1;
+  int p2_layers_per_stage = device->model_config.num_layers / p2_pp;
+  if (p2_layers_per_stage < 1) p2_layers_per_stage = 1;
+  double p2_sram_kvwrite_bytes = (double)batch_size_per_dp *
+      kvBytesPerLayerToken(device->model_config) * p2_layers_per_stage;
+
+  double p2_required_sram_bytes_per_device =
+      p2_sram_act_bytes + p2_sram_dbuf_bytes + p2_sram_kvwrite_bytes;
+
+  std::cout << "P2_SRAM_ACT_BYTES: " << p2_sram_act_bytes << std::endl;
+  std::cout << "P2_SRAM_DBUF_BYTES: " << p2_sram_dbuf_bytes << std::endl;
+  std::cout << "P2_SRAM_KVWRITE_BYTES: " << p2_sram_kvwrite_bytes << std::endl;
+  std::cout << "P2_REQUIRED_SRAM_BYTES_PER_DEVICE: " << p2_required_sram_bytes_per_device << std::endl;
+
   // ---- Part C: generalised activation-scarce-tier check ---------------------
   // Checks activation against the scarce tier -- logic SRAM when num_hbm_stacks==0,
   // else the HBM-stack capacity -- using the scarceTierActivationLimit() helper
@@ -405,6 +484,13 @@ bool Cluster::checkMemorySize(double pred_weight_bytes,
   if (hasScarceTier(config)) {
     capacity_limit -= (double)config.hbf_config.num_hbm_stacks *
                       (double)config.hbf_config.hbm_per_stack_bytes;
+  } else if (cpuKvOffloadActive(config)) {
+    // paper2 §IV CPU-memory/NVLink-C2C KV offload tier: excess KV beyond
+    // memory_capacity is modeled as living in CPU memory, read over
+    // NVLink-C2C -- mirrors footprint.h checkCapacity()'s plain-HBM branch.
+    // Weights-fit-in-HBM-alone is guaranteed separately, by construction (see
+    // that function's comment for both paper2 models' weight footprints).
+    capacity_limit += config.cpu_memory_capacity;
   }
   double size_for_capacity_gate = hasScarceTier(config) ? (size - activation_size) : size;
   if (size_for_capacity_gate > capacity_limit) {
@@ -641,11 +727,25 @@ std::vector<Stat> Cluster::runIteration(int iter, std::string file_name) {
   // hitting
   scheduler->hittingQueue(10000);
 
+  // paper2 KV-bytes accountant: enable counting HERE, right before the TIMED
+  // per-iteration loop begins -- the initial fillRunningQueue() population
+  // above and every admission/decode inside hittingQueue()'s untimed warmup
+  // have already happened and must NOT be counted (see scheduler.h doc
+  // comment on p2_byte_counting_enabled). Both runIterationSumGenSplit and
+  // runIterationMixed below drive the actual timed setMetadata/run/
+  // updateScheduler/fillRunningQueue loop this accountant measures.
+  scheduler->setP2ByteCountingEnabled(true);
+
   if (config.disagg_system) {
     stat_list = runIterationSumGenSplit(iter, csv);
   } else {
     stat_list = runIterationMixed(iter, csv);
   }
+
+  // Disable after the timed loop: nothing outside runIteration should keep
+  // accumulating into these counters (e.g. if a caller ever re-invokes
+  // hittingQueue()/fillRunningQueue() post-hoc).
+  scheduler->setP2ByteCountingEnabled(false);
 
   std::cout << "Total: " << std::to_string(scheduler->total_time) << std::endl;
   std::cout << file_name << std::endl;

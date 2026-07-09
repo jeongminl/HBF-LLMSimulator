@@ -137,6 +137,17 @@ int main(int argc, char *argv[]) {
         system_config.hbf_config = conv_preset;
       } else if (mem_type == "CONV+") {
         system_config.hbf_config = conv_plus_preset;
+      } else if (mem_type == "P2_HBM") {
+        // paper2 device_HBM: all-HBM, no flash stacks -- every flash-only code
+        // path stays off exactly like HBM4 above.
+        system_config.hbf_config = paper2_hbm_preset;
+        system_config.paper2_mode = true;
+      } else if (mem_type == "P2_HBF") {
+        system_config.hbf_config = paper2_hbf_preset;
+        system_config.paper2_mode = true;
+      } else if (mem_type == "P2_HBF_HALF") {
+        system_config.hbf_config = paper2_hbf_half_preset;
+        system_config.paper2_mode = true;
       } else {
         fail("Unsupported memory_type: " + mem_type);
       }
@@ -162,6 +173,87 @@ int main(int argc, char *argv[]) {
            "(chunk_size must be specified in BYTES). Use 0 for auto (full SRAM "
            "staging capacity) or a value >= page_size_bytes.");
     }
+  }
+
+  // ---- paper2 config plumbing (all optional; paper1 config.yaml files that
+  // omit these keys entirely get the in-class defaults -- see
+  // hardware_config.h's paper2_mode/cpu_kv_offload/c2c_*/expose_first_expert_latency
+  // block for what each default is and why it's paper1-neutral). ----------
+  if (config["system"]["cpu_kv_offload"]) {
+    system_config.cpu_kv_offload = config["system"]["cpu_kv_offload"].as<bool>();
+  }
+  // NVLink-C2C generation -> per-direction bandwidth. Kept separate from the
+  // GPU-GPU nvlink_gen block above: c2c_bandwidth models the CPU<->GPU
+  // superchip link paper2's CPU-offload path uses, not device_ict_bandwidth
+  // (GPU<->GPU).
+  if (config["system"]["c2c_nvlink_gen"]) {
+    int c2c_gen = config["system"]["c2c_nvlink_gen"].as<int>();
+    if (c2c_gen == 5) {
+      system_config.c2c_bandwidth = 900e9;
+    } else if (c2c_gen == 6) {
+      system_config.c2c_bandwidth = 1800e9;
+    } else {
+      fail("Not support NVLink-C2C generation: " + std::to_string(c2c_gen));
+    }
+  }
+  // Explicit override, applied AFTER c2c_nvlink_gen so it always wins regardless
+  // of key order in the yaml file.
+  if (config["system"]["c2c_bandwidth_gbps"]) {
+    system_config.c2c_bandwidth =
+        config["system"]["c2c_bandwidth_gbps"].as<double>() * 1e9;
+  }
+  if (config["system"]["cpu_memory_capacity_gb"]) {
+    // "_gb" suffix follows this codebase's GiB convention (see mem_cap_limit-
+    // adjacent GB/GiB usage elsewhere in this file) -- GiB, not decimal GB.
+    system_config.cpu_memory_capacity =
+        config["system"]["cpu_memory_capacity_gb"].as<double>() * 1024.0 * 1024.0 * 1024.0;
+  }
+  if (config["system"]["expose_first_expert_latency"]) {
+    system_config.expose_first_expert_latency =
+        config["system"]["expose_first_expert_latency"].as<bool>();
+  }
+  if (config["system"]["c2c_read_composition"]) {
+    std::string composition = config["system"]["c2c_read_composition"].as<std::string>();
+    if (composition == "sum") {
+      system_config.c2c_read_composition = 0;
+    } else if (composition == "max") {
+      system_config.c2c_read_composition = 1;
+    } else {
+      fail("Unsupported system.c2c_read_composition: " + composition +
+           " (expected \"sum\" or \"max\")");
+    }
+  }
+
+  // paper2 stochastic workload sampler flags (parsed now; consumed by a later
+  // change -- see hardware_config.h's paper2_workload/workload_* block).
+  if (config["simulation"]["workload_mode"]) {
+    if (config["simulation"]["workload_mode"].as<std::string>() == "paper2") {
+      system_config.paper2_workload = true;
+    }
+  }
+  if (config["simulation"]["context_mean"]) {
+    system_config.workload_context_mean =
+        config["simulation"]["context_mean"].as<double>();
+  }
+  if (config["simulation"]["context_cv"]) {
+    system_config.workload_context_cv =
+        config["simulation"]["context_cv"].as<double>();
+  }
+  if (config["simulation"]["context_trunc_sigmas"]) {
+    system_config.workload_context_trunc_sigmas =
+        config["simulation"]["context_trunc_sigmas"].as<double>();
+  }
+  if (config["simulation"]["lout_mean_ratio"]) {
+    system_config.workload_lout_mean_ratio =
+        config["simulation"]["lout_mean_ratio"].as<double>();
+  }
+  if (config["simulation"]["lout_beta_kappa"]) {
+    system_config.workload_lout_beta_kappa =
+        config["simulation"]["lout_beta_kappa"].as<double>();
+  }
+  if (config["simulation"]["workload_seed"]) {
+    system_config.workload_seed =
+        config["simulation"]["workload_seed"].as<unsigned int>();
   }
 
   system_config.high_processor_type = ProcessorType::GPU;
@@ -244,6 +336,8 @@ int main(int argc, char *argv[]) {
     model_config = grok1;
   } else if (!model_name.compare("deepseekV3")) {
     model_config = deepseekV3;
+  } else if (!model_name.compare("deepseekR1")) {
+    model_config = deepseekR1;
   }else if (!model_name.compare("llama4_scout")) {
     model_config = llama4_scout;
   }else if (!model_name.compare("llama4_maverick")) {
@@ -251,6 +345,22 @@ int main(int argc, char *argv[]) {
   } 
   else {
     fail("No model configuration of " + model_name);
+  }
+
+  // paper2 §II "we focus on standard full attention"; Fig5's baselines are all
+  // non-iRoPE (confirmed against Maverick's own Fig5 numbers). Forces full
+  // global attention on every layer by zeroing attn_chunk_size (0 already means
+  // "no windowing" -- see isGlobalAttentionLayer()/effectiveKvLen(),
+  // model_config.h) and resetting attn_global_interval to 1, its "every layer
+  // is global" backward-compat value, purely for belt-and-suspenders clarity
+  // (isGlobalAttentionLayer already short-circuits on attn_chunk_size==0 alone).
+  // Must run AFTER model preset selection above so it overrides
+  // llama4_maverick/llama4_scout's iRoPE presets; optional and false by
+  // default, so every existing config.yaml (which omits this key) is unaffected.
+  if (config["simulation"]["disable_irope"] &&
+      config["simulation"]["disable_irope"].as<bool>()) {
+    model_config.attn_chunk_size = 0;
+    model_config.attn_global_interval = 1;
   }
 
   model_config.e_tp_dg =
@@ -659,6 +769,27 @@ int main(int argc, char *argv[]) {
   system_config.weight_stream_ops_per_iter =
       weightReadOpsPerIteration(model_config, num_node * num_device);
 
+  // paper2 CPU-memory/NVLink-C2C KV offload tier: stash this device's weight
+  // footprint into system_config BEFORE Scheduler::Create (Scheduler stores
+  // system_config BY VALUE, so anything set after Create is invisible to it)
+  // so Scheduler::setMetadata() can derive the local HBM-KV budget
+  // (memory_capacity - weight_bytes_per_device) without re-running the
+  // optimizer probe live every step. Reuses ParallelismOptimizer::
+  // EvaluateConfig's pred_weight_bytes -- the same computation that also
+  // backs the P2_WEIGHT_BYTES_NODE marker below (see that block's extensive
+  // comment for the full derivation/caveats); harmless/unused whenever
+  // cpu_kv_offload is off.
+  int total_gpus_for_weight = num_node * num_device;
+  {
+    int dp_for_weight = total_gpus_for_weight /
+        (model_config.ne_tp_dg * model_config.pp_dg);
+    ParallelConfig weight_probe = ParallelismOptimizer::EvaluateConfig(
+        model_config, system_config, total_gpus_for_weight,
+        model_config.ne_tp_dg, model_config.pp_dg, dp_for_weight,
+        model_config.e_tp_dg, max_batch_size, input_len + output_len);
+    system_config.weight_bytes_per_device = weight_probe.pred_weight_bytes;
+  }
+
   // long max_batch_size = 128;
   if (max_process_token == 0) {
     // max_process_token = 8192 * 16;
@@ -844,8 +975,96 @@ int main(int argc, char *argv[]) {
     std::cout << "PEC_FLASH_CAPACITY_BYTES: " << flash_capacity << std::endl;
   }
 
+  // Emit paper2 static (startup-computable) markers for the paper2 Python
+  // harness. Additive stdout only -- these do not alter any computed
+  // simulation behavior and are independent of the PEC_* markers above.
+  {
+    // 1) Full-context per-token KV bytes across ALL layers, with NO iRoPE
+    // window cap. This deliberately DIFFERS from PEC_KV_BYTES_PER_SEQ's
+    // per-layer window-capped geometry (see that block's isGlobalAttentionLayer
+    // logic just above): paper2 (§II) sizes batches off the naive full-context
+    // KV footprint, not the live write-timing model's windowed geometry.
+    //   standard KV per layer-token: 2 * num_kv_heads * head_dim * precision_byte
+    //   compressed KV (MLA):         (kv_lora_rank + qk_rope_head_dim) * precision_byte
+    double kv_bytes_per_layer_token_full = model_config.compressed_kv
+        ? (double)(model_config.kv_lora_rank + model_config.qk_rope_head_dim)
+            * model_config.precision_byte
+        : 2.0 * model_config.num_kv_heads
+            * model_config.head_dim * model_config.precision_byte;
+    double kv_bytes_per_token_full =
+        kv_bytes_per_layer_token_full * model_config.num_layers;
+    std::cout << "P2_KV_BYTES_PER_TOKEN_FULL: " << kv_bytes_per_token_full
+              << std::endl;
+
+    // 2) Physical flash pool bytes PER DEVICE. Same arithmetic as the flash
+    // branch of PEC_FLASH_CAPACITY_BYTES above, but ALWAYS the per-device flash
+    // allotment -- 0 (not system_config.memory_capacity) for non-flash configs
+    // -- since paper2 needs the flash pool specifically, never a generic
+    // fallback capacity.
+    double physical_flash_bytes_per_dev =
+        (system_config.use_hbf && system_config.hbf_config.num_flash_stacks > 0)
+        ? (double)system_config.hbf_config.total_capacity_bytes -
+          (double)system_config.hbf_config.num_hbm_stacks *
+          (double)system_config.hbf_config.hbm_per_stack_bytes
+        : 0.0;
+    std::cout << "P2_PHYSICAL_FLASH_BYTES_PER_DEV: "
+              << physical_flash_bytes_per_dev << std::endl;
+
+    // 3) Total weight bytes across the decode NODE under the CONFIGURED
+    // mapping (ne_tp_dg/e_tp_dg/pp_dg/dp as finally resolved above -- optimizer
+    // override or yaml). Reuses ParallelismOptimizer::EvaluateConfig's
+    // pred_weight_bytes (parallelism_optimizer.cpp:77-236,669) -- the codebase's
+    // existing source of truth for per-GPU weight footprint, which already
+    // encodes exactly the duplication-vs-distribution split this marker needs:
+    // attention/embedding/LM-head/router/layernorm weights are duplicated per
+    // device (full-size whenever ne_tp_dg < num_heads/vocab-shard granularity),
+    // while routed-expert weight is distributed across devices_per_stage
+    // (= total_gpus/pp_dg). weight_per_gpu does not depend on batch_size or
+    // sequence_length (see the cited range), so the placeholder batch/seqlen
+    // arguments below do not affect the result.
+    //   node_weight_bytes = total_gpus * weight_per_gpu
+    // is EXACT for pp_dg==1 (paper2's only configuration): every device sits in
+    // the same single stage, so per-device weight is uniform across the node.
+    // For pp_dg>1 this remains the same representative-heaviest-stage
+    // approximation the optimizer itself uses for its capacity gate elsewhere
+    // (EvaluateConfig's own moe_layers_in_stage comment, cpp:180-194).
+    //
+    // The probe itself was moved BEFORE Scheduler::Create (see
+    // system_config.weight_bytes_per_device's assignment above) so the
+    // paper2 CPU-offload tier's Scheduler::setMetadata() can consume it too;
+    // this marker just reuses the stashed per-device value instead of
+    // re-running the same probe a second time.
+    double weight_bytes_node =
+        system_config.weight_bytes_per_device * total_gpus_for_weight;
+    std::cout << "P2_WEIGHT_BYTES_NODE: " << weight_bytes_node << std::endl;
+  }
+
   scheduler->getActualArrivalTime(total_iter);
   stat_list = cluster->runIteration(total_iter, file_name);
+
+  // paper2 node-total live KV-bytes-written accountant, counted over the
+  // TIMED iterations only (Cluster::runIteration enables/disables the
+  // scheduler-level counters around exactly that window -- see
+  // scheduler.h's p2_byte_counting_enabled doc comment). Node-total and
+  // LOGICAL-byte by construction (see same doc comment); unconditional,
+  // additive-only emission -- these do not alter any prior stdout line.
+  {
+    double p2_admission_bytes = scheduler->getP2AdmissionKvBytes();
+    double p2_decode_bytes = scheduler->getP2DecodeKvBytes();
+    std::cout << "P2_KV_BYTES_WRITTEN_TOTAL: "
+              << (p2_admission_bytes + p2_decode_bytes) << std::endl;
+    std::cout << "P2_KV_ADMISSION_BYTES: " << p2_admission_bytes << std::endl;
+    std::cout << "P2_KV_DECODE_BYTES: " << p2_decode_bytes << std::endl;
+    std::cout << "P2_TIMED_ITERS: " << total_iter << std::endl;
+    // paper2 CPU-memory/NVLink-C2C KV offload tier: average offloaded-KV byte
+    // fraction over the timed window (Scheduler::p2_offload_fraction_sum /
+    // _samples -- see scheduler.h's doc comment). Emitted UNCONDITIONALLY
+    // (0.0 whenever cpu_kv_offload is off or nothing overflowed the local
+    // HBM-KV budget) so every regression diff against a pre-offload baseline
+    // differs by exactly this one added line, never a presence/absence flip.
+    std::cout << "P2_KV_OFFLOAD_FRACTION: "
+              << scheduler->getP2AvgOffloadFraction() << std::endl;
+  }
 
   // Part E: latency drift harness — compare optimizer prediction vs measured.
   // measured_latency_ms = total simulation time / num_iterations / 1e6.

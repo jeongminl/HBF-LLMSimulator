@@ -7,6 +7,7 @@
 // header — that would create an include cycle.
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <string>
 
 #include "hardware/hardware_config.h"
@@ -36,6 +37,17 @@ struct CapacityResult {
 // For plain HBM             → full memory_capacity (acts not separately bounded).
 inline double scarceTierActivationLimit(const SystemConfig& s) {
   if (s.use_hbf && s.hbf_config.num_flash_stacks > 0) {
+    // paper2 (Kyung et al., IEEE CAL 2026) §IV: on-chip SRAM is an
+    // assumed-sufficient resource whose REQUIRED size is an output of the
+    // analysis, not an input capacity constraint (see hbf_memory_config.h's
+    // unbounded_sram_gate). Signal "no limit" with +infinity so every caller's
+    // `act > limit` comparison (checkCapacity below, cluster.cpp's Part C)
+    // simply never binds, with zero change to either caller's comparison
+    // logic. Paper1 presets never set this field, so this branch is dead for
+    // every existing config -- paper1 takes the exact same path as before.
+    if (s.hbf_config.unbounded_sram_gate) {
+      return std::numeric_limits<double>::infinity();
+    }
     if (s.hbf_config.num_hbm_stacks > 0) {
       return static_cast<double>(s.hbf_config.num_hbm_stacks) *
              static_cast<double>(s.hbf_config.hbm_per_stack_bytes);
@@ -92,11 +104,25 @@ inline CapacityResult checkCapacity(const SystemConfig& s,
   } else {
     // Plain HBM: lumped check against memory_capacity
     double total = act + weight + kv;
-    if (total > s.memory_capacity) {
+    // paper2 §IV CPU-memory/NVLink-C2C KV offload tier: excess KV beyond
+    // memory_capacity is modeled as living in CPU memory (cpu_memory_capacity),
+    // read over NVLink-C2C -- see hbmKvOffloadReadDuration (layer_impl.h).
+    // Extending the KV-side limit by cpu_memory_capacity here is safe because
+    // weights-fit-in-HBM-alone is guaranteed separately, by construction: the
+    // caller never lets weight alone exceed memory_capacity (both paper2
+    // models' weight_bytes_per_device -- 125GB/198GB -- are well under the
+    // 256GB HBM4 preset). cpuKvOffloadActive()'s HBF exclusion is redundant
+    // here (this branch is only reached when !hasScarceTier(s)) but keeping
+    // the same guard function everywhere avoids drift.
+    double limit = s.memory_capacity;
+    if (cpuKvOffloadActive(s)) {
+      limit += s.cpu_memory_capacity;
+    }
+    if (total > limit) {
       return {true,
               "HBM capacity exceeded (" +
               std::to_string(total / 1073741824.0) + " GiB > " +
-              std::to_string(s.memory_capacity / 1073741824.0) + " GiB)"};
+              std::to_string(limit / 1073741824.0) + " GiB)"};
     }
     return {false, ""};
   }

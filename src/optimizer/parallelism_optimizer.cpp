@@ -457,6 +457,15 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
       // dependency), so per-op charging (the former attn_ops/moe_ffn_ops count
       // here) no longer matches the live model.
       double page_lat_total = page_lat_per_ns;
+      // paper2 §IV assumes double-buffering fully hides HBF read latency (except
+      // the first activated MoE expert, charged separately elsewhere -- not yet
+      // wired into this analytic model). Mirrors layer_impl.h's
+      // getLinearMemoryDuration weight_exposed_latency_ns zeroing exactly, so
+      // this ranking model stays in lock-step with the simulator under
+      // paper2_mode.
+      if (system_config.paper2_mode) {
+        page_lat_total = 0.0;
+      }
 
       // Weight read time: active-expert weight bandwidth + per-op page latency.
       double weight_read_time = (weight_for_latency / weight_bw * 1e9) + page_lat_total;
@@ -518,6 +527,14 @@ ParallelConfig ParallelismOptimizer::EvaluateConfig(const ModelConfig& model_con
         double chunk_transfer_ns = chunk_bytes / hbf.flash_read_bandwidth * 1e9;
         double exposed_latency_ns = (double)hbf.flash_page_read_latency_ns +
             (num_chunks - 1) * std::max(0.0, (double)hbf.flash_page_read_latency_ns - chunk_transfer_ns);
+        // paper2 §IV assumes double-buffering fully hides HBF read latency
+        // (except the first activated MoE expert, not yet wired into this
+        // analytic model). Mirrors layer_impl.h's getAttentionMemoryDuration
+        // exposed_latency_ns zeroing exactly (fill AND residual), keeping this
+        // ranking model in lock-step with the simulator under paper2_mode.
+        if (system_config.paper2_mode) {
+          exposed_latency_ns = 0.0;
+        }
         kv_read_time = (kv_read_size / hbf.flash_read_bandwidth * 1e9) + exposed_latency_ns;
       } else {
         kv_read_time = kv_read_size / system_config.memory_bandwidth * 1e9;

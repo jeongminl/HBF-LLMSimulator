@@ -211,11 +211,12 @@ void GateUpdate::aggregate_expert(BatchedSequence::Ptr sequences_metadata) {
 
 Route::Route(std::string& prefix, std::string& name, int num_expert_per_device,
              int expert_offset, std::vector<int> device_list,
-             Device::Ptr device)
+             Device::Ptr device, std::vector<Module::Ptr> local_expert_ffns)
     : Module(prefix, name, device, device_list, true),
       expert_offset(expert_offset),
-      num_expert_per_device(num_expert_per_device) {
-  
+      num_expert_per_device(num_expert_per_device),
+      local_expert_ffns(local_expert_ffns) {
+
  int num_expert = device->model_config.num_routed_expert;
   // NOTE: this module records no weight tensor. The router/gating projection
   // ({hidden_dim, num_expert}) is recorded by ExpertFFN (expert.cpp's gate_fn
@@ -241,6 +242,36 @@ TensorVec Route::forward(const TensorVec input,
        expert_idx < expert_offset + num_expert_per_device; expert_idx++) {
     expert_token_list.push_back(
         sequences_metadata->num_token_in_expert[expert_idx]);
+  }
+
+  // paper2 §IV: "double buffering hides HBF read latency for all layers
+  // except the MoE sub-block, where it is exposed only when loading the
+  // first activated expert." Route::forward() is the right (and only
+  // correct) place to decide this: unlike ExpertFFN::forward() (which builds
+  // the module graph once and never runs again -- see expert.cpp's ctor
+  // comment on local_expert_ffns), Route is a graph_execution LEAF that is
+  // genuinely re-invoked by TopModuleGraph::run() every decode step, with
+  // THIS step's live sequences_metadata -- exactly the per-step routing
+  // decision "first activated expert" requires (with Zipf/skewed routing the
+  // set of nonzero experts varies every step, so a static index would be
+  // wrong). expert_token_list[i] is this step's real token count for the
+  // local expert at global index expert_offset+i; a zero-token expert never
+  // actually reads flash at all (linearCore's zero-size early return in
+  // hardware/linear_impl.cpp), so scanning for the first NONZERO local
+  // expert and arming exactly that one is exact, not an approximation: it is
+  // guaranteed to actually perform a flash weight read this step, and at
+  // most one arm happens per MoE layer per device per step (zero if every
+  // local expert saw zero tokens this step -- e.g. an idle/empty batch).
+  // Gated on the config flag (default false) and on local_expert_ffns being
+  // populated (only expert.cpp's ExpertFFN passes it) so this is a complete
+  // no-op for every other Route use and every paper1 config.
+  if (device->config.expose_first_expert_latency && !local_expert_ffns.empty()) {
+    for (int local_idx = 0; local_idx < (int)expert_token_list.size(); local_idx++) {
+      if (expert_token_list[local_idx] > 0) {
+        local_expert_ffns.at(local_idx)->armExposeFirstExpertPageLatency();
+        break;
+      }
+    }
   }
 
   for (int expert_idx = 0; expert_idx < num_expert; expert_idx++) {

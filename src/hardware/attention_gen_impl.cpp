@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <memory>
 
+#include "common/assert.h"
 #include "common/type.h"
 #include "dram/dram_interface.h"
 #include "dram/dram_request.h"
@@ -91,6 +92,17 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
       if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
         total_kv_read_size += k * n * input->precision_byte;
         total_act_size += (m * k * num_heads / num_kv_heads + (use_flash_attention ? 0.0 : (double)m * n * num_heads / num_kv_heads)) * input->precision_byte;
+      } else if (cpuKvOffloadActive(config)) {
+        // paper2 CPU-offload tier: accumulate the same aggregate read/act
+        // totals the HBF flash branch above accumulates, so the single
+        // post-loop hbmKvOffloadReadDuration() call below composes with
+        // accumul_compute_duration exactly the way the flash branch's
+        // getAttentionMemoryDuration() call does. Also mirrors the flash
+        // branch's use_flash_attention gating (FA_FLAG_SPEC.md): when FA is
+        // ON, the score never materializes, so it must not be charged here
+        // either regardless of which memory tier backs the KV read.
+        total_kv_read_size += k * n * input->precision_byte;
+        total_act_size += (m * k * num_heads / num_kv_heads + (use_flash_attention ? 0.0 : (double)m * n * num_heads / num_kv_heads)) * input->precision_byte;
       } else {
         memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
         accumul_memory_duration += memory_duration;
@@ -104,6 +116,8 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
     // prefetched under K's transfer window (same cross-op hiding convention as
     // weight_stream_ops_per_iter) -- K and V together expose ~one fill/layer.
     accumul_memory_duration = getAttentionMemoryDuration(config, total_kv_read_size, total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size, 2);
+  } else if (cpuKvOffloadActive(config)) {
+    accumul_memory_duration = hbmKvOffloadReadDuration(config, total_kv_read_size, total_act_size, sequences_metadata->p2_kv_offload_fraction);
   }
 
   if (use_ramulator) {
@@ -203,6 +217,11 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
       if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
         total_context_kv_read_size += k * n * input->precision_byte;
         total_context_act_size += ((use_flash_attention ? 0.0 : (double)m * k * num_heads / num_kv_heads) + m * n * num_heads / num_kv_heads) * input->precision_byte;
+      } else if (cpuKvOffloadActive(config)) {
+        // See the Scoring-loop cpuKvOffloadActive branch above: mirror the
+        // flash branch's use_flash_attention gating here too.
+        total_context_kv_read_size += k * n * input->precision_byte;
+        total_context_act_size += ((use_flash_attention ? 0.0 : (double)m * k * num_heads / num_kv_heads) + m * n * num_heads / num_kv_heads) * input->precision_byte;
       } else {
         memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
         accumul_memory_duration += memory_duration;
@@ -214,6 +233,8 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
     // Other half of the K->V fill amortization above: V's fill hides under K's
     // transfer, so this call also charges only its 1/2 share of the page fill.
     accumul_memory_duration = getAttentionMemoryDuration(config, total_context_kv_read_size, total_context_act_size, layer_info.use_chunked_attention, layer_info.chunk_size, 2);
+  } else if (cpuKvOffloadActive(config)) {
+    accumul_memory_duration = hbmKvOffloadReadDuration(config, total_context_kv_read_size, total_context_act_size, sequences_metadata->p2_kv_offload_fraction);
   }
 
   if (use_ramulator) {
@@ -632,6 +653,17 @@ ExecStatus MultiLatentAttentionGenExecutionGPU(Device_Ptr device,
   ExecStatus exec_status;
   if (sequences_metadata->get_gen_process_token() == 0) {
     return exec_status;
+  }
+
+  // paper2 CPU-memory/NVLink-C2C KV offload tier: neither of paper2's Fig5
+  // device_HBM cases (llama4_maverick / GQA -> AttentionGenExecutionGPU;
+  // deepseekR1 / absorb-MLA -> AbsorbMLAGenExecutionGPU) reaches this
+  // non-absorb MLA gen path (deepseekR1's preset sets use_absorb=true), so it
+  // was deliberately left un-patched. Fail loudly rather than silently
+  // computing wrong timing if this path is ever reached with the offload
+  // tier turned on (e.g. a future non-absorb-MLA + cpu_kv_offload config).
+  if (cpuKvOffloadActive(config)) {
+    fail("cpu_kv_offload: unmodeled attention path MultiLatentAttentionGenExecutionGPU (non-absorb MLA gen)");
   }
 
   std::vector<int> orig_shape = input->shape;
@@ -1795,12 +1827,20 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
       if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
         total_kv_read_size += n * (kv_lora_rank + qk_rope_head_dim) * input->precision_byte;
         total_act_size += num_heads * (kv_lora_rank + qk_rope_head_dim + kv_lora_rank) * input->precision_byte;
+      } else if (cpuKvOffloadActive(config)) {
+        // paper2 CPU-offload tier: deepseekR1's Fig5 device_HBM case (absorb
+        // MLA, use_flash_mla=true) fires this branch. Mirror the HBF flash
+        // branch's aggregate-then-single-post-loop-call structure above.
+        total_kv_read_size += n * (kv_lora_rank + qk_rope_head_dim) * input->precision_byte;
+        total_act_size += num_heads * (kv_lora_rank + qk_rope_head_dim + kv_lora_rank) * input->precision_byte;
       } else {
         accumul_memory_duration += memory_size / memory_bandwidth * 1000 * 1000 * 1000;
       }
     }
     if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
       accumul_memory_duration = getAttentionMemoryDuration(config, total_kv_read_size, total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size);
+    } else if (cpuKvOffloadActive(config)) {
+      accumul_memory_duration = hbmKvOffloadReadDuration(config, total_kv_read_size, total_act_size, sequences_metadata->p2_kv_offload_fraction);
     }
     exec_status.memory_duration += accumul_memory_duration;
 
@@ -1845,6 +1885,16 @@ ExecStatus AbsorbMLAGenExecutionGPU(Device_Ptr device,
     exec_status.batch_dependent_duration += std::max(accumul_compute_duration, accumul_memory_duration);
   }
   else{
+    // paper2 CPU-memory/NVLink-C2C KV offload tier: deepseekR1's Fig5
+    // device_HBM case sets use_flash_mla=true, so this non-flash-mla
+    // (separate Scoring/Softmax/Context phases) branch was deliberately left
+    // un-patched -- its Scoring-NoPE/Scoring-RoPE/Softmax sub-phases below
+    // don't even have an HBF flash-storage variant to mirror. Fail loudly
+    // rather than silently mis-time this path if it's ever reached with the
+    // offload tier on.
+    if (cpuKvOffloadActive(config)) {
+      fail("cpu_kv_offload: unmodeled attention path AbsorbMLAGenExecutionGPU (use_flash_mla=false)");
+    }
     // Scoring for NoPE//
     for (int seq_idx = 0; seq_idx < num_seq; seq_idx++) {
       seq = seq_list.at(seq_idx);

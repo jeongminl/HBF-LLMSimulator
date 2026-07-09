@@ -147,6 +147,33 @@ inline double effectiveKvLenSumAllLayers(const ModelConfig& mc, double context_l
   return total;
 }
 
+// Per-layer, per-token KV-cache byte width. Model-wide, not per-layer --
+// compressed_kv/kv_lora_rank/qk_rope_head_dim/num_kv_heads/head_dim/
+// precision_byte are all model-level fields, not layer-indexed. Shared unit
+// behind PEC_KV_BYTES_PER_SEQ's admission+decode sum (eval/test.cpp) and the
+// paper2 live node-total KV-bytes-written accountant (Scheduler::
+// p2_admission_kv_bytes / p2_decode_kv_bytes, scheduler.cpp).
+//   standard KV per layer-token: 2 * num_kv_heads * head_dim * precision_byte
+//   compressed KV (MLA):         (kv_lora_rank + qk_rope_head_dim) * precision_byte
+inline double kvBytesPerLayerToken(const ModelConfig& mc) {
+  return mc.compressed_kv
+      ? (double)(mc.kv_lora_rank + mc.qk_rope_head_dim) * mc.precision_byte
+      : 2.0 * mc.num_kv_heads * mc.head_dim * mc.precision_byte;
+}
+
+// Admission-side KV bytes landing in decode-node flash the instant a sequence
+// with `input_len` prefill tokens is admitted into a running batch: the
+// per-layer iRoPE-window-capped length (effectiveKvLenSumAllLayers above)
+// times the per-layer-token byte width. This is exactly the admission HALF of
+// PEC_KV_BYTES_PER_SEQ's per-sequence sum (eval/test.cpp) -- that block's
+// other half is num_layers * output_len tokens, UNCAPPED, matching the decode
+// hook in scheduler.cpp: decode appends are never window-capped (a local
+// layer's window evicts old KV entries on eviction, it does not skip writing
+// new ones), only admission is.
+inline double perSeqAdmissionKvBytes(const ModelConfig& mc, double input_len) {
+  return kvBytesPerLayerToken(mc) * effectiveKvLenSumAllLayers(mc, input_len);
+}
+
 // Returns true if the given (0-indexed) layer is a MoE (routed-expert) layer.
 // Honors both first_k_dense (the first N layers are always dense regardless of
 // expert_freq) and expert_freq (every expert_freq-th layer is MoE). Works for
@@ -233,8 +260,30 @@ static ModelConfig glam = ModelConfig(4096, 128, 32, 32, 32, 8192, 16384, 16384,
                                       1, 2, 64, 0, 2, 2, 2, 0, 0, 0, 0, 0, 256000, false, false, 0.0, "glam");
 
 static ModelConfig deepseekV3 =
-    ModelConfig(7168, 128, 60, 128, 128, 131072, 18432, 2048, 1, 1, 256, 1, 1, 8,
-                3, 3, 1536, 512, 128, 64, 129280, true, true, 0.0,"deepseekV3"); // n_layer = 60 (not consider MTP module)
+    ModelConfig(7168, 128, 61, 128, 128, 131072, 18432, 2048, 1, 1, 256, 1, 1, 8,
+                3, 3, 1536, 512, 128, 64, 129280, true, true, 0.0,"deepseekV3"); // n_layer = 61 per the V3 tech report: 61 transformer layers, EXCLUDING the separate MTP module (the old "60 (not consider MTP module)" comment misread this same count as 60 base + MTP separately, undercounting by one)
+
+// paper2 (Kyung et al., IEEE CAL 2026) §IV evaluates DeepSeek-R1 671B, verbatim
+// "employing BF16 precision for both model weights and KV caches" -- hence
+// precision_byte=2 here (deepseekV3 above uses precision_byte=1/FP8). Otherwise
+// an exact copy of deepseekV3's architecture (R1 and V3 share the same
+// transformer architecture; R1 is a reasoning-tuned checkpoint of it), except
+// num_layers=61: the DeepSeek-V3/R1 technical report specifies 61 transformer
+// layers EXCLUDING the separate Multi-Token-Prediction (MTP) module -- matches
+// deepseekV3's own num_layers above (also 61; see that preset's comment and
+// this file's git history for the 60->61 correction, landed as a separate,
+// deliberately-isolated change so as not to conflate it with this preset's
+// addition). KV bytes/token with this preset:
+// (kv_lora_rank + qk_rope_head_dim) * precision_byte * num_layers =
+// (512 + 64) * 2 * 61 = 68.6 KB/token, matching paper2 §II's own figure.
+// CAVEAT (comment only -- no code change needed): communication.cpp's
+// deepseekV3 FP8 all-to-all dispatch-size adjustment is STRING-MATCHED against
+// model_name=="deepseekV3"; a future FP8 variant of R1 would silently miss
+// that adjustment under model_name=="deepseekR1". Not applicable today since
+// this preset is BF16 (precision_byte=2), which never takes that FP8 branch.
+static ModelConfig deepseekR1 =
+    ModelConfig(7168, 128, 61, 128, 128, 131072, 18432, 2048, 1, 2, 256, 1, 1, 8,
+                3, 3, 1536, 512, 128, 64, 129280, true, true, 0.0, "deepseekR1");
 
 // precision_byte=2 (BF16): matches the paper's explicit "no 1-/2-GPU segments in all HBM4
 // bars" claim, which requires llama3_405B's real footprint to exceed 2x288GB=576GB -- only

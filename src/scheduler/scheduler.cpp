@@ -1,5 +1,7 @@
 #include "scheduler/scheduler.h"
 #include <numeric>
+#include <cmath>
+#include <random>
 
 namespace llm_system {
 Scheduler::Scheduler(SystemConfig system_config, ModelConfig& model_config,
@@ -7,6 +9,7 @@ Scheduler::Scheduler(SystemConfig system_config, ModelConfig& model_config,
                      int num_max_batched_token,  // per dp, total
                      int max_process_token)      // per dp, in sum
     : system_config(system_config),
+      workload_rng(system_config.workload_seed),
       model_config(model_config),
       expert_file_path(expert_file_path),
       total_batch_size(total_batch_size),
@@ -135,9 +138,177 @@ void Scheduler::pushDummySeq(int input_len, int output_len, int idx, int count) 
   sequence_queue.push_back(new_seq);
 }
 
+// paper2 stochastic workload sampler (paper2 Sec. V-A). Draws a total context
+// length C and an output/context ratio r independently, then derives
+// (input_len, output_len) from their product. Determinism: this is the only
+// place that advances workload_rng, and it is only ever called from pushSeq's
+// per-seq loop (i = 0..num_seq-1, in order) when system_config.paper2_workload
+// is set, so for a fixed workload_seed the sequence of draws -- and therefore
+// every sampled (input_len, output_len) -- is fully determined by the
+// scheduler's call order, independent of anything else in the simulator
+// (workload_rng is never touched by getRandomExpert/getNormaldistribution/
+// getPoissondistribution's static-local generators, and vice versa).
+void Scheduler::sampleWorkloadLengths(int& input_len, int& output_len, bool size_biased) {
+  double mu = system_config.workload_context_mean;
+  double sigma = system_config.workload_context_cv * mu;
+  double trunc_sigmas = system_config.workload_context_trunc_sigmas;
+  // Truncated support for C: paper2 Sec. V-A draws context length from a
+  // Normal(mu, sigma) truncated to mu +/- trunc_sigmas*sigma. sigma above uses
+  // workload_context_cv as the PRE-truncation coefficient of variation;
+  // conditioning on this truncated window shrinks the REALIZED CV to roughly
+  // 0.88x the nominal cv at trunc_sigmas=2 (a truncated normal's variance is
+  // always <= the untruncated variance). The same ~0.88x shrink factor
+  // applies to both the paper's low- and high-dispersion cv settings, so the
+  // *relative* low-vs-high dispersion contrast the paper studies is preserved
+  // even though neither realized CV is exactly the configured value.
+  double lo = mu - trunc_sigmas * sigma;
+  double hi = mu + trunc_sigmas * sigma;
+  // DETERMINISTIC (homogeneous) context when context_cv <= 0: every request in
+  // the batch is exactly the mean context mu. This is paper2 Fig.5's construction
+  // ("...we use the average sequence length within a batch..." -- Sec. VI-B),
+  // which, unlike Fig.4's stochastic heterogeneous-request lifetime sweep,
+  // specifies NO dispersion (no CV/kappa) and evaluates a single representative
+  // (mean) length. Skip the normal draw entirely (avoids a stddev==0
+  // distribution); construct context_dist with a placeholder stddev so it is
+  // never sampled in this mode.
+  bool deterministic_context = (sigma <= 0.0);
+  std::normal_distribution<double> context_dist(mu, deterministic_context ? 1.0 : sigma);
+
+  // r = Lout / (Lin + Lout) = Lout / C, modeled as Beta(alpha, beta) via the
+  // mean/concentration parametrization: alpha = mu_r*kappa, beta =
+  // (1-mu_r)*kappa, so that E[r] = mu_r and kappa = alpha+beta is paper2's
+  // "concentration parameter" (larger kappa -> r concentrates tighter around
+  // mu_r). mu_r = workload_lout_mean_ratio is the only Beta-compatible
+  // reading of the paper's Lin:Lout ratio: Beta's support is [0,1], and
+  // Lout/(Lin+Lout) is the natural quantity confined to [0,1] -- unlike
+  // Lout/Lin, which is unbounded above and not Beta-distributable.
+  double mu_r = system_config.workload_lout_mean_ratio;
+  double kappa = system_config.workload_lout_beta_kappa;
+  double alpha = mu_r * kappa;
+  double beta = (1.0 - mu_r) * kappa;
+  // Beta(alpha, beta) == g1/(g1+g2) for independent g1 ~ Gamma(alpha, 1),
+  // g2 ~ Gamma(beta, 1) -- standard Gamma-ratio construction of the Beta
+  // distribution.
+  // DETERMINISTIC Lout ratio when lout_beta_kappa <= 0: every request splits at
+  // exactly r = mu_r (the mean Lout ratio). Same paper2 Fig.5 "average sequence
+  // length" construction as deterministic_context above -- together they yield a
+  // fully homogeneous batch. Placeholder gamma params when unused (alpha/beta
+  // would be 0 at kappa==0, which is not a valid gamma shape).
+  bool deterministic_ratio = (kappa <= 0.0);
+  std::gamma_distribution<double> gamma_a(deterministic_ratio ? 1.0 : alpha, 1.0);
+  std::gamma_distribution<double> gamma_b(deterministic_ratio ? 1.0 : beta, 1.0);
+
+  // SIZE-BIASED mode (initial fill only, size_biased=true): under continuous
+  // batching at steady state, the population of sequences in flight at a
+  // random instant is length-biased -- the renewal/inspection paradox --
+  // because a longer-Lout sequence occupies "in flight" status for longer, so
+  // P(a given in-flight slot holds a sequence of a given Lout) is proportional
+  // to that Lout (paper2 measures ~+9% mean Lout for the in-flight population
+  // vs the raw arrival population at cv=0.3). Long-Lout sequences also
+  // contribute almost no completions during a bounded simulated run, so an
+  // unbiased initial population would never self-correct toward the true
+  // steady-state length mix within the run's horizon -- the bias has to be
+  // baked into the initial snapshot directly. Realize it by rejection
+  // sampling: draw (C, r) unbiased as below, accept with probability
+  // Lout/Lout_max, where Lout_max is the largest Lout the truncated support
+  // can produce (C capped at hi, r capped below 1, so Lout = C*r < hi always
+  // -- this bounds acceptance probability strictly below 1 without needing to
+  // clamp it). Steady-state refills (size_biased=false) draw UNBIASED and
+  // enter at current_len=input_len (age 0, see pushDummySeq's decode_mode
+  // else-branch) -- an unbiased age-0 arrival stream combined with the
+  // length-biased initial snapshot is exactly the stationary in-flight
+  // distribution (matches pushDummySeq's decode_mode comment on why initial
+  // fill and refills are seeded differently).
+  double lout_max = hi;
+  std::uniform_real_distribution<double> accept_dist(0.0, 1.0);
+
+  double C = mu;
+  double r = mu_r;
+  while (true) {
+    if (deterministic_context) {
+      C = mu;
+    } else {
+      do {
+        C = context_dist(workload_rng);
+      } while (C < lo || C > hi);
+    }
+
+    if (deterministic_ratio) {
+      r = mu_r;
+    } else {
+      double g1 = gamma_a(workload_rng);
+      double g2 = gamma_b(workload_rng);
+      double denom = g1 + g2;
+      r = (denom > 0.0) ? (g1 / denom) : mu_r;
+    }
+
+    if (!size_biased) break;
+    // A fully deterministic (homogeneous) population has no length bias to
+    // correct -- every candidate is identical -- so accept immediately rather
+    // than spinning the size-biased rejection loop.
+    if (deterministic_context && deterministic_ratio) break;
+    double lout_candidate = C * r;
+    double accept_prob = (lout_max > 0.0) ? (lout_candidate / lout_max) : 1.0;
+    if (accept_dist(workload_rng) <= accept_prob) break;
+  }
+
+  // Lower clamp 2: pushDummySeq's decode_mode stagger needs output_len-2 >= 0,
+  // and updateScheduler's completion check (current_len == total_len, checked
+  // AFTER advancing current_len) needs total_len = input_len+output_len >
+  // input_len, i.e. output_len >= 1 -- clamping to 2 keeps a full margin for
+  // the stagger. Upper clamp (round(C)-1): guarantees input_len >= 1.
+  long long C_round = std::llround(C);
+  output_len = (int)std::clamp<long long>(std::llround(C * r), 2, C_round - 1);
+  input_len = (int)(C_round - output_len);
+}
+
 void Scheduler::pushSeq(int num_seq) {
   if (!real_data) {
-    assertTrue(model_config.input_len < model_config.max_seq_len, "Invalid input_len (= " 
+    if (system_config.paper2_workload) {
+      // paper2 stochastic workload: each dummy sequence draws its own
+      // (input_len, output_len) via sampleWorkloadLengths instead of every
+      // sequence reusing the single uniform model_config.input_len/output_len
+      // pair below. This branch is only taken when paper2_workload is
+      // explicitly set true (default false), so the uniform paper1 path
+      // (assert + pushDummySeq loop in the else-branch) is untouched and
+      // remains bit-identical.
+      //
+      // size_biased = !initial_fill_done: initial_fill_done is false only
+      // during the very first fillSequenceQueue()/fillRunningQueue() call in
+      // Cluster::runIteration (cluster.cpp, before it flips true at line
+      // ~560), so every sequence pushSeq generates for that initial
+      // population is drawn size-biased; every subsequent steady-state
+      // refill (called from fillSequenceQueue inside hittingQueue/
+      // runIterationMixed's per-iteration loop) is drawn unbiased. See
+      // sampleWorkloadLengths's size-biased-mode comment for why.
+      bool size_biased = !initial_fill_done;
+      for (int i = 0; i < num_seq; i++) {
+        int sampled_input_len = 0;
+        int sampled_output_len = 0;
+        sampleWorkloadLengths(sampled_input_len, sampled_output_len, size_biased);
+
+        // Safety-net resample (mirrors the paper1 branch's max_seq_len guard
+        // above, generalized to per-sample C): the truncated support
+        // guarantees C <= workload_context_mean * (1 + trunc_sigmas * cv),
+        // which is far below max_seq_len for every paper2 cell (e.g. mean
+        // 8192, cv 0.3, trunc_sigmas 2 -> C <= 8192*1.6 = 13107 << 32768), so
+        // this loop is expected to never execute. Resample rather than
+        // clamp/truncate so a misconfigured preset can't silently produce a
+        // statistically-biased sequence at the boundary; the guard counter
+        // bounds worst-case cost if a preset ever violates the assumption.
+        int guard = 0;
+        while (sampled_input_len + sampled_output_len >= model_config.max_seq_len &&
+               guard < 1000) {
+          sampleWorkloadLengths(sampled_input_len, sampled_output_len, size_biased);
+          guard++;
+        }
+
+        pushDummySeq(sampled_input_len, sampled_output_len, i, num_seq);
+      }
+      return;
+    }
+
+    assertTrue(model_config.input_len < model_config.max_seq_len, "Invalid input_len (= "
                + std::to_string(model_config.input_len) + ")" );
     if(model_config.input_len + model_config.output_len > model_config.max_seq_len){
       model_config.output_len = model_config.max_seq_len - model_config.input_len;
@@ -331,6 +502,47 @@ BatchedSequence::Ptr Scheduler::getMaxMetadata(int num_expert, int top_k,
 }
 
 std::vector<BatchedSequence::Ptr> Scheduler::setMetadata() {
+  // paper2 admission-token counter: reset at the top of the step boundary --
+  // see the member's doc comment in scheduler.h. Unconditional (paper1 and
+  // paper2 alike); harmless since nothing reads the counter yet.
+  admitted_prefill_tokens_this_step = 0;
+
+  // paper2 CPU-memory/NVLink-C2C KV offload tier: reservation-based offloaded
+  // byte fraction, recomputed once per step per dp-shard (running batch).
+  // Each request reserves a contiguous KV region for its FULL context
+  // (total_len = input_len + output_len - 1, Sequence's ctor) at admission;
+  // batches fill the local HBM-KV budget first, and the remainder is modeled
+  // as living in CPU memory. Guarded by cpuKvOffloadActive() (hardware_config.h)
+  // so paper1 and every non-offload/HBF paper2 config leaves
+  // BatchedSequence::p2_kv_offload_fraction at its default-initialized 0.0 --
+  // a complete no-op.
+  if (cpuKvOffloadActive(system_config)) {
+    // ne_tp_degree_of_the_shard: paper2's mapping has model_config.ne_tp_dg==1,
+    // so this reduces to exactly "one device's HBM minus its resident
+    // weights". The multiplier generalizes to TP>1, where a dp-shard's KV
+    // cache is sharded across the whole ne_tp group backing it (dp_degree's
+    // own derivation above, ctor line 18-19, shows the same ne_tp_dg driving
+    // the dp/TP split) -- paper2 itself never exercises TP>1 (ne_tp=1).
+    double hbm_kv_budget =
+        (system_config.memory_capacity - system_config.weight_bytes_per_device) *
+        (double)model_config.ne_tp_dg;
+    for (auto& batch : running_queue) {
+      double reserved_total = 0.0;
+      for (auto& seq : batch->get_seq()) {
+        reserved_total +=
+            perSeqAdmissionKvBytes(model_config, (double)seq->total_len);
+      }
+      double f_off = (reserved_total > 0.0)
+          ? std::max(0.0, reserved_total - hbm_kv_budget) / reserved_total
+          : 0.0;
+      batch->p2_kv_offload_fraction = f_off;
+      if (p2_byte_counting_enabled) {
+        p2_offload_fraction_sum += f_off;
+        p2_offload_fraction_samples += 1;
+      }
+    }
+  }
+
   bool process_gen = true;
   bool process_sum = true;
 
@@ -392,6 +604,30 @@ std::vector<Sequence::Ptr> Scheduler::updateScheduler(time_ns time) {
 
   for (int batch_idx = 0; batch_idx < running_queue.size(); batch_idx++) {
     BatchedSequence::Ptr batch = running_queue.at(batch_idx);
+
+    // paper2 KV-bytes accountant -- decode hook. MUST run BEFORE
+    // batch->update(time) below: that call both advances current_len AND
+    // zeroes num_process_token (Sequence::update), so this is the only point
+    // where "did this sequence just generate a token this step" is still
+    // observable. get_gen() classifies by current_len >= input_len, i.e.
+    // "already past prefill" at this pre-update instant -- the very step a
+    // sequence's prefill *completes* (current_len reaches input_len via THIS
+    // update call) is still classified "sum" going into it, so it is
+    // correctly excluded here: that admission's prefill KV bytes were
+    // already counted once, at admission time, in fillRunningQueue(). The
+    // num_process_token>0 guard excludes gen-classified sequences that
+    // haven't actually started generating yet (gen_start_time > total_time
+    // in setMetadata(), whose num_process_token stays 0) -- they wrote no KV
+    // entry this step.
+    if (p2_byte_counting_enabled) {
+      for (auto& seq : batch->get_gen()) {
+        if (seq->num_process_token > 0) {
+          p2_decode_kv_bytes +=
+              model_config.num_layers * kvBytesPerLayerToken(model_config);
+        }
+      }
+    }
+
     batch->update(time);
 
     // remove seq of which generation is done
@@ -453,6 +689,20 @@ void Scheduler::fillRunningQueue(time_ns time) {
           seqPtr->queueing_delay = total_time - seqPtr->arrival_time;
         }
         batch->add(seqPtr);
+        // paper2 admission-token counter: seqPtr just transitioned from
+        // sequence_queue into a running batch, i.e. it was just admitted --
+        // this is the sole place that happens. Unconditional upkeep (see
+        // scheduler.h doc comment); a plain integer add cannot alter timing.
+        admitted_prefill_tokens_this_step += seqPtr->input_len;
+        // paper2 KV-bytes accountant -- admission hook. Same site as the
+        // admission-token counter just above (sole place a sequence
+        // transitions sequence_queue -> running_queue). Guarded by
+        // p2_byte_counting_enabled (see scheduler.h doc comment); a plain
+        // double add cannot perturb timing.
+        if (p2_byte_counting_enabled) {
+          p2_admission_kv_bytes +=
+              perSeqAdmissionKvBytes(model_config, (double)seqPtr->input_len);
+        }
         break;
       }
     }
