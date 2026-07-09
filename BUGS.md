@@ -8,14 +8,15 @@ to live in this file and in the now-deleted `BUGS_HIDDEN_BY_FLAGS.md`. Full inve
 verification detail for that session lives in `ledgers/BUGS_FIXES.md`. Listed roughly in order of
 how likely each is to actually bite someone.
 
-> **2026-07-08 — correctness-first campaign.** This campaign abandoned paper-number
+> **2026-07-08 — correctness-first campaign, landed.** This campaign abandoned paper-number
 > reproduction as a goal and prioritised technical correctness. A codebase-wide
-> internal-inconsistency audit (17 items, see `CODEBASE_INCONSISTENCIES.md`) plus a CB1↔worktree
-> source diff surfaced the new items **#28-#33** below and re-scoped several existing ones. Items
-> being actively fixed this campaign are marked **FIX SCOPED (2026-07-08)** — they are NOT yet
-> merged (the first implementation wave was accidentally built on a stale worktree base and is
-> being redone in-place). The `use_flash_attention` master-flag work (`FA_FLAG_SPEC.md`) resolves
-> the score/softmax-materialization family coherently and is NOT tracked as a bug here.
+> internal-inconsistency audit (17 items, see `ledgers/CODEBASE_INCONSISTENCIES.md`) plus a
+> CB1↔worktree source diff surfaced items **#28-#33** below and re-scoped several existing ones.
+> Items marked **FIX SCOPED (2026-07-08)** are now merged to `main` (I3/I8/I4, the CB1 fixes,
+> and the `use_flash_attention` master-flag refactor — see `ledgers/FA_FLAG_SPEC.md` — all landed
+> and validated; see `CHANGES.md` for the commit history and full-sweep verification results). The
+> FA-flag family (score/softmax-materialization coherence) is resolved by that refactor and is NOT
+> tracked as a bug here.
 
 ## 1. Disaggregated path (`disagg_system=on`) lost its prefill→decode KV transfer term
 
@@ -79,7 +80,7 @@ audit comment added directly above the function. Its capacity-math inconsistency
 unaddressed and should not be trusted if the function is ever wired back up; the decision of
 delete-vs-repair-vs-keep is left to the user now that its dead-code status is unambiguous.
 
-## 4. MLA prefill attention on flash never models KV-read timing — **FIX SCOPED (2026-07-08): audit item I15**
+## 4. MLA prefill attention on flash never models KV-read timing — **RESOLVED (2026-07-08, commit 295dbeb): audit item I15**
 
 `MultiLatentAttentionSumExecutionGPU/Logic/PIM` and `AbsorbMLASumExecutionGPU/Logic/PIM` (6
 functions, `attention_sum_impl.cpp`) never route flash KV-read timing through
@@ -88,6 +89,11 @@ model *and* prefill mode together — doubly dormant, since no sweep in this rep
 of the 6 functions has its own memory-size accounting (including a distinct FlashAttention
 SRAM-tiling algorithm branch, `use_flash_attention`, orthogonal to the HBF flash-memory tiering),
 and none of them are currently exercised by any config this repo runs end-to-end.
+
+**Fixed:** `MultiLatentAttentionSumExecutionGPU`'s Scoring/Context loops now accumulate
+`total_kv_read_size`/`total_act_size` and call `getAttentionMemoryDuration` once post-loop,
+mirroring GQA-Sum. Byte-identical on all paper-1 GQA cells (verified); structural-only for MLA
+(no paper-1 MLA model to numerically test against).
 
 **Not implemented**: given the size (6 large, intricate functions across GPU/Logic/PIM ×
 MLA/Absorb × flash-algorithm/non-flash) and the total absence of a way to verify correctness
@@ -339,7 +345,7 @@ the `"flash"` bucket — semantically it should be `"capacity"`. Affects only Fi
 hatching/labeling in generated plots; no numeric consequence for any reported figure. Low priority,
 cosmetic-label fix only.
 
-## 22. CHANGES#61 documents the gen-path `fill_amortize` fix but not the still-open sum/MLA residual — **FIX SCOPED (2026-07-08): audit item I3**
+## 22. CHANGES#61 documents the gen-path `fill_amortize` fix but not the still-open sum/MLA residual — **RESOLVED (2026-07-08, commit 2810d8f): audit item I3**
 
 `CHANGES.md` item 61 documents fixing the gen-path K/V double-fill (`fill_amortize`), but the same
 class of asymmetry remains on the sum (prefill) and MLA-gen paths, which still effectively run at
@@ -348,6 +354,10 @@ path never executes under `decode_mode: on` (this repo's config for every report
 is not exercised by either paper-1 model (llama3/llama4 are both GQA). Doc-gap only — worth a note so
 a future paper-2/prefill or MLA-model sweep doesn't rediscover this as a "new" bug.
 
+**Fixed:** added `fill_amortize_calls=2` to GQA-Sum's Scoring/Context and MLA-Gen's Score/Context
+calls, matching GQA-Gen's existing convention. Verified byte-identical on all published decode
+cells (4-cell sanity + full 60-cell sweep).
+
 ## 23. `attention_sum_impl.cpp` memory_util divisor drift (print-only)
 
 `attention_sum_impl.cpp:358`'s `memory_util` diagnostic computation uses a divisor that has drifted
@@ -355,7 +365,7 @@ from the value it's nominally supposed to track. This field is print/logging-onl
 into any timing, capacity, or energy calculation — so the drift has no effect on any reported number.
 Cosmetic; flagged so a future diagnostic-trust exercise doesn't need to re-derive this from scratch.
 
-## 24. Cross-node AllReduce is flat (no hierarchical NCCL model) — **FIX SCOPED (2026-07-08): audit item I8 (hierarchical AllReduce)**
+## 24. Cross-node AllReduce is flat (no hierarchical NCCL model) — **RESOLVED (2026-07-08, commit 32b53a0): audit item I8 (hierarchical AllReduce)**
 
 `communication.cpp`'s AllReduce charges the full ring volume `2(n−1)/n · size` over ONE link — the
 inter-node IB link (100 GB/s) whenever the group spans nodes — instead of a hierarchical
@@ -371,6 +381,12 @@ throughput-max batches ep16 loses by ~26%, far beyond any AR correction (the n=1
 doesn't shrink), so **no paper-figure winner is suppressed**. Fix (only if a num_kv_heads ≥ 16 model
 or small-batch cross-node ep study is ever swept): hierarchical AR in both `communication.cpp` and the
 optimizer's comm term, in lock-step.
+
+**Fixed:** `AllReduce::forward` now models a two-phase hierarchical cost (intra-node reduce-scatter
++ all-gather on `device_ict`/NVLink, inter-node exchange on `node_ict`/IB), reducing exactly to the
+prior formula when the group fits in one node. Verified byte-identical on all gpu≤8 (single-node)
+cells and the full 60-cell sweep at gpu=16 (no paper-1 group spans nodes, so zero published-cell
+movement) — the hierarchical model is now available for any future config where one does.
 
 ## 25. `logic_memory_bandwidth`/`pim_memory_bandwidth` go stale after the Table-I memory override — disagg/PIM-only
 
@@ -430,7 +446,7 @@ not attention) so it is NOT covered by that flag. Low numeric impact: on flash c
 hidden×vocab weight read dominates under `max()`, and on HBM4 it's a small additive term. Deferred
 this campaign. Fix: charge only the argmax-tile write in timing to match capacity.
 
-## 29. MoE GateUpdate aggregation leader gated on the wrong device (PP bug, CB1 diff) — **FIX QUEUED (2026-07-08)**
+## 29. MoE GateUpdate aggregation leader gated on the wrong device (PP bug, CB1 diff) — **RESOLVED (2026-07-08, commit d8fdf45)**
 
 `route.cpp:157` reads `if (device->device_total_rank == 0)`; CB1 uses `== device_list.front()`
 ("With PP, device 0 may not belong to this stage's MoE layer"). Under `pp_dg>1`, any MoE layer on a
@@ -441,15 +457,19 @@ never runs for that layer — it reuses whatever draw rank 0 last produced for a
 MoEScatter/MoEGather then size the all-to-all off stale counts. Timing impact is bounded
 (same-distribution draw) but it is incorrect and it disables the invariant check for non-zero
 stages. Only bites llama4 + pp>1. The MOE_TAG_FIX_SPEC §4.5 micro-vector block (`route.cpp:193-202`)
-is inside the same `==0` block and inherits the defect. One-line fix (`==0` → `==device_list.front()`);
-queued behind the current campaign wave.
+is inside the same `==0` block and inherited the defect (fixed alongside — same commit).
+**Fixed:** `route.cpp:157` now compares against `device_list.front()`.
 
-## 30. Sequence token accessors are `int`, should be `int64_t` (CB1 diff) — **FIX QUEUED (2026-07-08)**
+## 30. Sequence token accessors are `int`, should be `int64_t` (CB1 diff) — **RESOLVED (2026-07-08, commits d8fdf45 + e4b0264)**
 
 `src/scheduler/sequence.h`'s `get_gen_process_token()`/`get_sum_process_token()`/
 `get_total_sequence_length()` return `int`; CB1 uses `int64_t`. These feed comm-size and footprint
 byte/FLOP math. Safe at paper-1 scale (batch × seq_len ≈ 5×10⁷ ≪ 2³¹) but a large-batch/long-context
-sweep can overflow 2³¹ and silently corrupt sizing. Cheap widen, no effect on current figures; queued.
+sweep can overflow 2³¹ and silently corrupt sizing.
+
+**Fixed:** widened to `int64_t` in `sequence.h` (d8fdf45). Note: the matching `sequence.cpp`
+out-of-line definitions were initially left uncommitted in d8fdf45 (a header/definition type
+mismatch that would fail to compile from a clean clone) — caught and fixed in e4b0264.
 
 ## 31. KV-write reuse / seeded-steady-state model absent vs CB1 (dormant divergence)
 
@@ -464,10 +484,11 @@ accounting — a conscious divergence, flagged so it is not rediscovered as a "b
 The `use_flash_attention` master flag gates score/softmax materialization on the GPU attention
 paths, but the PIM/LOGIC GQA roofline variants (`attention_gen_impl.cpp` G2/G3,
 `attention_sum_impl.cpp` S2/S3) never modeled the score in either branch and were deliberately left
-as-is (ruling, 2026-07-08 — see `FA_FLAG_SPEC.md`). Consequence: the flag's `OFF` (materialized)
-semantics are **not modeled on PIM/LOGIC** — those paths behave as always-`ON` there, and must stay
-byte-identical across `ON`/`OFF` (a regression tripwire). Only matters for hetero/disaggregated runs,
-never the paper-1 GPU sweeps.
+as-is (ruling, 2026-07-08 — see `ledgers/FA_FLAG_SPEC.md`). Consequence: the flag's `OFF`
+(materialized) semantics are **not modeled on PIM/LOGIC** — those paths behave as always-`ON`
+there. **Verified as the regression tripwire during implementation**: grep-confirmed zero
+`use_flash_attention` references in these functions, and both are byte-identical across `ON`/`OFF`.
+Only matters for hetero/disaggregated runs, never the paper-1 GPU sweeps.
 
 ## 33. Missing `#include <cstdint>` in ramulator2 `utils.h` (GCC-13 build break)
 
@@ -479,6 +500,7 @@ the include.
 ---
 
 Resolved fixes and the (now historical) paper-vs-simulator comparison items live in `CHANGES.md`.
-This campaign's internal-inconsistency audit is in `CODEBASE_INCONSISTENCIES.md`; the
-`use_flash_attention` flag design is in `FA_FLAG_SPEC.md`. `PAPER_INCONSISTENCIES.md` is superseded
-(2026-07-08, paper-conformance abandoned) — its dispositions were absorbed into `CHANGES.md`.
+This campaign's internal-inconsistency audit is in `ledgers/CODEBASE_INCONSISTENCIES.md`; the
+`use_flash_attention` flag design is in `ledgers/FA_FLAG_SPEC.md`. `PAPER_INCONSISTENCIES.md` is
+superseded (2026-07-08, paper-conformance abandoned) — its dispositions were absorbed into
+`CHANGES.md`.
