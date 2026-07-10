@@ -157,15 +157,22 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
     compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
 
     // OFF (materialized): the softmax reads the resident score and writes P back
-    // to memory -- charge 2*m*n*heads/kv, unifying GQA to MLA's existing 2*m*n
-    // softmax-memory term (see MultiLatentAttentionGenExecutionGPU). ON: on-chip,
-    // zero memory (today's behavior). The score/P round-trip is activation traffic
-    // on the SCARCE tier, NOT flash: mirror getAttentionMemoryDuration's act-tier
+    // to memory -- charge 2*m*n*heads, matching MLA's convention (see
+    // MultiLatentAttentionGenExecutionGPU:867) and this same kernel's own FLOPs
+    // line 3 above (7*m*n*num_heads, not .../num_kv_heads). I18: the score/P sheet
+    // is per query head regardless of GQA K/V sharing -- one read + one write per
+    // element is 2*m*n*num_heads bytes, not 2*m*n*num_heads/num_kv_heads (this loop
+    // is a single pass over seq_idx, not a per-kv-head loop like Context below, so
+    // there is nothing to sum the missing num_kv_heads factor back in). Was
+    // undercounting softmax materialization memory by num_kv_heads-fold (8x for
+    // 64/8 GQA) whenever use_flash_attention is off. ON: on-chip, zero memory
+    // (today's behavior). The score/P round-trip is activation traffic on the
+    // SCARCE tier, NOT flash: mirror getAttentionMemoryDuration's act-tier
     // bandwidth (on HBF-family the local `memory_bandwidth` is repurposed to
     // flash_read_bandwidth, device.cpp:32-33) -- hbm_read_bandwidth (num_hbm_stacks>0)
     // else logic_sram_bandwidth; plain-HBM keeps memory_bandwidth.
     if (!use_flash_attention) {
-      double softmax_mem = 2.0 * (double)m * n * num_heads / num_kv_heads * input->precision_byte;
+      double softmax_mem = 2.0 * (double)m * n * num_heads * input->precision_byte;
       hw_metric softmax_bw = (config.use_hbf && config.hbf_config.num_flash_stacks > 0)
           ? ((config.hbf_config.num_hbm_stacks > 0) ? config.hbf_config.hbm_read_bandwidth
                                                     : config.hbf_config.logic_sram_bandwidth)
