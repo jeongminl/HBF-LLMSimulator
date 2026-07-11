@@ -78,11 +78,12 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
     if (layer_info.local_attention_window > 0) n = std::min(n, layer_info.local_attention_window);
 
     for (int kv_idx = 0; kv_idx < num_kv_heads; kv_idx++) {
-      flops = m * k * n * 2.0 * attention_group_size;
+      flops = 1.0 * m * k * n * 2.0 * attention_group_size;
       total_flops += flops;
 
       // ON: score (m*n*heads/kv) never materializes -> drop from Scoring traffic.
-      memory_size = 1.0 * (m * k * num_heads / num_kv_heads + k * n + (use_flash_attention ? 0.0 : (double)m * n * num_heads / num_kv_heads)) * input->precision_byte;
+      // I19: latent at decode's m=1, fixed for consistency with the prefill sites.
+      memory_size = 1.0 * ((double)m * k * num_heads / num_kv_heads + (double)k * n + (use_flash_attention ? 0.0 : (double)m * n * num_heads / num_kv_heads)) * input->precision_byte;
       total_memory_size += memory_size;
 
       compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
@@ -91,7 +92,7 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
 
       if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
         total_kv_read_size += k * n * input->precision_byte;
-        total_act_size += (m * k * num_heads / num_kv_heads + (use_flash_attention ? 0.0 : (double)m * n * num_heads / num_kv_heads)) * input->precision_byte;
+        total_act_size += ((double)m * k * num_heads / num_kv_heads + (use_flash_attention ? 0.0 : (double)m * n * num_heads / num_kv_heads)) * input->precision_byte;
       } else if (cpuKvOffloadActive(config)) {
         // paper2 CPU-offload tier: accumulate the same aggregate read/act
         // totals the HBF flash branch above accumulates, so the single
@@ -102,7 +103,7 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
         // ON, the score never materializes, so it must not be charged here
         // either regardless of which memory tier backs the KV read.
         total_kv_read_size += k * n * input->precision_byte;
-        total_act_size += (m * k * num_heads / num_kv_heads + (use_flash_attention ? 0.0 : (double)m * n * num_heads / num_kv_heads)) * input->precision_byte;
+        total_act_size += ((double)m * k * num_heads / num_kv_heads + (use_flash_attention ? 0.0 : (double)m * n * num_heads / num_kv_heads)) * input->precision_byte;
       } else {
         memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
         accumul_memory_duration += memory_duration;
@@ -209,12 +210,13 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
     n = head_dim;
 
     for (int kv_idx = 0; kv_idx < num_kv_heads; kv_idx++) {
-      flops = m * k * n * 2.0 * attention_group_size;
+      flops = 1.0 * m * k * n * 2.0 * attention_group_size;
       total_flops += flops;
 
       // ON: the softmax-weight P (read here as m*k*heads/kv) never materializes
       // -> drop from Context traffic. m*n*heads/kv is the context output write (kept).
-      memory_size = 1.0 * ((use_flash_attention ? 0.0 : (double)m * k * num_heads / num_kv_heads) + k * n + m * n * num_heads / num_kv_heads) * input->precision_byte;
+      // I19: latent at decode's m=1, fixed for consistency with the prefill sites.
+      memory_size = 1.0 * ((use_flash_attention ? 0.0 : (double)m * k * num_heads / num_kv_heads) + (double)k * n + (double)m * n * num_heads / num_kv_heads) * input->precision_byte;
       total_memory_size += memory_size;
 
       compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
@@ -223,12 +225,12 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
 
       if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
         total_context_kv_read_size += k * n * input->precision_byte;
-        total_context_act_size += ((use_flash_attention ? 0.0 : (double)m * k * num_heads / num_kv_heads) + m * n * num_heads / num_kv_heads) * input->precision_byte;
+        total_context_act_size += ((use_flash_attention ? 0.0 : (double)m * k * num_heads / num_kv_heads) + (double)m * n * num_heads / num_kv_heads) * input->precision_byte;
       } else if (cpuKvOffloadActive(config)) {
         // See the Scoring-loop cpuKvOffloadActive branch above: mirror the
         // flash branch's use_flash_attention gating here too.
         total_context_kv_read_size += k * n * input->precision_byte;
-        total_context_act_size += ((use_flash_attention ? 0.0 : (double)m * k * num_heads / num_kv_heads) + m * n * num_heads / num_kv_heads) * input->precision_byte;
+        total_context_act_size += ((use_flash_attention ? 0.0 : (double)m * k * num_heads / num_kv_heads) + (double)m * n * num_heads / num_kv_heads) * input->precision_byte;
       } else {
         memory_duration = memory_size / memory_bandwidth * 1000 * 1000 * 1000;
         accumul_memory_duration += memory_duration;

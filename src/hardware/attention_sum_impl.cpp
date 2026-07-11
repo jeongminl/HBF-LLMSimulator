@@ -90,8 +90,12 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
     total_flops += flops;
 
     // ON: score (m*n*heads) never materializes -> drop from Scoring traffic.
+    // I19: cast the leading operand of EVERY product, not just this one -- the
+    // outer 1.0 * only promotes the whole sum after each addend's int*int*int
+    // has already evaluated (and, at LONG-workload dims, come within ~20% of
+    // wrapping int32 for m*k*num_heads on llama3_405B).
     memory_size =
-        1.0 * (m * k * num_heads + k * n * num_kv_heads + (use_flash_attention ? 0.0 : (double)m * n * num_heads)) *
+        1.0 * ((double)m * k * num_heads + (double)k * n * num_kv_heads + (use_flash_attention ? 0.0 : (double)m * n * num_heads)) *
         input->precision_byte;
     total_memory_size += memory_size;
 
@@ -304,8 +308,9 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
 
     // ON: the softmax-weight P (read here as m*k*heads) never materializes -> drop
     // from Context traffic. m*n*heads is the context output write (kept).
+    // I19: cast every product's leading operand (see Scoring loop above).
     memory_size =
-        1.0 * ((use_flash_attention ? 0.0 : (double)m * k * num_heads) + k * n * num_kv_heads + m * n * num_heads) *
+        1.0 * ((use_flash_attention ? 0.0 : (double)m * k * num_heads) + (double)k * n * num_kv_heads + (double)m * n * num_heads) *
         input->precision_byte;
     total_memory_size += memory_size;
 
@@ -466,10 +471,11 @@ ExecStatus AttentionSumExecutionLogic(Device_Ptr device,
     k = head_dim;
     n = seq->current_len + seq->num_process_token;
 
-    flops = m * k * n * 2.0 * num_heads;
+    // I19: cast the leading operand of each product -- see AttentionSumExecutionGPU.
+    flops = 1.0 * m * k * n * 2.0 * num_heads;
     total_flops += flops;
 
-    memory_size = (m * k * num_heads + k * n * num_kv_heads) * input->precision_byte;
+    memory_size = ((double)m * k * num_heads + (double)k * n * num_kv_heads) * input->precision_byte;
     total_memory_size += memory_size;
 
     compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
@@ -647,10 +653,11 @@ ExecStatus AttentionSumExecutionPIM(Device_Ptr device,
     k = head_dim;
     n = seq->current_len + seq->num_process_token;
 
-    flops = m * k * n * 2.0 * num_heads;
+    // I19: cast the leading operand of each product -- see AttentionSumExecutionGPU.
+    flops = 1.0 * m * k * n * 2.0 * num_heads;
     total_flops += flops;
 
-    memory_size = (m * k * num_heads + k * n * num_kv_heads) * input->precision_byte;
+    memory_size = ((double)m * k * num_heads + (double)k * n * num_kv_heads) * input->precision_byte;
     total_memory_size += memory_size;
 
     compute_duration = flops / (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000;
