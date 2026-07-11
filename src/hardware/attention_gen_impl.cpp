@@ -116,7 +116,7 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
     // V's page address has no data dependency on K/softmax, so its fetch can be
     // prefetched under K's transfer window (same cross-op hiding convention as
     // weight_stream_ops_per_iter) -- K and V together expose ~one fill/layer.
-    accumul_memory_duration = getAttentionMemoryDuration(config, total_kv_read_size, total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size, 2);
+    accumul_memory_duration = getAttentionMemoryDuration(config, total_kv_read_size, total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size, 2, layer_info.kv_hbm_fraction);
   } else if (cpuKvOffloadActive(config)) {
     accumul_memory_duration = hbmKvOffloadReadDuration(config, total_kv_read_size, total_act_size, sequences_metadata->p2_kv_offload_fraction);
   }
@@ -241,7 +241,7 @@ ExecStatus AttentionGenExecutionGPU(Device_Ptr device,
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
     // Other half of the K->V fill amortization above: V's fill hides under K's
     // transfer, so this call also charges only its 1/2 share of the page fill.
-    accumul_memory_duration = getAttentionMemoryDuration(config, total_context_kv_read_size, total_context_act_size, layer_info.use_chunked_attention, layer_info.chunk_size, 2);
+    accumul_memory_duration = getAttentionMemoryDuration(config, total_context_kv_read_size, total_context_act_size, layer_info.use_chunked_attention, layer_info.chunk_size, 2, layer_info.kv_hbm_fraction);
   } else if (cpuKvOffloadActive(config)) {
     accumul_memory_duration = hbmKvOffloadReadDuration(config, total_context_kv_read_size, total_context_act_size, sequences_metadata->p2_kv_offload_fraction);
   }

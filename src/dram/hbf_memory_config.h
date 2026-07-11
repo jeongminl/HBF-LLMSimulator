@@ -70,6 +70,15 @@ struct HBFMemoryConfig {
   // hbf_preset, hbf_plus_preset, conv_preset, conv_plus_preset) is completely
   // unaffected.
   bool unbounded_sram_gate = false;
+  // H3 (Ha et al., IEEE CAL 2026) topology: the HBF stacks are daisy-chained
+  // BEHIND the HBM base dies, so HBF traffic reaches the GPU through the same
+  // GPU<->HBM-base D2D link that carries HBM traffic (the paper sets link BW =
+  // HBM core BW). When true, getAttentionMemoryDuration adds a third roofline
+  // ceiling ((kv_read + act) / hbm_read_bandwidth) so the two tiers' bandwidths
+  // are not additive. Like unbounded_sram_gate above: member initializer only
+  // (NOT a constructor arg), defaults false so every existing preset -- all of
+  // which model flash as direct-attached -- is completely unaffected.
+  bool flash_behind_hbm = false;
 };
 
 // Preset 1: HBM4 (8 HBM stacks, 288 GB, 12.8 TB/s symmetric)

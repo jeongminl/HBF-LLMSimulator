@@ -125,10 +125,20 @@ inline time_ns getLinearMemoryDuration(const SystemConfig& config, double m, dou
 // each call exposing a full fill. Mirrors program_latency_amortize_calls /
 // weight_stream_ops_per_iter's amortize-across-calls convention. Default 1
 // charges the full page latency per call (legacy behavior).
-inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric kv_read_size, hw_metric act_size, bool use_chunked_attention = false, int chunk_size_override = 0, int fill_amortize_calls = 1) {
+// kv_hbm_fraction: H3 hybrid KV placement (see LayerInfo::kv_hbm_fraction) --
+// that fraction of kv_read_size is HBM-resident and is charged on the HBM side
+// TOGETHER with the activation traffic (both physically live in HBM and share
+// its bandwidth); only the flash-resident remainder goes through the chunked
+// page-latency model below. 0.0 (the default, and every internal CB2 call
+// site) reproduces today's arithmetic bit-for-bit: x*(1.0-0.0) == x and
+// act_size + x*0.0 == act_size exactly in IEEE754.
+inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric kv_read_size, hw_metric act_size, bool use_chunked_attention = false, int chunk_size_override = 0, int fill_amortize_calls = 1, double kv_hbm_fraction = 0.0) {
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
     auto& hbf = config.hbf_config;
     int fill_amortize = (fill_amortize_calls > 0) ? fill_amortize_calls : 1;
+    double kv_frac = (kv_hbm_fraction < 0.0) ? 0.0 : ((kv_hbm_fraction > 1.0) ? 1.0 : kv_hbm_fraction);
+    hw_metric kv_flash_size = kv_read_size * (1.0 - kv_frac);
+    hw_metric kv_hbm_size = kv_read_size * kv_frac;
 
     double kv_read_time = 0;
     if (use_chunked_attention) {
@@ -152,7 +162,7 @@ inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric 
           ? std::min((double)effective_chunk, sram_capacity)
           : sram_capacity;
       int num_chunks = (chunk_bytes > 0)
-          ? (int)std::ceil((double)kv_read_size / chunk_bytes)
+          ? (int)std::ceil((double)kv_flash_size / chunk_bytes)
           : 1;
       if (num_chunks < 1) num_chunks = 1;
       double chunk_transfer_ns = chunk_bytes / hbf.flash_read_bandwidth * 1e9;
@@ -165,14 +175,14 @@ inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric 
       if (config.paper2_mode) {
         exposed_latency_ns = 0.0;
       }
-      kv_read_time = (kv_read_size / hbf.flash_read_bandwidth * 1e9) + exposed_latency_ns;
+      kv_read_time = (kv_flash_size / hbf.flash_read_bandwidth * 1e9) + exposed_latency_ns;
     } else {
       // No chunked attention: still double-buffer by SRAM-sized chunks (plane-level
       // parallelism means flash_page_read_latency is only fully exposed once, for
       // the pipeline-fill chunk -- see the chunked branch above for the reasoning).
       double sram_capacity = (double)hbf.sram_per_stack_bytes * hbf.num_flash_stacks;
       int num_chunks = (sram_capacity > 0)
-          ? (int)std::ceil((double)kv_read_size / sram_capacity)
+          ? (int)std::ceil((double)kv_flash_size / sram_capacity)
           : 1;
       if (num_chunks < 1) num_chunks = 1;
       double chunk_transfer_ns = sram_capacity / hbf.flash_read_bandwidth * 1e9;
@@ -185,16 +195,70 @@ inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric 
       if (config.paper2_mode) {
         exposed_latency_ns = 0.0;
       }
-      kv_read_time = (kv_read_size / hbf.flash_read_bandwidth * 1e9) + exposed_latency_ns;
+      kv_read_time = (kv_flash_size / hbf.flash_read_bandwidth * 1e9) + exposed_latency_ns;
+    }
+    // All-HBM placement (kv_frac == 1.0): nothing is fetched from flash, so no
+    // page-fill latency is exposed. Guarded on kv_frac > 0 so the legacy
+    // kv_read_size == 0 corner (which DOES charge a fill today) is untouched.
+    if (kv_frac > 0.0 && kv_flash_size <= 0.0) {
+      kv_read_time = 0.0;
     }
 
+    // HBM-resident KV contends with activation traffic on HBM bandwidth (both
+    // physically live in HBM). kv_hbm_size == +0.0 at the default fraction, so
+    // act_size + kv_hbm_size == act_size exactly and existing presets are
+    // unchanged. The no-HBM branch keeps the sum defined for (misused)
+    // fraction>0 on an HBM-less preset; the Frontier router never routes KV to
+    // HBM unless num_hbm_stacks > 0.
     double act_time;
     if (hbf.num_hbm_stacks > 0) {
-      act_time = act_size / hbf.hbm_read_bandwidth * 1e9;
+      act_time = (act_size + kv_hbm_size) / hbf.hbm_read_bandwidth * 1e9;
     } else {
-      act_time = act_size / hbf.logic_sram_bandwidth * 1e9;
+      act_time = (act_size + kv_hbm_size) / hbf.logic_sram_bandwidth * 1e9;
+    }
+    // H3 daisy-chain topology (hbf_config.flash_behind_hbm): HBF traffic
+    // reaches the GPU through the GPU<->HBM-base D2D link that also carries
+    // the HBM traffic, with link BW = HBM core BW (paper §III-A) -- so the two
+    // tiers' bandwidths are NOT additive. Third roofline ceiling: the link
+    // must move ALL of this phase's traffic (flash KV + HBM KV + act). Pure
+    // bandwidth term; the exposed page-fill latency stays with kv_read_time.
+    // False on every existing preset (direct-attached flash) -- no golden
+    // motion.
+    if (hbf.flash_behind_hbm && hbf.num_hbm_stacks > 0) {
+      double link_time = (kv_read_size + act_size) / hbf.hbm_read_bandwidth * 1e9;
+      return std::max(std::max(kv_read_time, act_time), link_time);
     }
     return std::max(kv_read_time, act_time);
+  }
+  return 0;
+}
+
+// H3 hybrid KV placement, write side: price a caller-computed KV write byte
+// volume split across the flash and HBM tiers. The FLASH portion reproduces
+// getKVWriteDuration's pricing exactly (bytes / flash_write_bandwidth +
+// page-program pipeline-fill amortized per program_latency_amortize_calls --
+// see that function's doc comment above; the program-latency term is charged
+// even at 0 flash bytes, preserving the legacy per-iteration-stream
+// convention of the byte-override path this function replaces). The HBM
+// portion is a plain bandwidth term on hbm_write_bandwidth -- HBM writes have
+// no page-program latency. MAX composition: the two portions target different
+// memory controllers and the write is fire-and-forget (call sites charge only
+// the remainder not hidden under compute), so the fast tier's write hides
+// entirely under the slow tier's; SUM would double-charge it. Callers that
+// split nothing (kv_write_bytes_hbm == 0) get the legacy single-tier result
+// bit-for-bit. Volume computation deliberately stays with the caller: Frontier
+// owns per-request amortized byte composition (heterogeneous batches), CB2
+// owns the pricing.
+inline time_ns getKVWriteDurationFromBytes(const SystemConfig& config, double kv_write_bytes_flash, double kv_write_bytes_hbm, int program_latency_amortize_calls = 1) {
+  if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
+    auto& hbf = config.hbf_config;
+    int amortize = (program_latency_amortize_calls > 0) ? program_latency_amortize_calls : 1;
+    double flash_write_ns = (kv_write_bytes_flash / hbf.flash_write_bandwidth * 1e9) +
+                            (double)hbf.flash_page_program_latency_ns / amortize;
+    double hbm_write_ns = (kv_write_bytes_hbm > 0 && hbf.hbm_write_bandwidth > 0)
+        ? kv_write_bytes_hbm / hbf.hbm_write_bandwidth * 1e9
+        : 0.0;
+    return (time_ns)std::max(flash_write_ns, hbm_write_ns);
   }
   return 0;
 }

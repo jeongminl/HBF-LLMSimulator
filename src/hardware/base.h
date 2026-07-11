@@ -34,6 +34,13 @@ struct LayerInfo {
   // (module/attention.cpp), consumed by AttentionGenExecutionGPU
   // (hardware/attention_gen_impl.cpp). See CHANGES.md for the investigation.
   int local_attention_window = 0;
+  // H3 (Ha et al., IEEE CAL 2026) hybrid HBM+HBF KV placement: fraction of this
+  // layer's KV-cache READ bytes that are resident in HBM rather than flash
+  // (byte-weighted across the batch by the caller). 0.0 = all KV on flash --
+  // today's behavior for every existing preset and module, which never set it;
+  // only external callers (the Frontier binding) route KV across tiers.
+  // Consumed by getAttentionMemoryDuration via the GQA gen/sum call sites.
+  double kv_hbm_fraction = 0.0;
 };
 
 enum class LayerType {
