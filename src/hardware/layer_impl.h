@@ -332,25 +332,28 @@ inline time_ns hbmKvOffloadReadDuration(const SystemConfig& config, hw_metric kv
 inline time_ns getKVWriteDuration(const SystemConfig& config, int num_seq, int num_kv_heads, int head_dim, int precision, bool compressed_kv, int kv_lora_rank, int qk_rope_head_dim, int input_len, int output_len, int local_attention_window = 0, int program_latency_amortize_calls = 1) {
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
     auto& hbf = config.hbf_config;
-    double num_new_queries = (double)num_seq / (output_len > 0 ? output_len : 1);
-    // Llama-4 iRoPE: a local layer only ever retains/writes a bounded KV window
-    // (attn_chunk_size), never the full input_len -- matches the cap already
-    // applied to the KV-READ path (see this file's getAttentionMemoryDuration
-    // callers, e.g. attention_gen_impl.cpp's local_attention_window usage) and
-    // the capacity path's effectiveKvLen() (model/model_config.h). window==0 (every
-    // non-iRoPE model, and any call site that hasn't threaded the per-layer window
-    // through) is a no-op: effective_input_len == input_len.
-    int effective_input_len = (local_attention_window > 0)
-        ? std::min(input_len, local_attention_window) : input_len;
+    // PHASE-FAITHFUL convention (2026-07 audit follow-up): a decode iteration
+    // physically writes exactly the batch's NEW tokens' KV entries -- one per
+    // sequence. The previous uniform-workload form amortized the PROMPT's
+    // writes into the decode phase ((num_seq/output_len)*input_len tokens per
+    // step) while omitting the decode token's own entry, i.e. it charged the
+    // decode phase entirely with writes that physically occur during prefill
+    // and excluded the only write that occurs during decode. Prompt writes
+    // are now priced where they happen: in the prefill (sum) kernel
+    // (attention_sum_impl.cpp, phase-faithful KV-write block).
+    // input_len/output_len/local_attention_window stay in the signature for
+    // API compatibility but no longer enter the volume: a new token's KV
+    // entry is written once regardless of prompt length, and a full iRoPE
+    // window overwrites in place -- still one token's bytes. (I12's qk_rope
+    // K-side term is retained.)
     double kv_write_size = 0;
     if (compressed_kv) {
-      kv_write_size = num_new_queries * (kv_lora_rank + qk_rope_head_dim) * effective_input_len * precision;
+      kv_write_size = (double)num_seq * (kv_lora_rank + qk_rope_head_dim) * precision;
     } else {
-      // I12: add qk_rope to the K side, mirroring the KV-read path's
-      // n * (2*head_dim + qk_rope_head_dim) * num_heads term (attention_gen_impl.cpp) --
-      // the write side was omitting the RoPE component of the key. qk_rope_head_dim==0
-      // for every GQA model (paper-1), so this is a no-op there; live for MLA.
-      kv_write_size = num_new_queries * num_kv_heads * (2.0 * head_dim + qk_rope_head_dim) * effective_input_len * precision;
+      kv_write_size = (double)num_seq * num_kv_heads * (2.0 * head_dim + qk_rope_head_dim) * precision;
+    }
+    if (kv_write_size <= 0) {
+      return 0;  // no stream, no page-program fill (mirrors the F4 guard below)
     }
     int amortize = (program_latency_amortize_calls > 0) ? program_latency_amortize_calls : 1;
     double write_time = (kv_write_size / hbf.flash_write_bandwidth * 1e9) +

@@ -419,6 +419,33 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
   exec_status.flops = total_flops;
   exec_status.memory_size = total_memory_size;
 
+  if (config.use_hbf && config.hbf_config.num_flash_stacks > 0 && !use_ramulator) {
+    // PHASE-FAITHFUL KV writes (2026-07 audit follow-up; mirrors the gen
+    // kernel's write block, attention_gen_impl.cpp): the prefill leg writes
+    // each PROCESSED token's K/V entry -- the writes the old model amortized
+    // into the decode (gen) kernel via getKVWriteDuration's
+    // (num_seq/output_len)*input_len volume. Volume = batch_m (total
+    // processed tokens this call) x per-token KV bytes; priced as one
+    // per-iteration flash stream (write bandwidth + page-program fill
+    // amortized across this stage's per-layer calls, same convention as
+    // gen) and hidden under this kernel's own compute; only the unhidden
+    // remainder extends the critical path. Ordering mirrors gen: utils above
+    // deliberately exclude the write. GQA form only (this GPU kernel); the
+    // MLA sum kernels stay write-free -- MLA is out of scope end-to-end
+    // (docs/H3_KV_Tiering.md).
+    int layers_per_stage = device->model_config.num_layers /
+        (device->model_config.pp_dg > 0 ? device->model_config.pp_dg : 1);
+    if (layers_per_stage < 1) layers_per_stage = 1;
+    double kv_write_size = batch_m * num_kv_heads * 2.0 * head_dim * input->precision_byte;
+    time_ns kv_write = getKVWriteDurationFromBytes(config, kv_write_size, 0.0, layers_per_stage);
+    time_ns hide_budget = (time_ns)(total_flops /
+        (compute_peak_flops * effectiveMFU(config, batch_m)) * 1000 * 1000 * 1000);
+    time_ns unhidden_write = std::max((time_ns)0, kv_write - hide_budget);
+    exec_status.total_duration += unhidden_write;
+    exec_status.batch_dependent_duration += unhidden_write;
+    exec_status.kv_write_duration = unhidden_write;
+  }
+
   assertTrue(total_flops > 0, "fail");
   assertTrue(total_memory_size > 0, "fail");
 
