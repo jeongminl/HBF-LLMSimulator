@@ -109,6 +109,20 @@ inline time_ns getLinearMemoryDuration(const SystemConfig& config, double m, dou
     } else {
       act_time = (act_read_size + act_write_size) / hbf.logic_sram_bandwidth * 1e9;
     }
+    // H3 daisy-chain topology (audit R4, mirroring getAttentionMemoryDuration's
+    // flash_behind_hbm ceiling below): weight stream (flash, behind the HBM
+    // base dies) and activation traffic (HBM) both cross the shared GPU<->HBM
+    // D2D link, with link BW = HBM core BW -- the two tiers' bandwidths are
+    // NOT additive within one linear op either. Third ceiling: the link must
+    // move ALL of this op's bytes. Pure bandwidth term; the exposed page-fill
+    // latency stays with weight_read_time. False on every pre-H3 preset (and
+    // the exposed-latency term keeps weight_read_time >= its own bandwidth
+    // share), so existing SKUs are bit-for-bit unchanged.
+    if (hbf.flash_behind_hbm && hbf.num_hbm_stacks > 0) {
+      double link_time =
+          (weight_size + act_read_size + act_write_size) / hbf.hbm_read_bandwidth * 1e9;
+      return std::max(std::max(weight_read_time, act_time), link_time);
+    }
     return std::max(weight_read_time, act_time);
   } else {
     return total_memory_size / memory_bandwidth * 1000 * 1000 * 1000;
@@ -238,8 +252,8 @@ inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric 
 // getKVWriteDuration's pricing exactly (bytes / flash_write_bandwidth +
 // page-program pipeline-fill amortized per program_latency_amortize_calls --
 // see that function's doc comment above; the program-latency term is charged
-// even at 0 flash bytes, preserving the legacy per-iteration-stream
-// convention of the byte-override path this function replaces). The HBM
+// ONLY when flash bytes > 0 -- no flash stream, no fill cost; see the audit
+// F4 note inside the function body). The HBM
 // portion is a plain bandwidth term on hbm_write_bandwidth -- HBM writes have
 // no page-program latency. MAX composition: the two portions target different
 // memory controllers and the write is fire-and-forget (call sites charge only
@@ -253,8 +267,18 @@ inline time_ns getKVWriteDurationFromBytes(const SystemConfig& config, double kv
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
     auto& hbf = config.hbf_config;
     int amortize = (program_latency_amortize_calls > 0) ? program_latency_amortize_calls : 1;
-    double flash_write_ns = (kv_write_bytes_flash / hbf.flash_write_bandwidth * 1e9) +
-                            (double)hbf.flash_page_program_latency_ns / amortize;
+    // Audit F4: the page-program pipeline-fill term is charged ONLY when
+    // bytes actually stream to flash. The previous unconditional charge
+    // ("preserving the legacy per-iteration-stream convention") was
+    // unreachable on legacy call paths (their flash volume is never 0) but
+    // became live -- and physically indefensible, a flash cost with no
+    // flash stream -- on H3 all-HBM placement, inflating that control
+    // arm's decode TPOT by ~100us/iteration (+6.7% measured on the agentic
+    // fixture at llama-2-7b/TP1).
+    double flash_write_ns = (kv_write_bytes_flash > 0)
+        ? (kv_write_bytes_flash / hbf.flash_write_bandwidth * 1e9) +
+              (double)hbf.flash_page_program_latency_ns / amortize
+        : 0.0;
     double hbm_write_ns = (kv_write_bytes_hbm > 0 && hbf.hbm_write_bandwidth > 0)
         ? kv_write_bytes_hbm / hbf.hbm_write_bandwidth * 1e9
         : 0.0;
