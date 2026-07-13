@@ -97,8 +97,14 @@ class ModelConfig {
   int pp_dg = 1; // pipeline parallelism degree
   std::string dataset;
 
-  int input_len;
-  int output_len;
+  // Zero-initialized (2026-07 audit round 2, item 5e): a default-constructed
+  // ModelConfig (e.g. the pybind binding's make_context) previously left
+  // these indeterminate until the first attention() call overwrote them;
+  // every reachable read today is post-overwrite, but any earlier read would
+  // have been UB. 0 is inert for priced time (getKVWriteDuration ignores
+  // both since pin a56f50e).
+  int input_len = 0;
+  int output_len = 0;
 };
 
 // ---------------------------------------------------------------------------

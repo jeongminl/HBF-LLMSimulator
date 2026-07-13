@@ -102,7 +102,7 @@ static HBFMemoryConfig hbm4_preset = HBFMemoryConfig(
 static HBFMemoryConfig hbf_preset = HBFMemoryConfig(
     1,                                           // num_hbm_stacks
     7,                                           // num_flash_stacks
-    3620ULL * 1024 * 1024 * 1024,               // total_capacity_bytes (flash pool)
+    3620ULL * 1024 * 1024 * 1024,               // total_capacity_bytes (COMBINED Table-I: HBM reserve + flash; pool = 3620 - 36 = 3584 GB, footprint.h checkCapacity)
     1.6e12,                                      // hbm_read_bandwidth (1/8 of HBM4)
     1.6e12,                                      // hbm_write_bandwidth
     11.2e12,                                     // flash_read_bandwidth (7 * 1.6 TB/s)
@@ -136,7 +136,7 @@ static HBFMemoryConfig hbf_plus_preset = HBFMemoryConfig(
 static HBFMemoryConfig conv_preset = HBFMemoryConfig(
     1,                                           // num_hbm_stacks
     7,                                           // num_flash_stacks
-    3620ULL * 1024 * 1024 * 1024,               // total_capacity_bytes (flash pool)
+    3620ULL * 1024 * 1024 * 1024,               // total_capacity_bytes (COMBINED Table-I: HBM reserve + flash; pool = 3620 - 36 = 3584 GB, footprint.h checkCapacity)
     1.6e12,                                      // hbm_read_bandwidth
     1.6e12,                                      // hbm_write_bandwidth
     2.45e12,                                     // flash_read_bandwidth (7 * 350 GB/s)
