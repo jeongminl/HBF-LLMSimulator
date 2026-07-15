@@ -200,7 +200,7 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
     // full to each. Was defaulting to 1 (2x over-charge). Prefill-only path
     // (GQA-Sum runs on the prefill/sum leg) -- report whether any published
     // decode cell moves (should be none; this loop never executes for decode).
-    time_ns accumul_memory_duration = getAttentionMemoryDuration(config, total_kv_read_size, total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size, 2, layer_info.kv_hbm_fraction);
+    time_ns accumul_memory_duration = getAttentionMemoryDuration(config, total_kv_read_size, total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size, 2, layer_info.kv_hbm_fraction, layer_info.kv_write_bytes_flash / 2.0, layer_info.kv_write_bytes_hbm / 2.0);
     exec_status.total_duration += std::max(accumul_compute_duration, accumul_memory_duration);
   }
 
@@ -407,7 +407,7 @@ ExecStatus AttentionSumExecutionGPU(Device_Ptr device,
   }
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0 && !use_ramulator) {
     // I3: fill_amortize_calls=2 -- see the Scoring loop's I3 comment above.
-    time_ns context_accumul_memory_duration = getAttentionMemoryDuration(config, context_total_kv_read_size, context_total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size, 2, layer_info.kv_hbm_fraction);
+    time_ns context_accumul_memory_duration = getAttentionMemoryDuration(config, context_total_kv_read_size, context_total_act_size, layer_info.use_chunked_attention, layer_info.chunk_size, 2, layer_info.kv_hbm_fraction, layer_info.kv_write_bytes_flash / 2.0, layer_info.kv_write_bytes_hbm / 2.0);
     exec_status.total_duration += std::max(context_accumul_compute_duration, context_accumul_memory_duration);
   }
 

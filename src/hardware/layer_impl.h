@@ -119,9 +119,17 @@ inline time_ns getLinearMemoryDuration(const SystemConfig& config, double m, dou
     // the exposed-latency term keeps weight_read_time >= its own bandwidth
     // share), so existing SKUs are bit-for-bit unchanged.
     if (hbf.flash_behind_hbm && hbf.num_hbm_stacks > 0) {
+      // Link (1), the shared shoreline: must move ALL of this op's bytes.
       double link_time =
-          (weight_size + act_read_size + act_write_size) / hbf.hbm_read_bandwidth * 1e9;
-      return std::max(std::max(weight_read_time, act_time), link_time);
+          (weight_size + act_read_size + act_write_size) / hbf.linkBandwidth() * 1e9;
+      // Link (3), the HBM-base <-> HBF-base daisy-chain hop: the weight stream
+      // is flash-resident, so it crosses this hop too. A SEPARATE ceiling, not
+      // an added serial cost -- the hops pipeline (see hbf_chain_bandwidth).
+      // Inert while chainBandwidth() >= linkBandwidth() (the paper's
+      // assumption, and the default), since link_time then dominates it.
+      double chain_time = weight_size / hbf.chainBandwidth() * 1e9;
+      return std::max(std::max(weight_read_time, act_time),
+                      std::max(link_time, chain_time));
     }
     return std::max(weight_read_time, act_time);
   } else {
@@ -146,7 +154,20 @@ inline time_ns getLinearMemoryDuration(const SystemConfig& config, double m, dou
 // page-latency model below. 0.0 (the default, and every internal CB2 call
 // site) reproduces today's arithmetic bit-for-bit: x*(1.0-0.0) == x and
 // act_size + x*0.0 == act_size exactly in IEEE754.
-inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric kv_read_size, hw_metric act_size, bool use_chunked_attention = false, int chunk_size_override = 0, int fill_amortize_calls = 1, double kv_hbm_fraction = 0.0) {
+// kv_write_bytes_flash / kv_write_bytes_hbm: H3 shoreline completeness (see
+// LayerInfo's fields of the same name) -- the KV WRITEBACK bytes attributed to
+// this call, which cross the shared GPU<->HBM-base link (1) alongside this
+// call's KV reads and activations, and (flash share) the daisy-chain link (3).
+// They enter ONLY the link/chain bandwidth ceilings below, never kv_read_time
+// or act_time: the terminal NAND-program / DRAM-array cost of the same bytes is
+// priced separately by getKVWriteDurationFromBytes, and transport and program
+// are distinct pipeline stages, so this is not a double charge. Callers that
+// invoke this function more than once per op (the GQA gen/sum kernels call it
+// twice -- score leg + context leg) must pass each call its SHARE of the op's
+// write volume, mirroring the fill_amortize_calls convention, so the transport
+// is not counted once per leg. 0.0 (the default, and every internal CB2 call
+// site) leaves the arithmetic bit-for-bit unchanged.
+inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric kv_read_size, hw_metric act_size, bool use_chunked_attention = false, int chunk_size_override = 0, int fill_amortize_calls = 1, double kv_hbm_fraction = 0.0, double kv_write_bytes_flash = 0.0, double kv_write_bytes_hbm = 0.0) {
   if (config.use_hbf && config.hbf_config.num_flash_stacks > 0) {
     auto& hbf = config.hbf_config;
     int fill_amortize = (fill_amortize_calls > 0) ? fill_amortize_calls : 1;
@@ -239,8 +260,23 @@ inline time_ns getAttentionMemoryDuration(const SystemConfig& config, hw_metric 
     // False on every existing preset (direct-attached flash) -- no golden
     // motion.
     if (hbf.flash_behind_hbm && hbf.num_hbm_stacks > 0) {
-      double link_time = (kv_read_size + act_size) / hbf.hbm_read_bandwidth * 1e9;
-      return std::max(std::max(kv_read_time, act_time), link_time);
+      // Link (1), the shared shoreline: must move ALL of this phase's traffic
+      // -- flash KV reads + HBM KV reads + activations + KV WRITEBACKS. The
+      // writebacks are the completeness fix: they cross this link like every
+      // other byte, but are otherwise priced only against the terminal
+      // NAND/DRAM array (getKVWriteDurationFromBytes) and then hidden under
+      // compute at the call site, so without this term they would traverse the
+      // shared shoreline for free.
+      double link_time =
+          (kv_read_size + act_size + kv_write_bytes_flash + kv_write_bytes_hbm) /
+          hbf.linkBandwidth() * 1e9;
+      // Link (3), the daisy-chain hop: flash-resident traffic only (HBM traffic
+      // terminates at the HBM stack). Separate ceiling, not a serial cost.
+      // Inert at the default chainBandwidth() == linkBandwidth().
+      double chain_time =
+          (kv_flash_size + kv_write_bytes_flash) / hbf.chainBandwidth() * 1e9;
+      return std::max(std::max(kv_read_time, act_time),
+                      std::max(link_time, chain_time));
     }
     return std::max(kv_read_time, act_time);
   }

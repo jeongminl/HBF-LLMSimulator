@@ -41,6 +41,22 @@ struct LayerInfo {
   // only external callers (the Frontier binding) route KV across tiers.
   // Consumed by getAttentionMemoryDuration via the GQA gen/sum call sites.
   double kv_hbm_fraction = 0.0;
+  // H3 shoreline completeness: this op's KV WRITEBACK byte volume, split by
+  // destination tier. On the H3 daisy chain a KV write crosses the SAME
+  // GPU<->HBM-base link (1) as this op's KV reads and activations, so it must
+  // enter that link's ceiling -- otherwise write bytes traverse the shared
+  // shoreline while contributing to no bandwidth budget anywhere (they are
+  // priced only against the terminal NAND/DRAM array by
+  // getKVWriteDurationFromBytes, and then hidden under compute at the call
+  // site, so they can vanish entirely). The flash share additionally crosses
+  // link (3). Transport (here) and array-program cost (getKVWriteDurationFromBytes)
+  // are distinct pipeline stages and are NOT double-counted: this is a pure
+  // bandwidth ceiling on the link, that one is the NAND program time.
+  // 0.0 = no writeback attributed to this op -- every internal CB2 module,
+  // hence every existing preset, bit-for-bit unchanged. Set only by external
+  // callers (the Frontier binding), which own the per-request byte composition.
+  double kv_write_bytes_flash = 0.0;
+  double kv_write_bytes_hbm = 0.0;
 };
 
 enum class LayerType {

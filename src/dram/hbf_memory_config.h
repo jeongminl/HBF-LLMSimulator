@@ -79,6 +79,34 @@ struct HBFMemoryConfig {
   // (NOT a constructor arg), defaults false so every existing preset -- all of
   // which model flash as direct-attached -- is completely unaffected.
   bool flash_behind_hbm = false;
+  // H3 Fig.3(b) link (1): the GPU <-> HBM-base-die D2D "shoreline". SHARED by
+  // HBM and HBF traffic -- every HBF byte crosses it, because HBF sits BEHIND
+  // the HBM base die. The paper pins BW(1) == HBM core BW ("the bandwidth
+  // between the GPU and the HBM base die is equal to the bandwidth between
+  // each base die and the core die", §III-A), and that equality is the sole
+  // reason tier-splitting buys latency hiding rather than bandwidth: a
+  // shoreline provisioned ABOVE HBM core BW would make the two tiers partially
+  // additive. Exposed as a knob so that assumption can be swept instead of
+  // hard-coded. 0.0 == "follow hbm_read_bandwidth" == the paper -- and every
+  // existing golden -- bit-for-bit. Member-initializer only (like
+  // flash_behind_hbm / unbounded_sram_gate), so no preset's ctor arg list moves.
+  double d2d_link_bandwidth = 0.0;
+  // H3 Fig.3(b) link (3): the HBM-base <-> HBF-base D2D daisy-chain hop.
+  // Carries HBF traffic ONLY (HBM traffic terminates at the HBM stack), so it
+  // is a SEPARATE ceiling from the shoreline, not an extra serial cost -- the
+  // hops pipeline, and a pipeline's throughput is set by its slowest stage,
+  // not by the sum of its stages. 0.0 == "follow the shoreline BW" (the
+  // paper's assumption). Only consulted when flash_behind_hbm.
+  double hbf_chain_bandwidth = 0.0;
+
+  // Effective shoreline (link 1) bandwidth -- see d2d_link_bandwidth.
+  double linkBandwidth() const {
+    return d2d_link_bandwidth > 0.0 ? d2d_link_bandwidth : hbm_read_bandwidth;
+  }
+  // Effective daisy-chain (link 3) bandwidth -- see hbf_chain_bandwidth.
+  double chainBandwidth() const {
+    return hbf_chain_bandwidth > 0.0 ? hbf_chain_bandwidth : linkBandwidth();
+  }
 };
 
 // Preset 1: HBM4 (8 HBM stacks, 288 GB, 12.8 TB/s symmetric)
